@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: yt-automation-proxy
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
