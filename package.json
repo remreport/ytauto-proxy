@@ -3,7 +3,8 @@
   "version": "1.1.0",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "worker": "node worker.js"
   },
   "engines": {
     "node": ">=18"

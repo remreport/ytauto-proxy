@@ -1,0 +1,16 @@
+node_modules/
+.env
+.env.local
+*.log
+
+# Service account keys — never commit these to git
+firebase-key.json
+firebase-*.json
+service-account.json
+*-firebase-adminsdk-*.json
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
