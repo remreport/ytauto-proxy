@@ -130,9 +130,11 @@ async function processJob(job) {
 
 async function tick() {
   try {
+    // Single-field query (status only) — avoids a composite index on
+    // (status, createdAt). Order across pending jobs doesn't matter for
+    // phase 2 since concurrency is 1 and they all eventually drain.
     const snap = await db.collection('editingJobs')
       .where('status', '==', 'pending')
-      .orderBy('createdAt', 'asc')
       .limit(1)
       .get();
     if (snap.empty) return;
@@ -151,10 +153,6 @@ async function tick() {
     }
   } catch (e) {
     console.error('Poll failed:', e.message);
-    if (/index/i.test(e.message || '')) {
-      console.error('  → Firestore needs a composite index on editingJobs (status asc + createdAt asc).');
-      console.error('  → The error message above usually contains a one-click link to create it.');
-    }
   }
 }
 
