@@ -10,7 +10,8 @@
     "node": ">=18"
   },
   "dependencies": {
-    "googleapis": "^144.0.0",
-    "firebase-admin": "^12.6.0"
+    "@remotion/lambda": "^4.0.456",
+    "firebase-admin": "^12.6.0",
+    "googleapis": "^144.0.0"
   }
 }

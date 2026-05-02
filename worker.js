@@ -22,6 +22,7 @@
 
 const fs = require('fs');
 const admin = require('firebase-admin');
+const {renderMediaOnLambda, getRenderProgress} = require('@remotion/lambda/client');
 
 if (process.env.WORKER_ENABLED !== 'true') {
   console.log('Worker disabled. Set WORKER_ENABLED=true to run.');
@@ -44,15 +45,90 @@ try {
   process.exit(1);
 }
 
-admin.initializeApp({ credential: admin.credential.cert(svc) });
+admin.initializeApp({
+  credential: admin.credential.cert(svc),
+  storageBucket: `${svc.project_id}.firebasestorage.app`,
+});
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
 
 const POLL_INTERVAL_MS = 30 * 1000;
-const TEST_RESULT_URL = process.env.TEST_RESULT_URL ||
-  'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ─── Remotion Lambda render ─────────────────────────────────────────
+async function renderOnLambda(inputProps, jobRef) {
+  const region = process.env.AWS_REGION || 'us-east-1';
+  const functionName = process.env.REMOTION_LAMBDA_FUNCTION_NAME;
+  const serveUrl = process.env.REMOTION_LAMBDA_SERVE_URL;
+  if (!functionName || !serveUrl) {
+    throw new Error('REMOTION_LAMBDA_FUNCTION_NAME and REMOTION_LAMBDA_SERVE_URL env vars required');
+  }
+
+  const {renderId, bucketName} = await renderMediaOnLambda({
+    region,
+    functionName,
+    serveUrl,
+    composition: 'MainComp',
+    inputProps,
+    codec: 'h264',
+    privacy: 'public',
+    imageFormat: 'jpeg',
+    // New AWS accounts default to ~10 concurrent Lambda invocations.
+    // framesPerLambda=200 keeps a 13s render to ~2 invocations and a
+    // 30s render to ~5 — well under the limit. Increase via AWS Service
+    // Quotas later if longer renders need more parallelism.
+    framesPerLambda: 200,
+    maxRetries: 2,
+  });
+  console.log(`  Lambda renderId: ${renderId}`);
+
+  let lastPct = -1;
+  while (true) {
+    await sleep(3000);
+    const progress = await getRenderProgress({
+      renderId, bucketName, functionName, region,
+    });
+    if (progress.fatalErrorEncountered) {
+      const err = progress.errors?.[0]?.message || 'unknown Lambda render error';
+      throw new Error(`Lambda render failed: ${err}`);
+    }
+    const pct = Math.round((progress.overallProgress || 0) * 100);
+    if (pct !== lastPct) {
+      console.log(`  Lambda progress: ${pct}%`);
+      // Map Lambda 0-100% into the worker's 70-95% slice
+      await jobRef.update({
+        currentStep: `Rendering on Lambda — ${pct}%`,
+        progress: 70 + Math.round((progress.overallProgress || 0) * 25),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      lastPct = pct;
+    }
+    if (progress.done) {
+      return progress.outputFile; // S3 URL of the rendered MP4
+    }
+  }
+}
+
+// Download Lambda's S3 output and re-upload to Firebase Storage so the
+// existing review UI plays it back the same as a worker submission.
+// Returns the {url, path, size} shape that project.editingFile uses.
+async function uploadRenderToFirebaseStorage(s3Url, channelId, projectId) {
+  const resp = await fetch(s3Url);
+  if (!resp.ok) throw new Error(`Could not fetch Lambda output: HTTP ${resp.status}`);
+  const buffer = Buffer.from(await resp.arrayBuffer());
+
+  const bucket = admin.storage().bucket();
+  const path = `channels/${channelId}/projects/${projectId}/editing/auto-edit-${Date.now()}.mp4`;
+  const file = bucket.file(path);
+  await file.save(buffer, {metadata: {contentType: 'video/mp4'}});
+  await file.makePublic();
+  return {
+    url: `https://storage.googleapis.com/${bucket.name}/${path}`,
+    path,
+    size: buffer.length,
+  };
+}
 
 // ─── AssemblyAI ─────────────────────────────────────────────────────
 // Submit voiceover URL, poll until complete, return sentence-level
@@ -205,7 +281,10 @@ async function pexelsSearchSingle(query) {
   if (!video) return null;
   const files = (video.video_files || []).filter((f) => f.file_type === 'video/mp4');
   if (!files.length) return null;
-  files.sort((a, b) => (b.height || 0) - (a.height || 0));
+  // Prefer ~1080p sources over 4K — our render output is 1080p, and 4K
+  // source files are 5-10x bigger which blows out Lambda disk and adds
+  // decode time without adding pixels to the output.
+  files.sort((a, b) => Math.abs((a.height || 0) - 1080) - Math.abs((b.height || 0) - 1080));
   return files[0].link;
 }
 
@@ -368,14 +447,30 @@ async function processJob(job) {
   });
   console.log(`[${job.id}] sourced ${footage.length} beats (${pexCount} Pexels, ${fluxCount} Flux)`);
 
-  // Step 3 — render (still fake, phase 3d)
+  // Step 3 — render: REAL (Remotion Lambda)
   await jobRef.update({
     status: 'rendering',
-    currentStep: 'Rendering video (fake)',
+    currentStep: 'Invoking Lambda renderer',
     progress: 70,
     updatedAt: FieldValue.serverTimestamp(),
   });
-  await sleep(10000);
+  const s3OutputUrl = await renderOnLambda(
+    {
+      voiceoverUrl: job.voiceoverUrl,
+      footage,
+      captions,
+    },
+    jobRef,
+  );
+  console.log(`[${job.id}] Lambda rendered to ${s3OutputUrl}`);
+
+  await jobRef.update({
+    currentStep: 'Copying render to Firebase Storage',
+    progress: 95,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  const finalFile = await uploadRenderToFirebaseStorage(s3OutputUrl, job.channelId, job.projectId);
+  console.log(`[${job.id}] uploaded to ${finalFile.url} (${finalFile.size} bytes)`);
 
   // Step 4 — done (atomic batch: job + project + notification)
   const batch = db.batch();
@@ -383,15 +478,15 @@ async function processJob(job) {
     status: 'done',
     currentStep: 'Complete',
     progress: 100,
-    resultUrl: TEST_RESULT_URL,
+    resultUrl: finalFile.url,
     updatedAt: FieldValue.serverTimestamp(),
   });
   batch.update(projRef, {
     editingFile: {
-      url: TEST_RESULT_URL,
-      path: '',
+      url: finalFile.url,
+      path: finalFile.path,
       name: 'auto-edit.mp4',
-      size: 0,
+      size: finalFile.size,
       type: 'video/mp4',
     },
     editingNote: 'Auto-edited by AI — review carefully',
@@ -441,7 +536,8 @@ async function tick() {
 
 console.log('Worker started.');
 console.log(`  Poll interval: ${POLL_INTERVAL_MS / 1000}s`);
-console.log(`  Test result URL: ${TEST_RESULT_URL}`);
+console.log(`  Lambda fn:   ${process.env.REMOTION_LAMBDA_FUNCTION_NAME || '(unset)'}`);
+console.log(`  Lambda site: ${process.env.REMOTION_LAMBDA_SERVE_URL || '(unset)'}`);
 
 (async function loop() {
   while (true) {
