@@ -99,10 +99,20 @@ const FieldValue = admin.firestore.FieldValue;
       if (job.error) console.log(`  error: ${job.error}`);
       if (job.footageUrls && job.footageUrls.length) {
         console.log(`  footageUrls (${job.footageUrls.length}):`);
-        job.footageUrls.forEach((u, idx) => {
+        job.footageUrls.slice(0, 3).forEach((u, idx) => {
           const short = u.length > 100 ? u.slice(0, 97) + '...' : u;
-          console.log(`    ${String(idx + 1).padStart(2)}. ${short}`);
+          console.log(`    ${idx + 1}. ${short}`);
         });
+        if (job.footageUrls.length > 3) console.log(`    ... and ${job.footageUrls.length - 3} more`);
+      }
+      if (job.captions && job.captions.length) {
+        console.log(`  captions (${job.captions.length} sentences):`);
+        job.captions.slice(0, 3).forEach((s, idx) => {
+          const text = s.text && s.text.length > 80 ? s.text.slice(0, 77) + '...' : (s.text || '');
+          const wc = (s.words || []).length;
+          console.log(`    ${idx + 1}. [${s.start.toFixed(1)}s-${s.end.toFixed(1)}s · ${wc} words] ${text}`);
+        });
+        if (job.captions.length > 3) console.log(`    ... and ${job.captions.length - 3} more`);
       }
       process.exit(job.status === 'done' ? 0 : 2);
     }

@@ -92,6 +92,80 @@ async function sourceFootageFromPexels(query, perPage = 10) {
     .filter(Boolean);
 }
 
+// AssemblyAI — submit voiceover URL, poll until complete, return
+// sentence-level captions with word-level timing in the shape the
+// Remotion Captions component expects (start/end in seconds, not ms).
+async function generateCaptionsFromAssemblyAI(audioUrl) {
+  if (!process.env.ASSEMBLYAI_API_KEY) {
+    throw new Error('ASSEMBLYAI_API_KEY env var missing');
+  }
+  if (!audioUrl) {
+    throw new Error('No voiceover URL on job; cannot transcribe');
+  }
+  const headers = {
+    Authorization: process.env.ASSEMBLYAI_API_KEY,
+    'Content-Type': 'application/json',
+  };
+
+  // 1. Submit transcription request — AssemblyAI fetches the URL itself,
+  //    so no separate upload step is needed for our Firebase Storage URLs.
+  //    `speech_models` is now required by the v2 API; "universal-2" is the
+  //    cheaper general-purpose model. Swap to "universal-3-pro" later if
+  //    transcription quality on real voiceovers needs upgrading.
+  const submit = await fetch('https://api.assemblyai.com/v2/transcript', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      audio_url: audioUrl,
+      speech_models: ['universal-2'],
+    }),
+  });
+  if (!submit.ok) {
+    throw new Error(`AssemblyAI submit ${submit.status}: ${(await submit.text()).slice(0, 200)}`);
+  }
+  const { id } = await submit.json();
+
+  // 2. Poll until done (4-min cap — short voiceovers finish in ~10-30s)
+  let lastStatus = '';
+  for (let i = 0; i < 120; i++) {
+    await sleep(2000);
+    const poll = await fetch(`https://api.assemblyai.com/v2/transcript/${id}`, { headers });
+    const data = await poll.json();
+    if (data.status !== lastStatus) {
+      console.log(`  AssemblyAI: ${data.status}`);
+      lastStatus = data.status;
+    }
+    if (data.status === 'completed') break;
+    if (data.status === 'error') {
+      throw new Error(`AssemblyAI: ${data.error || 'transcription failed'}`);
+    }
+    if (i === 119) {
+      throw new Error('AssemblyAI: still transcribing after 4 minutes');
+    }
+  }
+
+  // 3. Fetch sentence groupings — these include word-level timestamps per
+  //    sentence, which is exactly the shape the Remotion Captions component
+  //    expects.
+  const sentResp = await fetch(`https://api.assemblyai.com/v2/transcript/${id}/sentences`, { headers });
+  if (!sentResp.ok) {
+    throw new Error(`AssemblyAI sentences ${sentResp.status}: ${(await sentResp.text()).slice(0, 200)}`);
+  }
+  const { sentences = [] } = await sentResp.json();
+
+  // 4. Normalise: ms → seconds, and just the fields the renderer needs.
+  return sentences.map((s) => ({
+    start: s.start / 1000,
+    end: s.end / 1000,
+    text: s.text,
+    words: (s.words || []).map((w) => ({
+      text: w.text,
+      start: w.start / 1000,
+      end: w.end / 1000,
+    })),
+  }));
+}
+
 async function processJob(job) {
   const jobRef = db.collection('editingJobs').doc(job.id);
   const projRef = db.collection('channels').doc(job.channelId)
@@ -123,14 +197,21 @@ async function processJob(job) {
   });
   console.log(`[${job.id}] sourced ${footageUrls.length} Pexels clips`);
 
-  // Step 2: caption generation — STILL FAKE (phase 3b will call AssemblyAI)
+  // Step 2: caption generation — REAL (AssemblyAI)
   await jobRef.update({
     status: 'captions',
-    currentStep: 'Generating word-level captions (fake)',
+    currentStep: 'Transcribing voiceover with AssemblyAI',
     progress: 40,
     updatedAt: FieldValue.serverTimestamp(),
   });
-  await sleep(5000);
+  const captions = await generateCaptionsFromAssemblyAI(job.voiceoverUrl);
+  await jobRef.update({
+    captions,
+    progress: 60,
+    currentStep: `Transcribed ${captions.length} sentences`,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  console.log(`[${job.id}] transcribed ${captions.length} sentences`);
 
   // Step 3: render — STILL FAKE (phase 3d will call Remotion Lambda)
   await jobRef.update({
