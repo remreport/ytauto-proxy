@@ -27,6 +27,16 @@ $env:FIREBASE_SERVICE_ACCOUNT_FILE = "C:\Users\fiffa\firebase-key.json"
 # the right package.json regardless of where it was invoked from.
 Set-Location $PSScriptRoot
 
+# Load any additional API keys from .env (gitignored) into this shell's
+# env so the worker process inherits them. Format: KEY=value, one per line.
+if (Test-Path .env) {
+  foreach ($line in Get-Content .env) {
+    if ($line -match '^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$') {
+      Set-Item -Path "env:$($Matches[1])" -Value $Matches[2]
+    }
+  }
+}
+
 Write-Host ""
 Write-Host "Starting AI editing worker..." -ForegroundColor Cyan
 Write-Host "  Node:           $(node -v 2>$null)" -ForegroundColor DarkGray

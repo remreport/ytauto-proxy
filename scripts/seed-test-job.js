@@ -97,6 +97,13 @@ const FieldValue = admin.firestore.FieldValue;
       console.log(`\nFinal: ${job.status}`);
       if (job.resultUrl) console.log(`  resultUrl: ${job.resultUrl}`);
       if (job.error) console.log(`  error: ${job.error}`);
+      if (job.footageUrls && job.footageUrls.length) {
+        console.log(`  footageUrls (${job.footageUrls.length}):`);
+        job.footageUrls.forEach((u, idx) => {
+          const short = u.length > 100 ? u.slice(0, 97) + '...' : u;
+          console.log(`    ${String(idx + 1).padStart(2)}. ${short}`);
+        });
+      }
       process.exit(job.status === 'done' ? 0 : 2);
     }
     await new Promise((r) => setTimeout(r, 2000));

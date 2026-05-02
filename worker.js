@@ -57,35 +57,85 @@ const TEST_RESULT_URL = process.env.TEST_RESULT_URL ||
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// Pexels Videos API — search for landscape stock clips matching a query.
+// Returns up to `perPage` direct .mp4 URLs (highest available quality
+// per result). Throws on auth/network failure so the job is marked failed
+// loudly instead of silently producing an empty footage list.
+async function sourceFootageFromPexels(query, perPage = 10) {
+  if (!process.env.PEXELS_API_KEY) {
+    throw new Error('PEXELS_API_KEY env var missing');
+  }
+  const url = new URL('https://api.pexels.com/videos/search');
+  url.searchParams.set('query', query);
+  url.searchParams.set('per_page', String(perPage));
+  url.searchParams.set('orientation', 'landscape');
+  url.searchParams.set('size', 'large');
+
+  const resp = await fetch(url, {
+    headers: { Authorization: process.env.PEXELS_API_KEY },
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Pexels API ${resp.status}: ${body.slice(0, 200)}`);
+  }
+  const data = await resp.json();
+  return (data.videos || [])
+    .map((video) => {
+      const files = (video.video_files || []).filter(
+        (f) => f.file_type === 'video/mp4',
+      );
+      if (!files.length) return null;
+      // Highest resolution first
+      files.sort((a, b) => (b.height || 0) - (a.height || 0));
+      return files[0].link;
+    })
+    .filter(Boolean);
+}
+
 async function processJob(job) {
   const jobRef = db.collection('editingJobs').doc(job.id);
   const projRef = db.collection('channels').doc(job.channelId)
     .collection('projects').doc(job.projectId);
 
-  console.log(`[${job.id}] processing project "${job.projectTitle || job.projectId}"`);
+  // Pull topic from the project doc — the job payload doesn't carry it
+  const projSnap = await projRef.get();
+  if (!projSnap.exists) throw new Error(`Project ${job.projectId} not found`);
+  const proj = projSnap.data();
+  const searchQuery = [proj.title, proj.topic].filter(Boolean).join(' ').trim() || 'abstract';
+  console.log(`[${job.id}] processing "${proj.title}" — query="${searchQuery}"`);
 
-  // Step 1: footage sourcing (fake — phase 3 will call Pexels + Pixabay + Replicate)
+  // Step 1: footage sourcing — REAL (Pexels)
   await jobRef.update({
     status: 'sourcing',
-    currentStep: 'Searching stock footage',
+    currentStep: 'Searching Pexels for footage',
     progress: 10,
     updatedAt: FieldValue.serverTimestamp(),
   });
-  await sleep(5000);
+  const footageUrls = await sourceFootageFromPexels(searchQuery);
+  if (!footageUrls.length) {
+    throw new Error(`Pexels returned 0 results for "${searchQuery}". Widen the topic text.`);
+  }
+  await jobRef.update({
+    footageUrls,
+    progress: 30,
+    currentStep: `Found ${footageUrls.length} Pexels clips`,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  console.log(`[${job.id}] sourced ${footageUrls.length} Pexels clips`);
 
-  // Step 2: caption generation (fake — phase 3 will call AssemblyAI)
+  // Step 2: caption generation — STILL FAKE (phase 3b will call AssemblyAI)
   await jobRef.update({
     status: 'captions',
-    currentStep: 'Generating word-level captions',
+    currentStep: 'Generating word-level captions (fake)',
     progress: 40,
     updatedAt: FieldValue.serverTimestamp(),
   });
   await sleep(5000);
 
-  // Step 3: render (fake — phase 4 will call Remotion Lambda)
+  // Step 3: render — STILL FAKE (phase 3d will call Remotion Lambda)
   await jobRef.update({
     status: 'rendering',
-    currentStep: 'Rendering video',
+    currentStep: 'Rendering video (fake)',
     progress: 70,
     updatedAt: FieldValue.serverTimestamp(),
   });
