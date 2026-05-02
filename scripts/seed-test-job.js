@@ -97,14 +97,6 @@ const FieldValue = admin.firestore.FieldValue;
       console.log(`\nFinal: ${job.status}`);
       if (job.resultUrl) console.log(`  resultUrl: ${job.resultUrl}`);
       if (job.error) console.log(`  error: ${job.error}`);
-      if (job.footageUrls && job.footageUrls.length) {
-        console.log(`  footageUrls (${job.footageUrls.length}):`);
-        job.footageUrls.slice(0, 3).forEach((u, idx) => {
-          const short = u.length > 100 ? u.slice(0, 97) + '...' : u;
-          console.log(`    ${idx + 1}. ${short}`);
-        });
-        if (job.footageUrls.length > 3) console.log(`    ... and ${job.footageUrls.length - 3} more`);
-      }
       if (job.captions && job.captions.length) {
         console.log(`  captions (${job.captions.length} sentences):`);
         job.captions.slice(0, 3).forEach((s, idx) => {
@@ -113,6 +105,28 @@ const FieldValue = admin.firestore.FieldValue;
           console.log(`    ${idx + 1}. [${s.start.toFixed(1)}s-${s.end.toFixed(1)}s · ${wc} words] ${text}`);
         });
         if (job.captions.length > 3) console.log(`    ... and ${job.captions.length - 3} more`);
+      }
+      if (job.footage && job.footage.length) {
+        console.log(`  footage (${job.footage.length} beats):`);
+        const pex = job.footage.filter((b) => b.source === 'pexels').length;
+        const flux = job.footage.filter((b) => b.source === 'flux').length;
+        const miss = job.footage.filter((b) => !b.source).length;
+        console.log(`    sources: ${pex} Pexels · ${flux} Flux · ${miss} unmatched`);
+        job.footage.forEach((b, idx) => {
+          const sent = b.sentence ? (b.sentence.length > 60 ? b.sentence.slice(0, 57) + '...' : b.sentence) : '';
+          const kw = (b.keywords || []).join(', ');
+          const url = b.url ? (b.url.length > 90 ? b.url.slice(0, 87) + '...' : b.url) : '(no url)';
+          console.log(`    beat ${idx + 1}: [${(b.start || 0).toFixed(1)}s-${(b.end || 0).toFixed(1)}s] ${b.source || 'MISS'}`);
+          console.log(`       "${sent}"`);
+          console.log(`       kw: ${kw}`);
+          console.log(`       ${url}`);
+        });
+      } else if (job.footageUrls && job.footageUrls.length) {
+        console.log(`  footageUrls (${job.footageUrls.length}, legacy bulk):`);
+        job.footageUrls.slice(0, 3).forEach((u, idx) => {
+          const short = u.length > 100 ? u.slice(0, 97) + '...' : u;
+          console.log(`    ${idx + 1}. ${short}`);
+        });
       }
       process.exit(job.status === 'done' ? 0 : 2);
     }

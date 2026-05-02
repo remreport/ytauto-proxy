@@ -1,26 +1,24 @@
-// worker.js — background processor for editingJobs (Phase 2: fake steps)
+// worker.js — background processor for editingJobs.
 //
-// Polls Firestore for pending editing jobs and walks them through fake
-// stages (sourcing → captions → rendering → done) with hardcoded delays.
-// This validates the end-to-end orchestration; real Pexels/Pixabay/
-// AssemblyAI/Remotion calls land in phase 3.
+// Pipeline order (matters: sourcing reads captions for beat alignment):
+//   pending → captions → sourcing → rendering → done
+//
+// Phase 3 progress:
+//   - captions  : real (AssemblyAI)
+//   - sourcing  : real, beat-aware (Claude → per-beat Pexels → Flux fallback)
+//   - rendering : still fake; phase 3d swaps for Remotion Lambda
 //
 // On 'done' the worker atomically writes:
-//   - the editingJobs doc (status='done', resultUrl)
-//   - the project's editingFile + status.editing='awaiting_approval'
-//   - a notification for the project owner
-// so the existing pipeline picks up the result the same way it would
-// pick up a worker-submitted edit.
+//   - editingJobs doc (status, resultUrl)
+//   - project's editingFile + status.editing='awaiting_approval'
+//   - owner notification
+// Existing pipeline picks up the result identically to a worker submission.
 //
 // Run locally:
-//   1. Download a Firebase service account JSON from Firebase Console →
-//      Project Settings → Service accounts → "Generate new private key".
-//      Save it outside the repo, e.g. C:\Users\fiffa\firebase-key.json
-//   2. PowerShell:
-//        $env:WORKER_ENABLED = "true"
-//        $env:FIREBASE_SERVICE_ACCOUNT_FILE = "C:\Users\fiffa\firebase-key.json"
-//        npm run worker
-//   3. Logs print to stdout. Stop with Ctrl+C.
+//   1. Download a Firebase service account JSON. Save outside the repo.
+//   2. Put your API keys in .env (gitignored): PEXELS_API_KEY,
+//      ASSEMBLYAI_API_KEY, REPLICATE_API_KEY.
+//   3. .\start-worker.ps1   (loads .env automatically)
 
 const fs = require('fs');
 const admin = require('firebase-admin');
@@ -30,8 +28,7 @@ if (process.env.WORKER_ENABLED !== 'true') {
   process.exit(0);
 }
 
-// Load service account from inline JSON (Render production) or from a file
-// path (local dev — much easier to manage than a multi-line env var).
+// Service account: file (local dev) or inline JSON (Render production)
 let svc;
 try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_FILE) {
@@ -55,63 +52,22 @@ const POLL_INTERVAL_MS = 30 * 1000;
 const TEST_RESULT_URL = process.env.TEST_RESULT_URL ||
   'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Pexels Videos API — search for landscape stock clips matching a query.
-// Returns up to `perPage` direct .mp4 URLs (highest available quality
-// per result). Throws on auth/network failure so the job is marked failed
-// loudly instead of silently producing an empty footage list.
-async function sourceFootageFromPexels(query, perPage = 10) {
-  if (!process.env.PEXELS_API_KEY) {
-    throw new Error('PEXELS_API_KEY env var missing');
-  }
-  const url = new URL('https://api.pexels.com/videos/search');
-  url.searchParams.set('query', query);
-  url.searchParams.set('per_page', String(perPage));
-  url.searchParams.set('orientation', 'landscape');
-  url.searchParams.set('size', 'large');
-
-  const resp = await fetch(url, {
-    headers: { Authorization: process.env.PEXELS_API_KEY },
-  });
-  if (!resp.ok) {
-    const body = await resp.text();
-    throw new Error(`Pexels API ${resp.status}: ${body.slice(0, 200)}`);
-  }
-  const data = await resp.json();
-  return (data.videos || [])
-    .map((video) => {
-      const files = (video.video_files || []).filter(
-        (f) => f.file_type === 'video/mp4',
-      );
-      if (!files.length) return null;
-      // Highest resolution first
-      files.sort((a, b) => (b.height || 0) - (a.height || 0));
-      return files[0].link;
-    })
-    .filter(Boolean);
-}
-
-// AssemblyAI — submit voiceover URL, poll until complete, return
-// sentence-level captions with word-level timing in the shape the
-// Remotion Captions component expects (start/end in seconds, not ms).
+// ─── AssemblyAI ─────────────────────────────────────────────────────
+// Submit voiceover URL, poll until complete, return sentence-level
+// captions with word-level timing in seconds.
 async function generateCaptionsFromAssemblyAI(audioUrl) {
   if (!process.env.ASSEMBLYAI_API_KEY) {
     throw new Error('ASSEMBLYAI_API_KEY env var missing');
   }
-  if (!audioUrl) {
-    throw new Error('No voiceover URL on job; cannot transcribe');
-  }
+  if (!audioUrl) throw new Error('No voiceover URL on job; cannot transcribe');
+
   const headers = {
     Authorization: process.env.ASSEMBLYAI_API_KEY,
     'Content-Type': 'application/json',
   };
 
-  // 1. Submit transcription request — AssemblyAI fetches the URL itself,
-  //    so no separate upload step is needed for our Firebase Storage URLs.
-  //    `speech_models` is now required by the v2 API; "universal-2" is the
-  //    cheaper general-purpose model. Swap to "universal-3-pro" later if
-  //    transcription quality on real voiceovers needs upgrading.
   const submit = await fetch('https://api.assemblyai.com/v2/transcript', {
     method: 'POST',
     headers,
@@ -125,7 +81,6 @@ async function generateCaptionsFromAssemblyAI(audioUrl) {
   }
   const { id } = await submit.json();
 
-  // 2. Poll until done (4-min cap — short voiceovers finish in ~10-30s)
   let lastStatus = '';
   for (let i = 0; i < 120; i++) {
     await sleep(2000);
@@ -136,24 +91,16 @@ async function generateCaptionsFromAssemblyAI(audioUrl) {
       lastStatus = data.status;
     }
     if (data.status === 'completed') break;
-    if (data.status === 'error') {
-      throw new Error(`AssemblyAI: ${data.error || 'transcription failed'}`);
-    }
-    if (i === 119) {
-      throw new Error('AssemblyAI: still transcribing after 4 minutes');
-    }
+    if (data.status === 'error') throw new Error(`AssemblyAI: ${data.error || 'transcription failed'}`);
+    if (i === 119) throw new Error('AssemblyAI: still transcribing after 4 minutes');
   }
 
-  // 3. Fetch sentence groupings — these include word-level timestamps per
-  //    sentence, which is exactly the shape the Remotion Captions component
-  //    expects.
   const sentResp = await fetch(`https://api.assemblyai.com/v2/transcript/${id}/sentences`, { headers });
   if (!sentResp.ok) {
     throw new Error(`AssemblyAI sentences ${sentResp.status}: ${(await sentResp.text()).slice(0, 200)}`);
   }
   const { sentences = [] } = await sentResp.json();
 
-  // 4. Normalise: ms → seconds, and just the fields the renderer needs.
   return sentences.map((s) => ({
     start: s.start / 1000,
     end: s.end / 1000,
@@ -166,54 +113,262 @@ async function generateCaptionsFromAssemblyAI(audioUrl) {
   }));
 }
 
+// ─── Anthropic (direct, not via proxy) ──────────────────────────────
+async function callAnthropic(apiKey, prompt, maxTokens = 3000) {
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+  if (!resp.ok) {
+    throw new Error(`Anthropic ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  }
+  const data = await resp.json();
+  return data.content?.find((b) => b.type === 'text')?.text || '';
+}
+
+// Send timed sentences to Claude. Get back beats grouped to ~3 seconds,
+// each annotated with stock-search keywords + a Flux fallback prompt.
+// Beats are constrained to whole-sentence boundaries so timing always
+// aligns with real audio.
+async function breakIntoBeats(captions, anthropicKey) {
+  const sentences = captions.map((s, i) => ({
+    index: i,
+    start: s.start,
+    end: s.end,
+    text: s.text,
+  }));
+
+  const prompt = `You are given timed sentences from a YouTube video transcript.
+
+Group consecutive sentences into "beats" of approximately 3 seconds. A beat must consist of one or more whole consecutive sentences — never split a sentence mid-way. Combine adjacent short sentences when needed; keep long sentences (>3.5s) as their own beat.
+
+For each beat, output:
+- start: start time of the first sentence in the beat (seconds, decimal)
+- end: end time of the last sentence in the beat (seconds, decimal)
+- sentence: concatenated sentence text
+- keywords: 2-3 short visual keywords for stock-video search. Concrete nouns and visual concepts only — e.g. "city skyline at night", "person typing on laptop", "ocean waves crashing". Avoid abstract concepts.
+- fluxPrompt: a detailed photorealistic image generation prompt describing the same scene cinematically. One vivid sentence, 16:9, no text overlays.
+
+Output ONLY valid JSON. No preamble, no markdown fences, no commentary — just the array:
+
+[
+  {
+    "start": 0.2,
+    "end": 1.7,
+    "sentence": "Hey, you. It's me.",
+    "keywords": ["person waving at camera", "warm portrait"],
+    "fluxPrompt": "Close-up portrait of a friendly person looking directly at camera with warm natural lighting, photorealistic, shallow depth of field"
+  }
+]
+
+Sentences:
+${JSON.stringify(sentences)}`;
+
+  const text = await callAnthropic(anthropicKey, prompt);
+  const cleaned = text.replace(/```(?:json)?\s*|\s*```/g, '').trim();
+  try {
+    const beats = JSON.parse(cleaned);
+    if (!Array.isArray(beats)) throw new Error('expected an array');
+    return beats;
+  } catch (e) {
+    throw new Error(`Could not parse Claude beats response: ${e.message}. Raw: ${text.slice(0, 300)}`);
+  }
+}
+
+// ─── Pexels (single-result per beat) ────────────────────────────────
+async function pexelsSearchSingle(query) {
+  if (!process.env.PEXELS_API_KEY) throw new Error('PEXELS_API_KEY env var missing');
+  const url = new URL('https://api.pexels.com/videos/search');
+  url.searchParams.set('query', query);
+  url.searchParams.set('per_page', '5');
+  url.searchParams.set('orientation', 'landscape');
+  url.searchParams.set('size', 'large');
+
+  const resp = await fetch(url, {
+    headers: { Authorization: process.env.PEXELS_API_KEY },
+  });
+  if (!resp.ok) {
+    console.warn(`  Pexels ${resp.status} for "${query}"`);
+    return null;
+  }
+  const data = await resp.json();
+  const video = (data.videos || [])[0];
+  if (!video) return null;
+  const files = (video.video_files || []).filter((f) => f.file_type === 'video/mp4');
+  if (!files.length) return null;
+  files.sort((a, b) => (b.height || 0) - (a.height || 0));
+  return files[0].link;
+}
+
+// ─── Replicate Flux 1.1 Pro (16:9 photorealistic image generation) ──
+async function generateFluxImage(prompt) {
+  if (!process.env.REPLICATE_API_KEY) throw new Error('REPLICATE_API_KEY env var missing');
+
+  const headers = {
+    Authorization: `Bearer ${process.env.REPLICATE_API_KEY}`,
+    'Content-Type': 'application/json',
+    Prefer: 'wait',
+  };
+
+  const submit = await fetch(
+    'https://api.replicate.com/v1/models/black-forest-labs/flux-1.1-pro/predictions',
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        input: {
+          prompt,
+          aspect_ratio: '16:9',
+          output_format: 'jpg',
+          output_quality: 90,
+        },
+      }),
+    },
+  );
+  if (!submit.ok) {
+    throw new Error(`Replicate ${submit.status}: ${(await submit.text()).slice(0, 200)}`);
+  }
+  let data = await submit.json();
+
+  // With Prefer: wait, succeeded result usually arrives in the initial
+  // response. If not, fall back to polling.
+  while (data.status === 'starting' || data.status === 'processing') {
+    await sleep(2000);
+    const poll = await fetch(`https://api.replicate.com/v1/predictions/${data.id}`, { headers });
+    data = await poll.json();
+  }
+  if (data.status !== 'succeeded') {
+    throw new Error(`Replicate prediction ${data.status}: ${data.error || ''}`);
+  }
+  const out = data.output;
+  if (Array.isArray(out)) return out[0];
+  if (typeof out === 'string') return out;
+  throw new Error(`Replicate returned unexpected output: ${JSON.stringify(out).slice(0, 200)}`);
+}
+
+// ─── Beat-aware sourcing orchestrator ───────────────────────────────
+// 1. Ask Claude to break the captions into ~3s beats with keywords + flux prompts
+// 2. For each beat, try Pexels with the keywords; fall through to Flux on miss
+// 3. Update jobRef.currentStep per beat for live progress
+async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgress, progressSpan) {
+  await jobRef.update({
+    currentStep: 'Breaking script into beats with Claude',
+    progress: baseProgress,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  const rawBeats = await breakIntoBeats(captions, anthropicKey);
+  console.log(`  got ${rawBeats.length} beats from Claude`);
+
+  const footage = [];
+  for (let i = 0; i < rawBeats.length; i++) {
+    const beat = rawBeats[i];
+    const keywords = beat.keywords || [];
+    const query = keywords.join(' ');
+
+    await jobRef.update({
+      currentStep: `Sourcing beat ${i + 1}/${rawBeats.length}: ${keywords.join(', ').slice(0, 60)}`,
+      progress: baseProgress + Math.round(((i + 1) / rawBeats.length) * progressSpan),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    let url = null;
+    let source = null;
+
+    if (query) {
+      url = await pexelsSearchSingle(query);
+      if (url) source = 'pexels';
+    }
+
+    if (!url && beat.fluxPrompt) {
+      console.log(`  beat ${i + 1}: Pexels miss for "${query}" — generating with Flux`);
+      try {
+        url = await generateFluxImage(beat.fluxPrompt);
+        source = 'flux';
+      } catch (e) {
+        console.warn(`  beat ${i + 1}: Flux failed: ${e.message}`);
+      }
+    }
+
+    footage.push({
+      beatIndex: i,
+      start: beat.start,
+      end: beat.end,
+      sentence: beat.sentence,
+      keywords,
+      fluxPrompt: beat.fluxPrompt || null,
+      source,
+      url,
+    });
+    console.log(`  beat ${i + 1}: ${source || 'NO MATCH'} — ${(url || '').slice(0, 80)}`);
+  }
+  return footage;
+}
+
+// ─── Job processor ──────────────────────────────────────────────────
 async function processJob(job) {
   const jobRef = db.collection('editingJobs').doc(job.id);
   const projRef = db.collection('channels').doc(job.channelId)
     .collection('projects').doc(job.projectId);
 
-  // Pull topic from the project doc — the job payload doesn't carry it
   const projSnap = await projRef.get();
   if (!projSnap.exists) throw new Error(`Project ${job.projectId} not found`);
   const proj = projSnap.data();
-  const searchQuery = [proj.title, proj.topic].filter(Boolean).join(' ').trim() || 'abstract';
-  console.log(`[${job.id}] processing "${proj.title}" — query="${searchQuery}"`);
+  console.log(`[${job.id}] processing "${proj.title}"`);
 
-  // Step 1: footage sourcing — REAL (Pexels)
-  await jobRef.update({
-    status: 'sourcing',
-    currentStep: 'Searching Pexels for footage',
-    progress: 10,
-    updatedAt: FieldValue.serverTimestamp(),
-  });
-  const footageUrls = await sourceFootageFromPexels(searchQuery);
-  if (!footageUrls.length) {
-    throw new Error(`Pexels returned 0 results for "${searchQuery}". Widen the topic text.`);
-  }
-  await jobRef.update({
-    footageUrls,
-    progress: 30,
-    currentStep: `Found ${footageUrls.length} Pexels clips`,
-    updatedAt: FieldValue.serverTimestamp(),
-  });
-  console.log(`[${job.id}] sourced ${footageUrls.length} Pexels clips`);
-
-  // Step 2: caption generation — REAL (AssemblyAI)
+  // Step 1 — captions (must come before sourcing for beat alignment)
   await jobRef.update({
     status: 'captions',
     currentStep: 'Transcribing voiceover with AssemblyAI',
-    progress: 40,
+    progress: 10,
     updatedAt: FieldValue.serverTimestamp(),
   });
   const captions = await generateCaptionsFromAssemblyAI(job.voiceoverUrl);
   await jobRef.update({
     captions,
-    progress: 60,
+    progress: 30,
     currentStep: `Transcribed ${captions.length} sentences`,
     updatedAt: FieldValue.serverTimestamp(),
   });
   console.log(`[${job.id}] transcribed ${captions.length} sentences`);
 
-  // Step 3: render — STILL FAKE (phase 3d will call Remotion Lambda)
+  // Step 2 — beat-aware sourcing (Claude + per-beat Pexels + Flux fallback)
+  await jobRef.update({
+    status: 'sourcing',
+    currentStep: 'Looking up Anthropic key',
+    progress: 35,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  const ownerSnap = await db.collection('users').doc(job.ownerId).get();
+  const anthropicKey = ownerSnap.data()?.settings?.anthropicKey;
+  if (!anthropicKey) {
+    throw new Error('Owner has no Anthropic key — set it under Settings → Integrations in the app first');
+  }
+
+  // 35% → 60%: 25% span across N beats
+  const footage = await sourceBeatAwareFootage(captions, anthropicKey, jobRef, 35, 25);
+  const footageUrls = footage.map((f) => f.url).filter(Boolean);
+  const pexCount = footage.filter((f) => f.source === 'pexels').length;
+  const fluxCount = footage.filter((f) => f.source === 'flux').length;
+
+  await jobRef.update({
+    footage,
+    footageUrls,
+    progress: 60,
+    currentStep: `Sourced ${footage.length} beats — ${pexCount} Pexels · ${fluxCount} Flux`,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  console.log(`[${job.id}] sourced ${footage.length} beats (${pexCount} Pexels, ${fluxCount} Flux)`);
+
+  // Step 3 — render (still fake, phase 3d)
   await jobRef.update({
     status: 'rendering',
     currentStep: 'Rendering video (fake)',
@@ -222,7 +377,7 @@ async function processJob(job) {
   });
   await sleep(10000);
 
-  // Step 4: done — atomic batch so the project + job + notification all land together
+  // Step 4 — done (atomic batch: job + project + notification)
   const batch = db.batch();
   batch.update(jobRef, {
     status: 'done',
@@ -261,9 +416,6 @@ async function processJob(job) {
 
 async function tick() {
   try {
-    // Single-field query (status only) — avoids a composite index on
-    // (status, createdAt). Order across pending jobs doesn't matter for
-    // phase 2 since concurrency is 1 and they all eventually drain.
     const snap = await db.collection('editingJobs')
       .where('status', '==', 'pending')
       .limit(1)
@@ -280,7 +432,7 @@ async function tick() {
         currentStep: 'Failed',
         error: e.message || 'Unknown error',
         updatedAt: FieldValue.serverTimestamp(),
-      }).catch(err => console.error('Could not mark failed:', err));
+      }).catch((err) => console.error('Could not mark failed:', err));
     }
   } catch (e) {
     console.error('Poll failed:', e.message);
@@ -296,7 +448,7 @@ console.log(`  Test result URL: ${TEST_RESULT_URL}`);
     await tick();
     await sleep(POLL_INTERVAL_MS);
   }
-})().catch(e => {
+})().catch((e) => {
   console.error('Worker crashed:', e);
   process.exit(1);
 });
