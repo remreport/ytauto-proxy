@@ -81,9 +81,59 @@ async function fetchNewsAPI(niche, {limit = 10, apiKey} = {}) {
   }));
 }
 
+// Google Trends — unofficial public dailytrends JSON. The endpoint
+// returns a list of "what's trending today" globally for the given geo,
+// not niche-filtered, so we do a basic word-overlap filter against the
+// niche before returning. Claude ranking in step 6 does the deeper work.
+async function fetchGoogleTrends(niche, {limit = 10, geo = 'US'} = {}) {
+  const url = `https://trends.google.com/trends/api/dailytrends?hl=en-US&tz=-300&geo=${geo}&ns=15`;
+  const resp = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; rem-report/1.0)',
+      Accept: 'application/json',
+    },
+  });
+  if (!resp.ok) throw new Error(`Trends ${resp.status}`);
+  const text = await resp.text();
+  // Google prefixes the JSON with )]}', — strip before parsing.
+  const cleaned = text.replace(/^\)\]\}',?\s*/, '');
+  const data = JSON.parse(cleaned);
+  const days = data.default?.trendingSearchesDays || [];
+  const all = days.flatMap((d) => d.trendingSearches || []);
+
+  // Niche-relevance filter: keep items where niche keywords appear in
+  // the search query OR any associated article title. Falls back to the
+  // raw top-N if nothing matched (Claude will filter later anyway).
+  const nicheWords = niche
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+  const haystackOf = (s) =>
+    `${s.title?.query || ''} ${(s.articles || []).map((a) => a.title || '').join(' ')}`.toLowerCase();
+  const matched = all.filter((s) =>
+    nicheWords.some((w) => haystackOf(s).includes(w)),
+  );
+  const items = (matched.length ? matched : all).slice(0, limit);
+
+  return items.map((s) => ({
+    source: 'trends',
+    title: s.title?.query || '',
+    url: `https://trends.google.com/trends/explore?q=${encodeURIComponent(s.title?.query || '')}`,
+    score: parseInt(String(s.formattedTraffic || '0').replace(/[^\d]/g, ''), 10) || 0,
+    comments: 0,
+    summary: (s.articles || [])
+      .slice(0, 2)
+      .map((a) => a.title || '')
+      .join(' · ')
+      .slice(0, 300),
+    createdAt: Date.now(),
+    extra: {traffic: s.formattedTraffic || ''},
+  }));
+}
+
 // Run all fetchers in parallel; one source failing doesn't blank the rest.
-async function fetchAllTrending(niche, {newsApiKey} = {}) {
-  const [reddit, hn, news] = await Promise.all([
+async function fetchAllTrending(niche, {newsApiKey, geo = 'US'} = {}) {
+  const [reddit, hn, news, trends] = await Promise.all([
     fetchReddit(niche).catch((e) => {
       console.warn('Reddit failed:', e.message);
       return [];
@@ -96,6 +146,10 @@ async function fetchAllTrending(niche, {newsApiKey} = {}) {
       console.warn('NewsAPI failed:', e.message);
       return [];
     }),
+    fetchGoogleTrends(niche, {geo}).catch((e) => {
+      console.warn('Trends failed:', e.message);
+      return [];
+    }),
   ]);
   return {
     niche,
@@ -103,8 +157,20 @@ async function fetchAllTrending(niche, {newsApiKey} = {}) {
     reddit,
     hn,
     news,
-    counts: {reddit: reddit.length, hn: hn.length, news: news.length},
+    trends,
+    counts: {
+      reddit: reddit.length,
+      hn: hn.length,
+      news: news.length,
+      trends: trends.length,
+    },
   };
 }
 
-module.exports = {fetchReddit, fetchHN, fetchNewsAPI, fetchAllTrending};
+module.exports = {
+  fetchReddit,
+  fetchHN,
+  fetchNewsAPI,
+  fetchGoogleTrends,
+  fetchAllTrending,
+};

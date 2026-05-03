@@ -32,6 +32,7 @@ const ASSEMBLYAI_API_KEY = defineSecret('ASSEMBLYAI_API_KEY');
 const REPLICATE_API_KEY = defineSecret('REPLICATE_API_KEY');
 const AWS_ACCESS_KEY_ID = defineSecret('AWS_ACCESS_KEY_ID');
 const AWS_SECRET_ACCESS_KEY = defineSecret('AWS_SECRET_ACCESS_KEY');
+const NEWSAPI_KEY = defineSecret('NEWSAPI_KEY');
 
 // ─── Non-secret config ──────────────────────────────────────────────
 const AWS_REGION = 'us-east-1';
@@ -513,7 +514,212 @@ async function processJob(job) {
   console.log('done');
 }
 
-// ─── Trigger ────────────────────────────────────────────────────────
+// ─── Discovery: cached trending fetch + Claude ranking ─────────────
+// Cache lives on the channel doc as trendingCache: {niche, fetchedAt,
+// reddit, hn, news, trends}. Fresh = same niche + <6h old.
+async function getTrendingForChannel(channelId, niche) {
+  const chRef = db.collection('channels').doc(channelId);
+  const chSnap = await chRef.get();
+  const cache = chSnap.data()?.trendingCache;
+  const isFresh =
+    cache && cache.niche === niche && cache.fetchedAt &&
+    (Date.now() - cache.fetchedAt) < 6 * 3600 * 1000;
+  if (isFresh) {
+    console.log('using cached trending data, age:', Math.round((Date.now() - cache.fetchedAt) / 60000), 'min');
+    return cache;
+  }
+  console.log('fetching fresh trending data for', niche);
+  const {fetchAllTrending} = require('./lib/discover');
+  const fresh = await fetchAllTrending(niche, {newsApiKey: process.env.NEWSAPI_KEY});
+  await chRef.update({trendingCache: fresh});
+  return fresh;
+}
+
+// Send the union of fetched topics to Claude, get back a ranked pick +
+// 5 title variants + reasoning, all as JSON. The prompt heavily biases
+// toward multi-source convergence and recency.
+async function rankAndPickTopic(trending, niche, anthropicKey) {
+  const slim = (arr) => (arr || []).slice(0, 8).map((t) => ({
+    source: t.source,
+    title: t.title,
+    score: t.score,
+    comments: t.comments,
+    summary: t.summary,
+    age: Math.round((Date.now() - (t.createdAt || Date.now())) / 3.6e6) + 'h',
+    ...(t.extra?.subreddit ? {subreddit: t.extra.subreddit} : {}),
+    ...(t.extra?.sourceName ? {publisher: t.extra.sourceName} : {}),
+  }));
+  const allTopics = [
+    ...slim(trending.reddit),
+    ...slim(trending.hn),
+    ...slim(trending.news),
+    ...slim(trending.trends),
+  ];
+
+  const prompt = `You are a YouTube content strategist for a faceless channel in the niche "${niche}".
+
+I have ${allTopics.length} trending topics from Reddit, Hacker News, NewsAPI, and Google Trends. Pick the SINGLE BEST topic for a 5-minute YouTube video.
+
+Criteria (in priority order):
+1. Genuinely fits the niche "${niche}" — exclude noise that just keyword-matched (e.g. relationship drama with "finance" mentioned once)
+2. Strong engagement signal across multiple sources (multi-source convergence on the same story is the strongest signal)
+3. Fresh enough to feel "trending" — last 24-72h ideal, last week max
+4. Has substance — could fill 5 minutes with research, not a one-line meme
+5. Suitable for narration over stock footage (faceless format) — avoid topics that need a specific person on camera
+
+Then generate 5 viral title variants for that topic, ranked by predicted CTR using these patterns (mix them):
+- Curiosity gap: "The [thing] nobody is talking about"
+- Numbers: "[N] reasons why X happened"
+- Contrarian: "Why everyone is wrong about [X]"
+- News hook: "What [news event] really means"
+- Question hook: "Did [X] just signal [Y]?"
+
+Output ONLY valid JSON, no preamble, no markdown fences:
+
+{
+  "pickedTopic": "<concise topic title, 6-12 words>",
+  "pickedTopicSummary": "<2-3 sentence summary of what the video would cover>",
+  "pickedTopicReasoning": "<1-2 sentence reasoning for why this beat the others — cite source convergence, freshness, fit>",
+  "pickedTopicSources": ["reddit", "news"],
+  "titleVariants": [
+    {"title": "...", "ctrPrediction": "high|medium-high|medium", "reasoning": "<one short sentence>"},
+    {"title": "...", "ctrPrediction": "...", "reasoning": "..."},
+    {"title": "...", "ctrPrediction": "...", "reasoning": "..."},
+    {"title": "...", "ctrPrediction": "...", "reasoning": "..."},
+    {"title": "...", "ctrPrediction": "...", "reasoning": "..."}
+  ],
+  "pickedTitle": "<the title from the variants array predicted to have highest CTR>"
+}
+
+Topics:
+${JSON.stringify(allTopics, null, 2)}`;
+
+  const text = await callAnthropic(anthropicKey, prompt, 4000);
+  const cleaned = text.replace(/```(?:json)?\s*|\s*```/g, '').trim();
+  const parsed = JSON.parse(cleaned);
+  if (!parsed.pickedTopic || !Array.isArray(parsed.titleVariants) || parsed.titleVariants.length < 1) {
+    throw new Error('Claude response missing required fields');
+  }
+  return parsed;
+}
+
+// ─── Trigger: discovery jobs ────────────────────────────────────────
+exports.processDiscoveryJob = onDocumentCreated(
+  {
+    document: 'discoveryJobs/{jobId}',
+    secrets: [NEWSAPI_KEY],
+    timeoutSeconds: 300,
+    memory: '512MiB',
+    region: 'us-central1',
+  },
+  async (event) => {
+    const jobId = event.params.jobId;
+    const data = event.data?.data();
+    if (!data) return;
+    if (data.status !== 'pending') {
+      console.log(`[${jobId}] status=${data.status}, skipping`);
+      return;
+    }
+    console.log(`[${jobId}] discovery job for niche "${data.niche}"`);
+
+    const jobRef = db.collection('discoveryJobs').doc(jobId);
+    const projRef = data.projectId
+      ? db.collection('channels').doc(data.channelId).collection('projects').doc(data.projectId)
+      : null;
+
+    try {
+      const ownerSnap = await db.collection('users').doc(data.ownerId).get();
+      const anthropicKey = ownerSnap.data()?.settings?.anthropicKey;
+      if (!anthropicKey) {
+        throw new Error('Owner has no Anthropic key — set it under Settings → Integrations');
+      }
+
+      // Step 1: research
+      await jobRef.update({
+        status: 'researching',
+        currentStep: 'Pulling trending topics from Reddit, HN, NewsAPI, Trends',
+        progress: 20,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      if (projRef) await projRef.update({discoveryStatus: 'researching'});
+
+      const trending = await getTrendingForChannel(data.channelId, data.niche);
+      const totalCount =
+        (trending.reddit?.length || 0) + (trending.hn?.length || 0) +
+        (trending.news?.length || 0) + (trending.trends?.length || 0);
+      console.log(`[${jobId}] ${totalCount} topics fetched`);
+
+      // Step 2: rank with Claude
+      await jobRef.update({
+        currentStep: `Ranking ${totalCount} topics with Claude`,
+        progress: 60,
+        trendingTopicData: {
+          fetchedAt: trending.fetchedAt,
+          counts: trending.counts,
+        },
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      const proposal = await rankAndPickTopic(trending, data.niche, anthropicKey);
+      console.log(`[${jobId}] picked: ${proposal.pickedTopic}`);
+      console.log(`[${jobId}] title: ${proposal.pickedTitle}`);
+
+      // Step 3: propose — mirror to project so the pipeline UI sees it
+      await jobRef.update({
+        status: 'proposing',
+        currentStep: 'Awaiting approval',
+        progress: 100,
+        pickedTopic: proposal.pickedTopic,
+        pickedTopicSummary: proposal.pickedTopicSummary,
+        pickedTopicReasoning: proposal.pickedTopicReasoning,
+        pickedTopicSources: proposal.pickedTopicSources || [],
+        titleVariants: proposal.titleVariants,
+        pickedTitle: proposal.pickedTitle,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      if (projRef) {
+        await projRef.update({
+          discoveryStatus: 'proposing',
+          pickedTopic: proposal.pickedTopic,
+          pickedTopicSummary: proposal.pickedTopicSummary,
+          pickedTopicReasoning: proposal.pickedTopicReasoning,
+          pickedTopicSources: proposal.pickedTopicSources || [],
+          titleVariants: proposal.titleVariants,
+          pickedTitle: proposal.pickedTitle,
+        });
+      }
+
+      // Notify owner the proposal is ready
+      if (data.ownerId) {
+        const notifRef = db.collection('users').doc(data.ownerId).collection('notifications').doc();
+        await notifRef.set({
+          type: 'submission',
+          message: `🔍 AI proposed a topic: "${proposal.pickedTopic.slice(0, 60)}" — review`,
+          fromName: 'Discover',
+          link: null,
+          read: false,
+          ts: FieldValue.serverTimestamp(),
+        });
+      }
+    } catch (e) {
+      console.error(`[${jobId}] discovery failed:`, e);
+      await jobRef.update({
+        status: 'failed',
+        currentStep: 'Failed',
+        error: e.message || 'Unknown error',
+        updatedAt: FieldValue.serverTimestamp(),
+      }).catch(() => {});
+      if (projRef) {
+        await projRef.update({
+          discoveryStatus: 'failed',
+          discoveryError: e.message || 'Unknown error',
+        }).catch(() => {});
+      }
+    }
+  },
+);
+
+// ─── Trigger: editing jobs (existing) ───────────────────────────────
 exports.processEditingJob = onDocumentCreated(
   {
     document: 'editingJobs/{jobId}',

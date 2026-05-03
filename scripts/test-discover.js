@@ -30,10 +30,10 @@ const niche = process.argv[2] || 'finance news';
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 
   console.log(
-    `Done in ${elapsed}s — ${result.counts.reddit} Reddit + ${result.counts.hn} HN + ${result.counts.news} News\n`,
+    `Done in ${elapsed}s — ${result.counts.reddit} Reddit + ${result.counts.hn} HN + ${result.counts.news} News + ${result.counts.trends} Trends\n`,
   );
 
-  for (const source of ['reddit', 'hn', 'news']) {
+  for (const source of ['reddit', 'hn', 'news', 'trends']) {
     const items = result[source];
     if (!items.length) {
       console.log(`── ${source.toUpperCase()} ── (empty)\n`);
