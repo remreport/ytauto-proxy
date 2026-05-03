@@ -218,6 +218,43 @@ async function callAnthropic(apiKey, prompt, maxTokens = 3000) {
   return data.content?.find((b) => b.type === 'text')?.text || '';
 }
 
+function sanitizeJSON(text) {
+  let s = String(text || '');
+  s = s.replace(/```(?:json|JSON)?\s*/g, '').replace(/\s*```/g, '');
+  s = s.replace(/\/\/[^\n]*/g, '');
+  s = s.replace(/\/\*[\s\S]*?\*\//g, '');
+  s = s.replace(/,(\s*[}\]])/g, '$1');
+  return s.trim();
+}
+
+async function callAnthropicForJSON(apiKey, prompt, maxTokens = 4000) {
+  const raw = await callAnthropic(apiKey, prompt, maxTokens);
+  try {
+    return JSON.parse(sanitizeJSON(raw));
+  } catch (firstErr) {
+    console.warn(`JSON parse failed (${firstErr.message}) — retrying via Claude self-correction`);
+    const retryPrompt = `I tried to JSON.parse() the following text and it failed.
+
+Parse error: ${firstErr.message}
+
+Output ONLY the corrected JSON. No markdown fences, no commentary, no comments inside the JSON. Every property name and string value must use double quotes. No trailing commas. No JavaScript-only syntax. The output must parse cleanly with JSON.parse() in standard JavaScript.
+
+Original text:
+${raw}`;
+    const retryRaw = await callAnthropic(apiKey, retryPrompt, maxTokens);
+    try {
+      return JSON.parse(sanitizeJSON(retryRaw));
+    } catch (secondErr) {
+      const err = new Error(
+        `Claude returned unparseable JSON. First error: ${firstErr.message}. Retry error: ${secondErr.message}.`,
+      );
+      err.rawFirstResponse = raw.slice(0, 2000);
+      err.rawRetryResponse = retryRaw.slice(0, 2000);
+      throw err;
+    }
+  }
+}
+
 // Send timed sentences to Claude. Get back beats grouped to ~3 seconds,
 // each annotated with stock-search keywords + a Flux fallback prompt.
 // Beats are constrained to whole-sentence boundaries so timing always
@@ -267,13 +304,23 @@ For each beat, output:
 - keywords: 2-3 short visual keywords for stock-video search. Concrete nouns and visual concepts only — e.g. "city skyline at night", "person typing on laptop", "ocean waves crashing". Avoid abstract concepts.
 - fluxPrompt: a detailed photorealistic image generation prompt describing the same scene cinematically. One vivid sentence, 16:9, no text overlays.
 
-Output ONLY valid JSON. No preamble, no markdown fences, no commentary — just the array:
+CRITICAL JSON RULES — non-negotiable:
+- Output ONLY a JSON array. The first character must be [ and the last character must be ].
+- No markdown fences (no \`\`\`json, no \`\`\`).
+- No comments inside the JSON (no //, no /* */).
+- No trailing commas before ] or }.
+- Every property name and every string value must use double quotes ("…"), never single quotes.
+- Escape any double quotes that appear inside string values as \\".
+- No newlines inside string values — replace them with spaces.
+- The output must parse cleanly with standard JavaScript JSON.parse() on the first try.
+
+Example shape:
 
 [
   {
     "start": 0.2,
     "end": 1.7,
-    "sentence": "Hey, you. It's me.",
+    "sentence": "Hey, you. It is me.",
     "keywords": ["person waving at camera", "warm portrait"],
     "fluxPrompt": "Close-up portrait of a friendly person looking directly at camera with warm natural lighting, photorealistic, shallow depth of field"
   }
@@ -282,15 +329,9 @@ Output ONLY valid JSON. No preamble, no markdown fences, no commentary — just 
 Sentences:
 ${JSON.stringify(sentences)}`;
 
-  const text = await callAnthropic(anthropicKey, prompt);
-  const cleaned = text.replace(/```(?:json)?\s*|\s*```/g, '').trim();
-  try {
-    const beats = JSON.parse(cleaned);
-    if (!Array.isArray(beats)) throw new Error('expected an array');
-    return beats;
-  } catch (e) {
-    throw new Error(`Could not parse Claude beats response: ${e.message}. Raw: ${text.slice(0, 300)}`);
-  }
+  const beats = await callAnthropicForJSON(anthropicKey, prompt, 4000);
+  if (!Array.isArray(beats)) throw new Error('Claude returned non-array');
+  return beats;
 }
 
 // ─── Pexels (single-result per beat) ────────────────────────────────
