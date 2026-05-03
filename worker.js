@@ -1,4 +1,11 @@
-// worker.js — background processor for editingJobs.
+// worker.js — local debug-only background processor for editingJobs.
+//
+// PRODUCTION RUNS IN THE CLOUD.  The same logic lives in functions/index.js
+// as a Firebase Cloud Function triggered on editingJobs document creation.
+// That function processes every job in production — this script exists
+// only so you can iterate on worker code locally (start-worker.ps1) without
+// redeploying. Don't run this and the Cloud Function at the same time
+// against the same Firestore project: they'll race and double-process.
 //
 // Pipeline order (matters: sourcing reads captions for beat alignment):
 //   pending → captions → sourcing → rendering → done
