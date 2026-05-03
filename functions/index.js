@@ -121,6 +121,35 @@ async function callAnthropic(apiKey, prompt, maxTokens = 3000) {
   return data.content?.find((b) => b.type === 'text')?.text || '';
 }
 
+// Classify the script's overall tone into one of six moods. Used to
+// pick a background music track from the channel's library. Falls back
+// to 'calm' (least-likely-to-clash) if Claude returns something weird.
+// Mood enum must stay in sync with App.jsx MOODS constant.
+async function classifyTone(scriptText, anthropicKey) {
+  if (!scriptText || scriptText.trim().length < 10) return 'calm';
+  const prompt = `Classify the tone of this YouTube script as ONE of these moods:
+dramatic, educational, upbeat, calm, mysterious, inspirational
+
+Output ONLY the single mood word, lowercase, no explanation, no punctuation.
+
+Script:
+${scriptText.slice(0, 2500)}`;
+  const text = await callAnthropic(anthropicKey, prompt, 50);
+  const m = (text || '').toLowerCase().match(
+    /dramatic|educational|upbeat|calm|mysterious|inspirational/,
+  );
+  return m ? m[0] : 'calm';
+}
+
+async function pickMusicTrack(channelId, mood) {
+  const snap = await db.collection('channels').doc(channelId)
+    .collection('musicTracks').where('mood', '==', mood).get();
+  if (snap.empty) return null;
+  const tracks = snap.docs.map((d) => d.data());
+  const picked = tracks[Math.floor(Math.random() * tracks.length)];
+  return picked.url || null;
+}
+
 async function breakIntoBeats(captions, anthropicKey) {
   const sentences = captions.map((s, i) => ({
     index: i,
@@ -399,6 +428,30 @@ async function processJob(job) {
     updatedAt: FieldValue.serverTimestamp(),
   });
 
+  // Step 2.5 — pick background music. Tone classifier reads the script;
+  // we query the channel's musicTracks for matching mood and pick at
+  // random. Failure is non-fatal — render proceeds without music.
+  let musicUrl = null;
+  let pickedMood = null;
+  try {
+    pickedMood = await classifyTone(
+      captions.map((c) => c.text).join(' '),
+      anthropicKey,
+    );
+    musicUrl = await pickMusicTrack(job.channelId, pickedMood);
+    console.log(`tone=${pickedMood}, music=${musicUrl ? 'picked' : 'no track for this mood'}`);
+  } catch (e) {
+    console.warn(`Music pick failed: ${e.message} — proceeding without`);
+  }
+  await jobRef.update({
+    musicUrl,
+    pickedMood,
+    currentStep: musicUrl
+      ? `Music: ${pickedMood}`
+      : (pickedMood ? `No ${pickedMood} track in library — silent music bed` : 'No music'),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
   // Step 3 — Remotion Lambda render
   await jobRef.update({
     status: 'rendering',
@@ -409,7 +462,7 @@ async function processJob(job) {
   // Lambda needs AWS creds — in Cloud Functions they come from secrets.
   // The @remotion/lambda-client picks them up from process.env.
   const s3OutputUrl = await renderOnLambda(
-    {voiceoverUrl: job.voiceoverUrl, footage, captions},
+    {voiceoverUrl: job.voiceoverUrl, footage, captions, musicUrl},
     jobRef,
   );
   await jobRef.update({

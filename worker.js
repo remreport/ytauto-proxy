@@ -222,6 +222,32 @@ async function callAnthropic(apiKey, prompt, maxTokens = 3000) {
 // each annotated with stock-search keywords + a Flux fallback prompt.
 // Beats are constrained to whole-sentence boundaries so timing always
 // aligns with real audio.
+// Tone classifier + music picker — kept in sync with functions/index.js.
+async function classifyTone(scriptText, anthropicKey) {
+  if (!scriptText || scriptText.trim().length < 10) return 'calm';
+  const prompt = `Classify the tone of this YouTube script as ONE of these moods:
+dramatic, educational, upbeat, calm, mysterious, inspirational
+
+Output ONLY the single mood word, lowercase, no explanation, no punctuation.
+
+Script:
+${scriptText.slice(0, 2500)}`;
+  const text = await callAnthropic(anthropicKey, prompt, 50);
+  const m = (text || '').toLowerCase().match(
+    /dramatic|educational|upbeat|calm|mysterious|inspirational/,
+  );
+  return m ? m[0] : 'calm';
+}
+
+async function pickMusicTrack(channelId, mood) {
+  const snap = await db.collection('channels').doc(channelId)
+    .collection('musicTracks').where('mood', '==', mood).get();
+  if (snap.empty) return null;
+  const tracks = snap.docs.map((d) => d.data());
+  const picked = tracks[Math.floor(Math.random() * tracks.length)];
+  return picked.url || null;
+}
+
 async function breakIntoBeats(captions, anthropicKey) {
   const sentences = captions.map((s, i) => ({
     index: i,
@@ -454,6 +480,28 @@ async function processJob(job) {
   });
   console.log(`[${job.id}] sourced ${footage.length} beats (${pexCount} Pexels, ${fluxCount} Flux)`);
 
+  // Step 2.5 — pick background music
+  let musicUrl = null;
+  let pickedMood = null;
+  try {
+    pickedMood = await classifyTone(
+      captions.map((c) => c.text).join(' '),
+      anthropicKey,
+    );
+    musicUrl = await pickMusicTrack(job.channelId, pickedMood);
+    console.log(`[${job.id}] tone=${pickedMood}, music=${musicUrl ? 'picked' : 'no track'}`);
+  } catch (e) {
+    console.warn(`[${job.id}] music pick failed: ${e.message}`);
+  }
+  await jobRef.update({
+    musicUrl,
+    pickedMood,
+    currentStep: musicUrl
+      ? `Music: ${pickedMood}`
+      : (pickedMood ? `No ${pickedMood} track in library` : 'No music'),
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+
   // Step 3 — render: REAL (Remotion Lambda)
   await jobRef.update({
     status: 'rendering',
@@ -466,6 +514,7 @@ async function processJob(job) {
       voiceoverUrl: job.voiceoverUrl,
       footage,
       captions,
+      musicUrl,
     },
     jobRef,
   );
