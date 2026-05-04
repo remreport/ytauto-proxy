@@ -393,15 +393,43 @@ Sentences:
 ${JSON.stringify(sentences2)}`;
     result = await callAnthropicWithTool(anthropicKey, retryPrompt, BEATS_TOOL, 4096);
   }
-  const beats = result?.beats;
-  if (!Array.isArray(beats) || beats.length === 0) {
-    const preview = validSentences.map((s) => s.text).join(' ').slice(0, 200);
-    const err = new Error(
-      `Claude refused to generate beats. Transcription preview: "${preview}". Try a fresh voiceover.`,
-    );
-    err.code = 'NO_BEATS';
-    err.diagnosticInput = {sentencesGiven: sentences2, claudeReturnedBeats: beats};
-    throw err;
+  if (Array.isArray(result?.beats) && result.beats.length > 0) {
+    return result.beats;
+  }
+  // Naive fallback (parity with functions/index.js)
+  console.warn('breakIntoBeats: both Claude attempts returned 0 beats — naive grouping');
+  return naiveGroupSentences(validSentences);
+}
+
+function naiveGroupSentences(sentences) {
+  const STOPWORDS = new Set([
+    'the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'been', 'were',
+    'they', 'their', 'what', 'when', 'which', 'about', 'would', 'could', 'should',
+    'more', 'than', 'other', 'these', 'those', 'into', 'over', 'just', 'like',
+    'people', 'also', 'because', 'while', 'after', 'before', 'where', 'every',
+  ]);
+  const beats = [];
+  let i = 0;
+  while (i < sentences.length) {
+    const startSent = sentences[i];
+    let endSent = startSent;
+    let combinedText = startSent.text;
+    let j = i;
+    while (j + 1 < sentences.length && (sentences[j + 1].end - startSent.start) < 3.5) {
+      j++;
+      endSent = sentences[j];
+      combinedText += ' ' + sentences[j].text;
+    }
+    const words = (combinedText.toLowerCase().match(/[a-z]{4,}/g) || []).filter((w) => !STOPWORDS.has(w));
+    const keywords = Array.from(new Set(words)).slice(0, 3);
+    beats.push({
+      start: startSent.start,
+      end: endSent.end,
+      sentence: combinedText,
+      keywords: keywords.length ? keywords : ['abstract', 'atmospheric scene'],
+      fluxPrompt: `Cinematic photorealistic scene illustrating: ${combinedText.slice(0, 180)}. 16:9, soft natural lighting, no text overlays.`,
+    });
+    i = j + 1;
   }
   return beats;
 }

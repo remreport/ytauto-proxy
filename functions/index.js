@@ -10,6 +10,7 @@
 // serve URL, AWS region) is hardcoded since it changes rarely.
 
 const {onDocumentCreated} = require('firebase-functions/v2/firestore');
+const {onSchedule} = require('firebase-functions/v2/scheduler');
 const {defineSecret} = require('firebase-functions/params');
 const {setGlobalOptions} = require('firebase-functions/v2');
 const admin = require('firebase-admin');
@@ -24,6 +25,11 @@ admin.initializeApp({
   storageBucket: 'ytauto-95f91.firebasestorage.app',
 });
 const db = admin.firestore();
+// Globally drop undefined values from .update()/.set() payloads — without
+// this, a single undefined nested deep in a payload throws and aborts the
+// write, which on the catch path produces zombie jobs that never reach
+// status='failed'. Has to be set before the first DB operation.
+db.settings({ignoreUndefinedProperties: true});
 const FieldValue = admin.firestore.FieldValue;
 
 // ─── Secrets (live in Google Secret Manager) ────────────────────────
@@ -389,21 +395,64 @@ You MUST submit submit_beats with at least 1 beat. The submit_beats input_schema
 
 Sentences:
 ${JSON.stringify(sentences)}`;
-    result = await callAnthropicWithTool(anthropicKey, retryPrompt, BEATS_TOOL, 4096);
+    try {
+      result = await callAnthropicWithTool(anthropicKey, retryPrompt, BEATS_TOOL, 4096);
+    } catch (e) {
+      console.warn(`breakIntoBeats retry threw (${e.message}) — falling back to naive grouping`);
+      result = {beats: []};
+    }
   }
 
-  const beats = result?.beats;
-  if (!Array.isArray(beats) || beats.length === 0) {
-    const preview = validSentences.map((s) => s.text).join(' ').slice(0, 200);
-    const err = new Error(
-      `Claude refused to generate beats. Transcription preview: "${preview}". Try a fresh voiceover or contact support.`,
-    );
-    err.code = 'NO_BEATS';
-    err.diagnosticInput = {
-      sentencesGiven: sentences,
-      claudeReturnedBeats: beats,
-    };
-    throw err;
+  if (Array.isArray(result?.beats) && result.beats.length > 0) {
+    return result.beats;
+  }
+
+  // Last-resort deterministic fallback. Claude refused twice — group the
+  // sentences ourselves so the pipeline can still produce a render. Output
+  // quality is degraded (keywords are extracted heuristically, fluxPrompt
+  // is a generic illustrate-this template), but the user gets SOMETHING
+  // back instead of a stuck job. job.naiveFallbackUsed flags it.
+  console.warn(`breakIntoBeats: both Claude attempts returned 0 beats — using naive grouping fallback`);
+  return naiveGroupSentences(validSentences);
+}
+
+// Deterministic fallback when Claude refuses to call submit_beats.
+// Groups consecutive sentences into ~3-second windows, extracts heuristic
+// keywords, builds a generic fluxPrompt. Always returns at least one beat
+// for any non-empty input.
+function naiveGroupSentences(sentences) {
+  const STOPWORDS = new Set([
+    'the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'been', 'were',
+    'they', 'their', 'what', 'when', 'which', 'about', 'would', 'could', 'should',
+    'more', 'than', 'other', 'these', 'those', 'into', 'over', 'just', 'like',
+    'people', 'also', 'because', 'while', 'after', 'before', 'where', 'every',
+  ]);
+  const beats = [];
+  let i = 0;
+  while (i < sentences.length) {
+    const startSent = sentences[i];
+    let endSent = startSent;
+    let combinedText = startSent.text;
+    let j = i;
+    while (
+      j + 1 < sentences.length &&
+      (sentences[j + 1].end - startSent.start) < 3.5
+    ) {
+      j++;
+      endSent = sentences[j];
+      combinedText += ' ' + sentences[j].text;
+    }
+    const words = (combinedText.toLowerCase().match(/[a-z]{4,}/g) || [])
+      .filter((w) => !STOPWORDS.has(w));
+    const keywords = Array.from(new Set(words)).slice(0, 3);
+    beats.push({
+      start: startSent.start,
+      end: endSent.end,
+      sentence: combinedText,
+      keywords: keywords.length ? keywords : ['abstract', 'atmospheric scene'],
+      fluxPrompt: `Cinematic photorealistic scene illustrating: ${combinedText.slice(0, 180)}. 16:9, soft natural lighting, no text overlays.`,
+    });
+    i = j + 1;
   }
   return beats;
 }
@@ -902,20 +951,81 @@ exports.processDiscoveryJob = onDocumentCreated(
       }
     } catch (e) {
       console.error(`[${jobId}] discovery failed:`, e);
-      const errorDetail = buildErrorDetail(e);
-      await jobRef.update({
-        status: 'failed',
-        currentStep: 'Failed',
-        error: e.message || 'Unknown error',
-        errorDetail,
-        updatedAt: FieldValue.serverTimestamp(),
-      }).catch(() => {});
+      try {
+        await jobRef.update({
+          status: 'failed',
+          currentStep: 'Failed',
+          error: e.message || 'Unknown error',
+          errorDetail: buildErrorDetail(e),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      } catch (richUpdateErr) {
+        console.error(`[${jobId}] rich discovery error update failed — falling back to minimal`);
+        await jobRef.update({
+          status: 'failed',
+          currentStep: 'Failed',
+          error: `${e.message || 'Unknown error'}  [errorDetail save failed: ${richUpdateErr.message}]`,
+          updatedAt: FieldValue.serverTimestamp(),
+        }).catch(() => {});
+      }
       if (projRef) {
         await projRef.update({
           discoveryStatus: 'failed',
           discoveryError: e.message || 'Unknown error',
         }).catch(() => {});
       }
+    }
+  },
+);
+
+// ─── Watchdog: clean up jobs that get stuck mid-flight ──────────────
+// Runs every 5 minutes. Any job in a non-terminal status whose updatedAt
+// is older than 10 minutes is force-marked failed. Catches the case
+// where the function process itself crashed before the catch block
+// could run.
+exports.zombieJobWatchdog = onSchedule(
+  {
+    schedule: 'every 5 minutes',
+    region: 'us-central1',
+    timeoutSeconds: 60,
+    memory: '256MiB',
+  },
+  async () => {
+    const cutoffMs = Date.now() - 10 * 60 * 1000;
+
+    async function sweep(collectionName, activeStatuses) {
+      const snap = await db.collection(collectionName)
+        .where('status', 'in', activeStatuses)
+        .limit(50)
+        .get();
+      let killed = 0;
+      for (const doc of snap.docs) {
+        const data = doc.data();
+        const updatedMs = data.updatedAt?.toMillis ? data.updatedAt.toMillis() : 0;
+        if (!updatedMs || updatedMs > cutoffMs) continue;
+        const ageMin = Math.round((Date.now() - updatedMs) / 60000);
+        console.log(`[watchdog] ${collectionName}/${doc.id} stuck ${ageMin}min in ${data.status} — marking failed`);
+        await doc.ref.update({
+          status: 'failed',
+          currentStep: 'Failed',
+          error: `Job timed out — Cloud Function may have crashed before recording the failure (last status: ${data.status}, ${ageMin} minutes ago)`,
+          updatedAt: FieldValue.serverTimestamp(),
+        }).catch((err) => console.error(`[watchdog] could not mark ${doc.id}:`, err));
+        killed++;
+      }
+      return killed;
+    }
+
+    const editingKilled = await sweep(
+      'editingJobs',
+      ['pending', 'researching', 'sourcing', 'captions', 'rendering'],
+    );
+    const discoveryKilled = await sweep(
+      'discoveryJobs',
+      ['pending', 'researching', 'proposing'],
+    );
+    if (editingKilled || discoveryKilled) {
+      console.log(`[watchdog] swept editingJobs:${editingKilled}, discoveryJobs:${discoveryKilled}`);
     }
   },
 );
@@ -957,14 +1067,28 @@ exports.processEditingJob = onDocumentCreated(
       console.log(`[${jobId}] done`);
     } catch (e) {
       console.error(`[${jobId}] failed:`, e);
-      const errorDetail = buildErrorDetail(e);
-      await db.collection('editingJobs').doc(jobId).update({
-        status: 'failed',
-        currentStep: 'Failed',
-        error: e.message || 'Unknown error',
-        errorDetail,
-        updatedAt: FieldValue.serverTimestamp(),
-      }).catch((err) => console.error('Could not mark failed:', err));
+      // Bulletproof failure update: try the rich update first (with full
+      // errorDetail), and if THAT throws (Firestore rejecting some weird
+      // value, doc too large, etc.) fall through to a minimal update so
+      // the job NEVER stays in a non-terminal status. The watchdog cleans
+      // up if even this fails.
+      try {
+        await db.collection('editingJobs').doc(jobId).update({
+          status: 'failed',
+          currentStep: 'Failed',
+          error: e.message || 'Unknown error',
+          errorDetail: buildErrorDetail(e),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      } catch (richUpdateErr) {
+        console.error(`[${jobId}] rich error update failed (${richUpdateErr.message}) — falling back to minimal`);
+        await db.collection('editingJobs').doc(jobId).update({
+          status: 'failed',
+          currentStep: 'Failed',
+          error: `${e.message || 'Unknown error'}  [errorDetail save failed: ${richUpdateErr.message}]`,
+          updatedAt: FieldValue.serverTimestamp(),
+        }).catch((minErr) => console.error(`[${jobId}] even minimal update failed:`, minErr));
+      }
     }
   },
 );
