@@ -64,6 +64,10 @@ const POLL_INTERVAL_MS = 30 * 1000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ─── Remotion Lambda render ─────────────────────────────────────────
+function isAwsRateLimitError(message) {
+  return /rate.{0,5}exceeded|concurrency.{0,5}limit|throttl/i.test(message || '');
+}
+
 async function renderOnLambda(inputProps, jobRef) {
   const region = process.env.AWS_REGION || 'us-east-1';
   const functionName = process.env.REMOTION_LAMBDA_FUNCTION_NAME;
@@ -72,7 +76,7 @@ async function renderOnLambda(inputProps, jobRef) {
     throw new Error('REMOTION_LAMBDA_FUNCTION_NAME and REMOTION_LAMBDA_SERVE_URL env vars required');
   }
 
-  const {renderId, bucketName} = await renderMediaOnLambda({
+  const renderArgs = {
     region,
     functionName,
     serveUrl,
@@ -81,13 +85,34 @@ async function renderOnLambda(inputProps, jobRef) {
     codec: 'h264',
     privacy: 'public',
     imageFormat: 'jpeg',
-    // New AWS accounts default to ~10 concurrent Lambda invocations.
-    // framesPerLambda=200 keeps a 13s render to ~2 invocations and a
-    // 30s render to ~5 — well under the limit. Increase via AWS Service
-    // Quotas later if longer renders need more parallelism.
-    framesPerLambda: 200,
-    maxRetries: 2,
-  });
+    framesPerLambda: 2000,
+    concurrencyPerLambda: 4,
+    maxRetries: 5,
+  };
+
+  let renderId;
+  let bucketName;
+  let attempt = 0;
+  const maxAttempts = 3;
+  while (attempt < maxAttempts) {
+    attempt++;
+    try {
+      const result = await renderMediaOnLambda(renderArgs);
+      renderId = result.renderId;
+      bucketName = result.bucketName;
+      break;
+    } catch (e) {
+      if (!isAwsRateLimitError(e.message) || attempt >= maxAttempts) throw e;
+      const delaySec = attempt * 30;
+      console.warn(`Lambda submission rate-limited (attempt ${attempt}/${maxAttempts}) — retry in ${delaySec}s`);
+      await jobRef.update({
+        currentStep: `AWS render slot busy — retrying in ${delaySec}s (attempt ${attempt}/${maxAttempts})`,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      await sleep(delaySec * 1000);
+    }
+  }
+  if (!renderId) throw new Error('Lambda submission failed after retries');
   console.log(`  Lambda renderId: ${renderId}`);
 
   let lastPct = -1;
@@ -97,8 +122,13 @@ async function renderOnLambda(inputProps, jobRef) {
       renderId, bucketName, functionName, region,
     });
     if (progress.fatalErrorEncountered) {
-      const err = progress.errors?.[0]?.message || 'unknown Lambda render error';
-      throw new Error(`Lambda render failed: ${err}`);
+      const raw = progress.errors?.[0]?.message || 'unknown Lambda render error';
+      if (isAwsRateLimitError(raw)) {
+        throw new Error(
+          'AWS render slot was busy and the per-chunk retries also exhausted. Your AWS account is at its concurrent-Lambda quota. Wait a few minutes and click Retry, or request a quota increase.',
+        );
+      }
+      throw new Error(`Lambda render failed: ${raw}`);
     }
     const pct = Math.round((progress.overallProgress || 0) * 100);
     if (pct !== lastPct) {

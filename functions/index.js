@@ -582,10 +582,14 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
 }
 
 // ─── Remotion Lambda ────────────────────────────────────────────────
+function isAwsRateLimitError(message) {
+  return /rate.{0,5}exceeded|concurrency.{0,5}limit|throttl/i.test(message || '');
+}
+
 async function renderOnLambda(inputProps, jobRef) {
   const {renderMediaOnLambda, getRenderProgress} = require('@remotion/lambda-client');
 
-  const {renderId, bucketName} = await renderMediaOnLambda({
+  const renderArgs = {
     region: AWS_REGION,
     functionName: REMOTION_LAMBDA_FUNCTION_NAME,
     serveUrl: REMOTION_LAMBDA_SERVE_URL,
@@ -594,25 +598,66 @@ async function renderOnLambda(inputProps, jobRef) {
     codec: 'h264',
     privacy: 'public',
     imageFormat: 'jpeg',
-    framesPerLambda: 200,
-    maxRetries: 2,
-  });
+    // Higher framesPerLambda = fewer concurrent Lambdas. New AWS accounts
+    // start with a 10 concurrent execution quota; 2000 frames/Lambda keeps
+    // a 5-min/30fps render to ~5 Lambdas, a 10-min render to ~9. Once the
+    // quota increase comes through we can drop this back down for speed.
+    framesPerLambda: 2000,
+    // 4 frames rendered concurrently inside each Lambda — uses the 3GB
+    // memory better and ~4× the effective render speed without spawning
+    // more outer Lambdas. Stays inside the function's 300s timeout.
+    concurrencyPerLambda: 4,
+    // Per-Lambda invocation retries; Remotion handles transient throttles
+    // at the chunk level automatically.
+    maxRetries: 5,
+  };
+
+  // Outer retry: the initial spawn can be rejected by AWS even when later
+  // invocations would succeed. Exponential backoff between attempts.
+  let renderId;
+  let bucketName;
+  let attempt = 0;
+  const maxAttempts = 3;
+  while (attempt < maxAttempts) {
+    attempt++;
+    try {
+      const result = await renderMediaOnLambda(renderArgs);
+      renderId = result.renderId;
+      bucketName = result.bucketName;
+      break;
+    } catch (e) {
+      if (!isAwsRateLimitError(e.message) || attempt >= maxAttempts) throw e;
+      const delaySec = attempt * 30; // 30s, 60s
+      console.warn(
+        `Lambda submission rate-limited (attempt ${attempt}/${maxAttempts}) — retry in ${delaySec}s`,
+      );
+      await jobRef.update({
+        currentStep: `AWS render slot busy — retrying in ${delaySec}s (attempt ${attempt}/${maxAttempts})`,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      await sleep(delaySec * 1000);
+    }
+  }
   console.log(`Lambda renderId: ${renderId}`);
 
   let lastPct = -1;
   while (true) {
     await sleep(3000);
-    const {getRenderProgress: getProgress} = require('@remotion/lambda-client');
-    const progress = await getProgress({
+    const progress = await getRenderProgress({
       renderId,
       bucketName,
       functionName: REMOTION_LAMBDA_FUNCTION_NAME,
       region: AWS_REGION,
     });
     if (progress.fatalErrorEncountered) {
-      throw new Error(
-        `Lambda render failed: ${progress.errors?.[0]?.message || 'unknown'}`,
-      );
+      const raw = progress.errors?.[0]?.message || 'unknown error';
+      // Rephrase rate limits with actionable guidance
+      if (isAwsRateLimitError(raw)) {
+        throw new Error(
+          `AWS render slot was busy and the per-chunk retries also exhausted. Your AWS account is at its concurrent-Lambda quota (default 10 for new accounts). Wait a few minutes and click Retry, or request a quota increase from AWS Service Quotas.`,
+        );
+      }
+      throw new Error(`Lambda render failed: ${raw}`);
     }
     const pct = Math.round((progress.overallProgress || 0) * 100);
     if (pct !== lastPct) {
