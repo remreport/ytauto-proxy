@@ -125,7 +125,140 @@ async function callAnthropic(apiKey, prompt, maxTokens = 3000) {
 // Best-effort cleanup before JSON.parse: strips markdown fences, line
 // and block comments, trailing commas, leading/trailing whitespace.
 // Anything more exotic falls through to the Claude retry path below.
-// JSON helpers — robust against Claude's occasional fences/comments/trailing-commas.
+// Anthropic tool use — gives Claude a JSON Schema. The API validates
+// the response against the schema server-side and returns a structured
+// tool_use block whose .input is already an object. No text-mode JSON
+// parsing on our side, so unescaped quotes / fences / trailing commas
+// in narrative content can't break the pipeline.
+async function callAnthropicWithTool(apiKey, prompt, tool, maxTokens = 4096) {
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: maxTokens,
+      tools: [tool],
+      tool_choice: {type: 'tool', name: tool.name},
+      messages: [{role: 'user', content: prompt}],
+    }),
+  });
+  if (!resp.ok) {
+    throw new Error(`Anthropic ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  }
+  const data = await resp.json();
+  const toolUse = (data.content || []).find((b) => b.type === 'tool_use');
+  if (!toolUse) {
+    const fallbackText = (data.content || []).find((b) => b.type === 'text')?.text || '';
+    const err = new Error('Claude did not return a tool_use block');
+    err.fallbackText = fallbackText.slice(0, 2000);
+    throw err;
+  }
+  return toolUse.input;
+}
+
+// Tool schemas — kept here so they live next to the call sites.
+const BEATS_TOOL = {
+  name: 'submit_beats',
+  description: 'Submit the timed beats for a YouTube video. Each beat is a contiguous group of whole sentences that will be rendered with one stock clip or one Flux-generated image.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      beats: {
+        type: 'array',
+        description: 'Array of beats in chronological order. Beats must consist of whole sentences from the input transcript — never split a sentence mid-way.',
+        items: {
+          type: 'object',
+          properties: {
+            start: {type: 'number', description: 'Start time of the first sentence in the beat (seconds, decimal).'},
+            end: {type: 'number', description: 'End time of the last sentence in the beat (seconds, decimal).'},
+            sentence: {type: 'string', description: 'Concatenated sentence text for this beat.'},
+            keywords: {
+              type: 'array',
+              items: {type: 'string'},
+              description: '2-3 short concrete visual keywords for stock-video search (e.g. "city skyline at night"). Avoid abstract concepts.',
+            },
+            fluxPrompt: {type: 'string', description: 'A detailed photorealistic image generation prompt describing the same scene cinematically. One vivid sentence, 16:9, no text overlays.'},
+          },
+          required: ['start', 'end', 'sentence', 'keywords', 'fluxPrompt'],
+        },
+      },
+    },
+    required: ['beats'],
+  },
+};
+
+const TOPIC_PROPOSAL_TOOL = {
+  name: 'submit_topic_proposal',
+  description: 'Submit the chosen YouTube topic from a list of trending candidates plus 5 ranked viral title variants.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      pickedTopic: {type: 'string', description: 'Concise topic title, 6-12 words.'},
+      pickedTopicSummary: {type: 'string', description: '2-3 sentence summary of what the video would cover.'},
+      pickedTopicReasoning: {type: 'string', description: '1-2 sentence reasoning citing source convergence, freshness, and niche fit.'},
+      pickedTopicSources: {
+        type: 'array',
+        items: {type: 'string', enum: ['reddit', 'hn', 'news', 'trends']},
+        description: 'Which sources the picked topic appeared on.',
+      },
+      titleVariants: {
+        type: 'array',
+        description: 'Exactly 5 ranked title variants for the picked topic.',
+        items: {
+          type: 'object',
+          properties: {
+            title: {type: 'string'},
+            ctrPrediction: {type: 'string', enum: ['high', 'medium-high', 'medium']},
+            reasoning: {type: 'string', description: 'One short sentence explaining the title pattern and why it should hook viewers.'},
+          },
+          required: ['title', 'ctrPrediction', 'reasoning'],
+        },
+      },
+      pickedTitle: {type: 'string', description: 'The title from titleVariants predicted to have highest CTR (must match one of the variants exactly).'},
+    },
+    required: ['pickedTopic', 'pickedTopicSummary', 'pickedTopicReasoning', 'titleVariants', 'pickedTitle'],
+  },
+};
+
+// JSON helpers — kept for any future text-JSON callers, plus richer
+// diagnostics on parse failure.
+function extractErrorContext(text, errorMessage) {
+  const posMatch = /position (\d+)/i.exec(errorMessage || '');
+  if (!posMatch) return null;
+  const pos = parseInt(posMatch[1], 10);
+  const lineMatch = /line (\d+) column (\d+)/i.exec(errorMessage || '');
+  return {
+    position: pos,
+    line: lineMatch ? parseInt(lineMatch[1], 10) : null,
+    column: lineMatch ? parseInt(lineMatch[2], 10) : null,
+    before: text.slice(Math.max(0, pos - 100), pos),
+    at: text.slice(pos, pos + 1),
+    after: text.slice(pos + 1, pos + 100),
+  };
+}
+
+// Pull every diagnostic field off an error so the failed job doc has
+// enough context for me to debug without instrumenting anything else.
+// Saves full raw responses (no truncation) — Firestore strings can be
+// up to 1 MiB and Claude's longest replies are ~30 KB.
+function buildErrorDetail(e) {
+  const detail = {
+    message: e?.message || 'Unknown error',
+    code: e?.code || null,
+    name: e?.name || null,
+  };
+  if (e?.rawFirstResponse) detail.rawFirstResponse = e.rawFirstResponse;
+  if (e?.rawRetryResponse) detail.rawRetryResponse = e.rawRetryResponse;
+  if (e?.firstContext) detail.firstContext = e.firstContext;
+  if (e?.retryContext) detail.retryContext = e.retryContext;
+  if (e?.fallbackText) detail.fallbackText = e.fallbackText;
+  return detail;
+}
+
 function sanitizeJSON(text) {
   let s = String(text || '');
   s = s.replace(/```(?:json|JSON)?\s*/g, '').replace(/\s*```/g, '');
@@ -161,8 +294,11 @@ ${raw}`;
       const err = new Error(
         `Claude returned unparseable JSON. First error: ${firstErr.message}. Retry error: ${secondErr.message}.`,
       );
-      err.rawFirstResponse = raw.slice(0, 2000);
-      err.rawRetryResponse = retryRaw.slice(0, 2000);
+      err.code = 'JSON_PARSE_FAILED';
+      err.rawFirstResponse = raw;
+      err.rawRetryResponse = retryRaw;
+      err.firstContext = extractErrorContext(sanitizeJSON(raw), firstErr.message);
+      err.retryContext = extractErrorContext(sanitizeJSON(retryRaw), secondErr.message);
       throw err;
     }
   }
@@ -207,42 +343,23 @@ async function breakIntoBeats(captions, anthropicKey) {
 
   const prompt = `You are given timed sentences from a YouTube video transcript.
 
-Group consecutive sentences into "beats" of approximately 3 seconds. A beat must consist of one or more whole consecutive sentences — never split a sentence mid-way. Combine adjacent short sentences when needed; keep long sentences (>3.5s) as their own beat.
+Group consecutive sentences into beats of approximately 3 seconds. A beat must consist of one or more whole consecutive sentences — never split a sentence mid-way. Combine adjacent short sentences when needed; keep long sentences (>3.5s) as their own beat.
 
-For each beat, output:
-- start: start time of the first sentence in the beat (seconds, decimal)
-- end: end time of the last sentence in the beat (seconds, decimal)
-- sentence: concatenated sentence text
-- keywords: 2-3 short visual keywords for stock-video search. Concrete nouns and visual concepts only — e.g. "city skyline at night", "person typing on laptop", "ocean waves crashing". Avoid abstract concepts.
-- fluxPrompt: a detailed photorealistic image generation prompt describing the same scene cinematically. One vivid sentence, 16:9, no text overlays.
+For each beat, decide:
+- start / end timing (seconds, from the input)
+- 2-3 concrete visual keywords for stock-video search (avoid abstract concepts)
+- A detailed photorealistic image-generation prompt for the same scene (16:9, no text overlays, one vivid sentence)
 
-CRITICAL JSON RULES — non-negotiable:
-- Output ONLY a JSON array. The first character must be [ and the last character must be ].
-- No markdown fences (no \`\`\`json, no \`\`\`).
-- No comments inside the JSON (no //, no /* */).
-- No trailing commas before ] or }.
-- Every property name and every string value must use double quotes ("…"), never single quotes.
-- Escape any double quotes that appear inside string values as \\".
-- No newlines inside string values — replace them with spaces.
-- The output must parse cleanly with standard JavaScript JSON.parse() on the first try.
-
-Example shape:
-
-[
-  {
-    "start": 0.2,
-    "end": 1.7,
-    "sentence": "Hey, you. It is me.",
-    "keywords": ["person waving at camera", "warm portrait"],
-    "fluxPrompt": "Close-up portrait of a friendly person looking directly at camera with warm natural lighting, photorealistic, shallow depth of field"
-  }
-]
+Submit your beats via the submit_beats tool.
 
 Sentences:
 ${JSON.stringify(sentences)}`;
 
-  const beats = await callAnthropicForJSON(anthropicKey, prompt, 4000);
-  if (!Array.isArray(beats)) throw new Error('Claude returned non-array');
+  const result = await callAnthropicWithTool(anthropicKey, prompt, BEATS_TOOL, 4096);
+  const beats = result?.beats;
+  if (!Array.isArray(beats) || beats.length === 0) {
+    throw new Error('submit_beats tool returned no beats');
+  }
   return beats;
 }
 
@@ -628,39 +745,14 @@ Then generate 5 viral title variants for that topic, ranked by predicted CTR usi
 - News hook: "What [news event] really means"
 - Question hook: "Did [X] just signal [Y]?"
 
-CRITICAL JSON RULES — non-negotiable:
-- Output ONLY a JSON object. The first character must be { and the last character must be }.
-- No markdown fences (no \`\`\`json, no \`\`\`).
-- No comments inside the JSON (no //, no /* */).
-- No trailing commas before ] or }.
-- Every property name and every string value must use double quotes ("…"), never single quotes.
-- Escape any double quotes that appear inside string values as \\".
-- No newlines inside string values — replace them with spaces.
-- The output must parse cleanly with standard JavaScript JSON.parse() on the first try.
-
-Example shape:
-
-{
-  "pickedTopic": "<concise topic title, 6-12 words>",
-  "pickedTopicSummary": "<2-3 sentence summary of what the video would cover>",
-  "pickedTopicReasoning": "<1-2 sentence reasoning for why this beat the others — cite source convergence, freshness, fit>",
-  "pickedTopicSources": ["reddit", "news"],
-  "titleVariants": [
-    {"title": "...", "ctrPrediction": "high|medium-high|medium", "reasoning": "<one short sentence>"},
-    {"title": "...", "ctrPrediction": "...", "reasoning": "..."},
-    {"title": "...", "ctrPrediction": "...", "reasoning": "..."},
-    {"title": "...", "ctrPrediction": "...", "reasoning": "..."},
-    {"title": "...", "ctrPrediction": "...", "reasoning": "..."}
-  ],
-  "pickedTitle": "<the title from the variants array predicted to have highest CTR>"
-}
+Submit your proposal via the submit_topic_proposal tool. Include exactly 5 title variants and ensure pickedTitle exactly matches one of them.
 
 Topics:
 ${JSON.stringify(allTopics, null, 2)}`;
 
-  const parsed = await callAnthropicForJSON(anthropicKey, prompt, 4000);
+  const parsed = await callAnthropicWithTool(anthropicKey, prompt, TOPIC_PROPOSAL_TOOL, 4096);
   if (!parsed.pickedTopic || !Array.isArray(parsed.titleVariants) || parsed.titleVariants.length < 1) {
-    throw new Error('Claude response missing required fields');
+    throw new Error('submit_topic_proposal tool returned malformed proposal');
   }
   return parsed;
 }
@@ -765,10 +857,12 @@ exports.processDiscoveryJob = onDocumentCreated(
       }
     } catch (e) {
       console.error(`[${jobId}] discovery failed:`, e);
+      const errorDetail = buildErrorDetail(e);
       await jobRef.update({
         status: 'failed',
         currentStep: 'Failed',
         error: e.message || 'Unknown error',
+        errorDetail,
         updatedAt: FieldValue.serverTimestamp(),
       }).catch(() => {});
       if (projRef) {
@@ -818,10 +912,12 @@ exports.processEditingJob = onDocumentCreated(
       console.log(`[${jobId}] done`);
     } catch (e) {
       console.error(`[${jobId}] failed:`, e);
+      const errorDetail = buildErrorDetail(e);
       await db.collection('editingJobs').doc(jobId).update({
         status: 'failed',
         currentStep: 'Failed',
         error: e.message || 'Unknown error',
+        errorDetail,
         updatedAt: FieldValue.serverTimestamp(),
       }).catch((err) => console.error('Could not mark failed:', err));
     }

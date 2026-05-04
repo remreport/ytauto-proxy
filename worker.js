@@ -218,6 +218,62 @@ async function callAnthropic(apiKey, prompt, maxTokens = 3000) {
   return data.content?.find((b) => b.type === 'text')?.text || '';
 }
 
+// Anthropic tool use — see comment in functions/index.js for rationale.
+async function callAnthropicWithTool(apiKey, prompt, tool, maxTokens = 4096) {
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: maxTokens,
+      tools: [tool],
+      tool_choice: {type: 'tool', name: tool.name},
+      messages: [{role: 'user', content: prompt}],
+    }),
+  });
+  if (!resp.ok) {
+    throw new Error(`Anthropic ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+  }
+  const data = await resp.json();
+  const toolUse = (data.content || []).find((b) => b.type === 'tool_use');
+  if (!toolUse) {
+    const fallbackText = (data.content || []).find((b) => b.type === 'text')?.text || '';
+    const err = new Error('Claude did not return a tool_use block');
+    err.fallbackText = fallbackText.slice(0, 2000);
+    throw err;
+  }
+  return toolUse.input;
+}
+
+const BEATS_TOOL = {
+  name: 'submit_beats',
+  description: 'Submit the timed beats for a YouTube video.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      beats: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            start: {type: 'number'},
+            end: {type: 'number'},
+            sentence: {type: 'string'},
+            keywords: {type: 'array', items: {type: 'string'}},
+            fluxPrompt: {type: 'string'},
+          },
+          required: ['start', 'end', 'sentence', 'keywords', 'fluxPrompt'],
+        },
+      },
+    },
+    required: ['beats'],
+  },
+};
+
 function sanitizeJSON(text) {
   let s = String(text || '');
   s = s.replace(/```(?:json|JSON)?\s*/g, '').replace(/\s*```/g, '');
@@ -295,42 +351,20 @@ async function breakIntoBeats(captions, anthropicKey) {
 
   const prompt = `You are given timed sentences from a YouTube video transcript.
 
-Group consecutive sentences into "beats" of approximately 3 seconds. A beat must consist of one or more whole consecutive sentences — never split a sentence mid-way. Combine adjacent short sentences when needed; keep long sentences (>3.5s) as their own beat.
+Group consecutive sentences into beats of approximately 3 seconds. A beat must consist of whole consecutive sentences — never split a sentence. Combine short adjacent sentences as needed; keep long ones (>3.5s) as their own beat.
 
-For each beat, output:
-- start: start time of the first sentence in the beat (seconds, decimal)
-- end: end time of the last sentence in the beat (seconds, decimal)
-- sentence: concatenated sentence text
-- keywords: 2-3 short visual keywords for stock-video search. Concrete nouns and visual concepts only — e.g. "city skyline at night", "person typing on laptop", "ocean waves crashing". Avoid abstract concepts.
-- fluxPrompt: a detailed photorealistic image generation prompt describing the same scene cinematically. One vivid sentence, 16:9, no text overlays.
+For each beat, decide start/end timing, 2-3 concrete visual keywords for stock search, and a detailed photorealistic image-generation prompt (16:9, no text overlays).
 
-CRITICAL JSON RULES — non-negotiable:
-- Output ONLY a JSON array. The first character must be [ and the last character must be ].
-- No markdown fences (no \`\`\`json, no \`\`\`).
-- No comments inside the JSON (no //, no /* */).
-- No trailing commas before ] or }.
-- Every property name and every string value must use double quotes ("…"), never single quotes.
-- Escape any double quotes that appear inside string values as \\".
-- No newlines inside string values — replace them with spaces.
-- The output must parse cleanly with standard JavaScript JSON.parse() on the first try.
-
-Example shape:
-
-[
-  {
-    "start": 0.2,
-    "end": 1.7,
-    "sentence": "Hey, you. It is me.",
-    "keywords": ["person waving at camera", "warm portrait"],
-    "fluxPrompt": "Close-up portrait of a friendly person looking directly at camera with warm natural lighting, photorealistic, shallow depth of field"
-  }
-]
+Submit your beats via the submit_beats tool.
 
 Sentences:
 ${JSON.stringify(sentences)}`;
 
-  const beats = await callAnthropicForJSON(anthropicKey, prompt, 4000);
-  if (!Array.isArray(beats)) throw new Error('Claude returned non-array');
+  const result = await callAnthropicWithTool(anthropicKey, prompt, BEATS_TOOL, 4096);
+  const beats = result?.beats;
+  if (!Array.isArray(beats) || beats.length === 0) {
+    throw new Error('submit_beats tool returned no beats');
+  }
   return beats;
 }
 
