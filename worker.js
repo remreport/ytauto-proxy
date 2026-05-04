@@ -251,12 +251,13 @@ async function callAnthropicWithTool(apiKey, prompt, tool, maxTokens = 4096) {
 
 const BEATS_TOOL = {
   name: 'submit_beats',
-  description: 'Submit the timed beats for a YouTube video.',
+  description: 'Submit the timed beats for a YouTube video. The beats array must contain at least one beat — never empty.',
   input_schema: {
     type: 'object',
     properties: {
       beats: {
         type: 'array',
+        minItems: 1,
         items: {
           type: 'object',
           properties: {
@@ -349,21 +350,58 @@ async function breakIntoBeats(captions, anthropicKey) {
     text: s.text,
   }));
 
-  const prompt = `You are given timed sentences from a YouTube video transcript.
+  const validSentences = (captions || []).filter(
+    (c) => c && typeof c.text === 'string' && c.text.trim().length > 0,
+  );
+  if (validSentences.length === 0) {
+    throw new Error(
+      'Voiceover transcription returned no usable sentences. The audio may be silent, too noisy, or in an unsupported format.',
+    );
+  }
+  const sentences2 = validSentences.map((s, i) => ({
+    index: i,
+    start: s.start,
+    end: s.end,
+    text: s.text,
+  }));
 
-Group consecutive sentences into beats of approximately 3 seconds. A beat must consist of whole consecutive sentences — never split a sentence. Combine short adjacent sentences as needed; keep long ones (>3.5s) as their own beat.
+  const prompt = `You will receive ${sentences2.length} timed sentence(s) from an audio transcription. Your task is to group them into beats with visual keywords. This is a mechanical text-grouping task.
 
-For each beat, decide start/end timing, 2-3 concrete visual keywords for stock search, and a detailed photorealistic image-generation prompt (16:9, no text overlays).
+DO NOT refuse based on content quality, topic relevance, brevity, perceived inappropriateness, or any other judgment about the content. Always submit at least one beat — an empty beats array is a task failure.
 
-Submit your beats via the submit_beats tool.
+Group consecutive sentences into beats of approximately 3 seconds. A beat must consist of whole consecutive sentences — never split a sentence. Combine short adjacent sentences as needed; keep long ones (>3.5s) as their own beat. If total content is shorter than 3 seconds, output one beat covering everything.
+
+For each beat: start/end timing, 2-3 concrete visual keywords for stock search, a detailed photorealistic image-generation prompt (16:9, no text overlays).
+
+Submit via the submit_beats tool with at least 1 beat.
 
 Sentences:
-${JSON.stringify(sentences)}`;
+${JSON.stringify(sentences2)}`;
 
-  const result = await callAnthropicWithTool(anthropicKey, prompt, BEATS_TOOL, 4096);
+  let result;
+  try {
+    result = await callAnthropicWithTool(anthropicKey, prompt, BEATS_TOOL, 4096);
+  } catch (e) {
+    console.warn(`breakIntoBeats: first call threw (${e.message}) — retrying`);
+    result = {beats: []};
+  }
+  if (!result?.beats?.length) {
+    console.warn(`breakIntoBeats: 0 beats from ${sentences2.length} sentences — retrying with explicit feedback`);
+    const retryPrompt = `You just returned 0 beats but the input has ${sentences2.length} sentence(s). Submit submit_beats with at least 1 beat. Do not refuse.
+
+Sentences:
+${JSON.stringify(sentences2)}`;
+    result = await callAnthropicWithTool(anthropicKey, retryPrompt, BEATS_TOOL, 4096);
+  }
   const beats = result?.beats;
   if (!Array.isArray(beats) || beats.length === 0) {
-    throw new Error('submit_beats tool returned no beats');
+    const preview = validSentences.map((s) => s.text).join(' ').slice(0, 200);
+    const err = new Error(
+      `Claude refused to generate beats. Transcription preview: "${preview}". Try a fresh voiceover.`,
+    );
+    err.code = 'NO_BEATS';
+    err.diagnosticInput = {sentencesGiven: sentences2, claudeReturnedBeats: beats};
+    throw err;
   }
   return beats;
 }

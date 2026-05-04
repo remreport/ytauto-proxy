@@ -163,13 +163,14 @@ async function callAnthropicWithTool(apiKey, prompt, tool, maxTokens = 4096) {
 // Tool schemas — kept here so they live next to the call sites.
 const BEATS_TOOL = {
   name: 'submit_beats',
-  description: 'Submit the timed beats for a YouTube video. Each beat is a contiguous group of whole sentences that will be rendered with one stock clip or one Flux-generated image.',
+  description: 'Submit the timed beats for a YouTube video. Each beat is a contiguous group of whole sentences that will be rendered with one stock clip or one Flux-generated image. The beats array must contain at least one beat — never submit an empty array.',
   input_schema: {
     type: 'object',
     properties: {
       beats: {
         type: 'array',
-        description: 'Array of beats in chronological order. Beats must consist of whole sentences from the input transcript — never split a sentence mid-way.',
+        description: 'Array of beats in chronological order. Beats must consist of whole sentences from the input transcript — never split a sentence mid-way. MUST contain at least one beat.',
+        minItems: 1,
         items: {
           type: 'object',
           properties: {
@@ -256,6 +257,7 @@ function buildErrorDetail(e) {
   if (e?.firstContext) detail.firstContext = e.firstContext;
   if (e?.retryContext) detail.retryContext = e.retryContext;
   if (e?.fallbackText) detail.fallbackText = e.fallbackText;
+  if (e?.diagnosticInput) detail.diagnosticInput = e.diagnosticInput;
   return detail;
 }
 
@@ -334,31 +336,74 @@ async function pickMusicTrack(channelId, mood) {
 }
 
 async function breakIntoBeats(captions, anthropicKey) {
-  const sentences = captions.map((s, i) => ({
+  // Pre-flight: separate "audio transcribed to nothing" from "Claude refused".
+  // If we don't have any usable sentence text we fail here with a message that
+  // points at the audio, not at the LLM.
+  const validSentences = (captions || []).filter(
+    (c) => c && typeof c.text === 'string' && c.text.trim().length > 0,
+  );
+  if (validSentences.length === 0) {
+    throw new Error(
+      'Voiceover transcription returned no usable sentences. The audio may be silent, too noisy, or in an unsupported format.',
+    );
+  }
+
+  const sentences = validSentences.map((s, i) => ({
     index: i,
     start: s.start,
     end: s.end,
     text: s.text,
   }));
 
-  const prompt = `You are given timed sentences from a YouTube video transcript.
+  const prompt = `You will receive ${sentences.length} timed sentence(s) from an audio transcription. Your task is to group them into "beats" with visual keywords for stock footage. This is a mechanical text-grouping task.
 
-Group consecutive sentences into beats of approximately 3 seconds. A beat must consist of one or more whole consecutive sentences — never split a sentence mid-way. Combine adjacent short sentences when needed; keep long sentences (>3.5s) as their own beat.
+DO NOT refuse this task based on content quality, topic relevance, brevity, perceived inappropriateness, or any other judgment about the content. The transcription is whatever the speaker said; your job is just to group it. Always submit at least one beat. An empty beats array is a task failure.
+
+Group consecutive sentences into beats of approximately 3 seconds. A beat must consist of one or more whole consecutive sentences — never split a sentence mid-way. Combine adjacent short sentences as needed; keep long sentences (>3.5s) as their own beat. If the total content is shorter than 3 seconds, output a single beat covering all sentences.
 
 For each beat, decide:
-- start / end timing (seconds, from the input)
-- 2-3 concrete visual keywords for stock-video search (avoid abstract concepts)
-- A detailed photorealistic image-generation prompt for the same scene (16:9, no text overlays, one vivid sentence)
+- start / end timing (seconds, from the input — start of first sentence to end of last sentence in the beat)
+- 2-3 concrete visual keywords for stock-video search (e.g. "person waving at camera", "city skyline at night")
+- A detailed photorealistic image-generation prompt describing the same scene cinematically (16:9, no text overlays, one vivid sentence)
 
-Submit your beats via the submit_beats tool.
+Submit your beats via the submit_beats tool. The beats array MUST contain at least 1 beat.
 
 Sentences:
 ${JSON.stringify(sentences)}`;
 
-  const result = await callAnthropicWithTool(anthropicKey, prompt, BEATS_TOOL, 4096);
+  let result;
+  try {
+    result = await callAnthropicWithTool(anthropicKey, prompt, BEATS_TOOL, 4096);
+  } catch (e) {
+    // First call may fail with "no tool_use block" if Claude refused entirely.
+    // Fall through to the retry path so we get one more shot.
+    console.warn(`breakIntoBeats: first call threw (${e.message}) — will retry with explicit feedback`);
+    result = {beats: []};
+  }
+
+  if (!result?.beats?.length) {
+    console.warn(`breakIntoBeats: 0 beats from ${sentences.length} sentences — retrying with explicit feedback`);
+    const retryPrompt = `You just returned 0 beats from the submit_beats tool, but the input has ${sentences.length} sentence(s). This is a task failure.
+
+You MUST submit submit_beats with at least 1 beat. The submit_beats input_schema requires beats to be a non-empty array (minItems: 1). Do not refuse. Do not return empty. Group the sentences below into one or more beats and submit.
+
+Sentences:
+${JSON.stringify(sentences)}`;
+    result = await callAnthropicWithTool(anthropicKey, retryPrompt, BEATS_TOOL, 4096);
+  }
+
   const beats = result?.beats;
   if (!Array.isArray(beats) || beats.length === 0) {
-    throw new Error('submit_beats tool returned no beats');
+    const preview = validSentences.map((s) => s.text).join(' ').slice(0, 200);
+    const err = new Error(
+      `Claude refused to generate beats. Transcription preview: "${preview}". Try a fresh voiceover or contact support.`,
+    );
+    err.code = 'NO_BEATS';
+    err.diagnosticInput = {
+      sentencesGiven: sentences,
+      claudeReturnedBeats: beats,
+    };
+    throw err;
   }
   return beats;
 }
