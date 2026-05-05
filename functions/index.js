@@ -598,13 +598,18 @@ async function renderOnLambda(inputProps, jobRef) {
     codec: 'h264',
     privacy: 'public',
     imageFormat: 'jpeg',
-    // Higher framesPerLambda = fewer concurrent Lambdas. New AWS accounts
-    // start with a 10 concurrent execution quota; 4000 frames/Lambda keeps
-    // a 5-min/30fps render to ~3 Lambdas, a 10-min render to ~5. Requires
-    // the 900s function timeout (a 4000-frame chunk at concurrencyPerLambda=2
-    // takes well under that). Once the quota increase lands we can drop
-    // this back to 1000-2000 for faster wall-clock renders.
-    framesPerLambda: 4000,
+    // 1500 frames/Lambda balances chunk render time against parallelism.
+    // At concurrencyPerLambda=2 a 1500-frame chunk renders in ~150-250s
+    // wall, well under the 900s function timeout. AWS quota is now 1000
+    // concurrent (lifted from the new-account default 10) so chunk count
+    // is no longer the constraint — we optimise for chunk render time
+    // and overall wall clock instead. A 12k-frame video becomes 8 chunks
+    // running mostly in parallel.
+    //
+    // 4000 frames/chunk timed out the main function on a 192-sentence
+    // script (chunks took ~12-15min each, exceeded 900s). 2000 also a
+    // bit close. 1500 is the sweet spot at our 2-vCPU memory tier.
+    framesPerLambda: 1500,
     // Frames rendered concurrently inside each Lambda. Capped to the
     // number of vCPUs the function has (Remotion validates this and
     // throws otherwise). Our 3008MB memory tier maps to ~2 vCPUs, so

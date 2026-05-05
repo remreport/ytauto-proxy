@@ -39,8 +39,20 @@ const {STSClient, GetCallerIdentityCommand} = require(stsPath);
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const SERVICE_CODE = 'lambda';
-// AWS-stable code for "Concurrent executions" — the same in every region.
-const QUOTA_CODE = 'L-B99A9384';
+
+// Friendly name → AWS quota code map. Extend as we hit more new-account
+// restrictions. Default selection is "concurrent" if not specified.
+const QUOTAS = {
+  concurrent: {code: 'L-B99A9384', name: 'Concurrent executions'},
+  memory:     {code: 'L-548AE339', name: 'Function memory size'},
+};
+const quotaArgIdx = process.argv.indexOf('--quota');
+const QUOTA_KEY = quotaArgIdx >= 0 ? process.argv[quotaArgIdx + 1] : 'concurrent';
+if (!QUOTAS[QUOTA_KEY]) {
+  console.error(`Unknown --quota "${QUOTA_KEY}". Options: ${Object.keys(QUOTAS).join(', ')}`);
+  process.exit(1);
+}
+const QUOTA_CODE = QUOTAS[QUOTA_KEY].code;
 
 async function ensurePermissions() {
   const sts = new STSClient({region});
