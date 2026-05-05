@@ -458,28 +458,59 @@ function naiveGroupSentences(sentences) {
 }
 
 // ─── Pexels ─────────────────────────────────────────────────────────
-async function pexelsSearchSingle(query) {
+// Returns up to N candidate URLs (top distinct videos for the query).
+// We try each through validatePexelsVideo so a corrupted top result
+// doesn't blow up the render — fall through to next, then to Flux.
+async function pexelsSearchTop(query, n = 3) {
   if (!process.env.PEXELS_API_KEY) throw new Error('PEXELS_API_KEY not bound');
   const url = new URL('https://api.pexels.com/videos/search');
   url.searchParams.set('query', query);
-  url.searchParams.set('per_page', '5');
+  url.searchParams.set('per_page', '10');
   url.searchParams.set('orientation', 'landscape');
   url.searchParams.set('size', 'large');
 
   const resp = await fetch(url, {headers: {Authorization: process.env.PEXELS_API_KEY}});
   if (!resp.ok) {
     console.warn(`Pexels ${resp.status} for "${query}"`);
-    return null;
+    return [];
   }
   const data = await resp.json();
-  const video = (data.videos || [])[0];
-  if (!video) return null;
-  const files = (video.video_files || []).filter((f) => f.file_type === 'video/mp4');
-  if (!files.length) return null;
-  files.sort(
-    (a, b) => Math.abs((a.height || 0) - 1080) - Math.abs((b.height || 0) - 1080),
-  );
-  return files[0].link;
+  const out = [];
+  for (const video of data.videos || []) {
+    const files = (video.video_files || []).filter((f) => f.file_type === 'video/mp4');
+    if (!files.length) continue;
+    files.sort((a, b) => Math.abs((a.height || 0) - 1080) - Math.abs((b.height || 0) - 1080));
+    out.push(files[0].link);
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
+// Validate a Pexels mp4 URL before committing it to render. Catches
+// the ~5% of files that are missing frames, truncated, or 404s, which
+// blow up Remotion mid-render with "No frame found at position X".
+//   - HEAD: 2xx, content-type video/*, content-length sane
+//   - Range GET (first 1 MB): MP4 starts with 'ftyp' box at offset 4
+async function validatePexelsVideo(url) {
+  try {
+    const head = await fetch(url, {method: 'HEAD'});
+    if (!head.ok) return {ok: false, reason: `HEAD ${head.status}`};
+    const ct = head.headers.get('content-type') || '';
+    if (!/^video\//i.test(ct)) return {ok: false, reason: `bad content-type: ${ct}`};
+    const len = parseInt(head.headers.get('content-length') || '0', 10);
+    if (!len || len < 100_000 || len > 500_000_000) {
+      return {ok: false, reason: `bad content-length: ${len}`};
+    }
+    const ranged = await fetch(url, {headers: {Range: 'bytes=0-1048575'}});
+    if (!ranged.ok && ranged.status !== 206) return {ok: false, reason: `Range ${ranged.status}`};
+    const buf = Buffer.from(await ranged.arrayBuffer());
+    if (buf.length < 12) return {ok: false, reason: 'range body too small'};
+    const magic = buf.toString('ascii', 4, 8);
+    if (magic !== 'ftyp') return {ok: false, reason: `no ftyp box (got "${magic}")`};
+    return {ok: true, length: len};
+  } catch (e) {
+    return {ok: false, reason: e.message};
+  }
 }
 
 // ─── Replicate Flux ─────────────────────────────────────────────────
@@ -552,12 +583,19 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
 
     let url = null;
     let source = null;
+    const validationFailures = [];
     if (query) {
-      url = await pexelsSearchSingle(query);
-      if (url) source = 'pexels';
+      const candidates = await pexelsSearchTop(query, 3);
+      // Sequential validation — each takes ~1s, total ≤3-4s per beat.
+      for (const cand of candidates) {
+        const v = await validatePexelsVideo(cand);
+        if (v.ok) { url = cand; source = 'pexels'; break; }
+        validationFailures.push({url: cand, reason: v.reason});
+        console.warn(`beat ${i + 1}: Pexels candidate failed validation (${v.reason})`);
+      }
     }
     if (!url && beat.fluxPrompt) {
-      console.log(`beat ${i + 1}: Pexels miss for "${query}" — Flux fallback`);
+      console.log(`beat ${i + 1}: ${validationFailures.length ? 'all Pexels candidates failed validation' : 'Pexels miss'} — Flux fallback`);
       try {
         url = await generateFluxImage(beat.fluxPrompt);
         source = 'flux';
@@ -575,6 +613,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       fluxPrompt: beat.fluxPrompt || null,
       source,
       url,
+      ...(validationFailures.length ? {pexelsValidationFailures: validationFailures} : {}),
     });
     console.log(`beat ${i + 1}: ${source || 'NO MATCH'}`);
   }
@@ -598,18 +637,12 @@ async function renderOnLambda(inputProps, jobRef) {
     codec: 'h264',
     privacy: 'public',
     imageFormat: 'jpeg',
-    // 1500 frames/Lambda balances chunk render time against parallelism.
-    // At concurrencyPerLambda=2 a 1500-frame chunk renders in ~150-250s
-    // wall, well under the 900s function timeout. AWS quota is now 1000
-    // concurrent (lifted from the new-account default 10) so chunk count
-    // is no longer the constraint — we optimise for chunk render time
-    // and overall wall clock instead. A 12k-frame video becomes 8 chunks
-    // running mostly in parallel.
-    //
-    // 4000 frames/chunk timed out the main function on a 192-sentence
-    // script (chunks took ~12-15min each, exceeded 900s). 2000 also a
-    // bit close. 1500 is the sweet spot at our 2-vCPU memory tier.
-    framesPerLambda: 1500,
+    // 1000 frames/Lambda. AWS quota is 1000 concurrent so chunk count
+    // is no longer the constraint — we optimise for fastest wall clock.
+    // Each chunk renders in ~100-150s at concurrencyPerLambda=2, well
+    // under the 900s function timeout. A 12k-frame video → 12 chunks
+    // running fully in parallel → ~150-200s total wall time.
+    framesPerLambda: 1000,
     // Frames rendered concurrently inside each Lambda. Capped to the
     // number of vCPUs the function has (Remotion validates this and
     // throws otherwise). Our 3008MB memory tier maps to ~2 vCPUs, so
@@ -661,11 +694,20 @@ async function renderOnLambda(inputProps, jobRef) {
     });
     if (progress.fatalErrorEncountered) {
       const raw = progress.errors?.[0]?.message || 'unknown error';
-      // Rephrase rate limits with actionable guidance
       if (isAwsRateLimitError(raw)) {
         throw new Error(
           `AWS render slot was busy and the per-chunk retries also exhausted. Your AWS account is at its concurrent-Lambda quota (default 10 for new accounts). Wait a few minutes and click Retry, or request a quota increase from AWS Service Quotas.`,
         );
+      }
+      // "No frame found at position X for source /tmp/... (original source = URL)"
+      // — corrupted Pexels file. Surface the URL on the error so the recovery
+      // wrapper around renderOnLambda can swap it for Flux + retry.
+      const corruptUrlMatch = /original source = (https?:\/\/[^)\s]+)/i.exec(raw);
+      if (corruptUrlMatch) {
+        const err = new Error(`Render failed on a corrupted source clip: ${raw}`);
+        err.code = 'CORRUPT_SOURCE';
+        err.corruptUrl = corruptUrlMatch[1];
+        throw err;
       }
       throw new Error(`Lambda render failed: ${raw}`);
     }
@@ -773,19 +815,53 @@ async function processJob(job) {
     updatedAt: FieldValue.serverTimestamp(),
   });
 
-  // Step 3 — Remotion Lambda render
+  // Step 3 — Remotion Lambda render with corrupted-source recovery.
+  // If render fails with code=CORRUPT_SOURCE, find which beat owns
+  // that URL, swap it for a Flux-generated image, retry once. Up to
+  // 3 swaps total per render.
   await jobRef.update({
     status: 'rendering',
     currentStep: 'Invoking Lambda renderer',
     progress: 70,
     updatedAt: FieldValue.serverTimestamp(),
   });
-  // Lambda needs AWS creds — in Cloud Functions they come from secrets.
-  // The @remotion/lambda-client picks them up from process.env.
-  const s3OutputUrl = await renderOnLambda(
-    {voiceoverUrl: job.voiceoverUrl, footage, captions, musicUrl},
-    jobRef,
-  );
+  const renderInput = {voiceoverUrl: job.voiceoverUrl, footage, captions, musicUrl};
+  let s3OutputUrl;
+  let swapsUsed = 0;
+  const MAX_SWAPS = 3;
+  while (true) {
+    try {
+      s3OutputUrl = await renderOnLambda(renderInput, jobRef);
+      break;
+    } catch (e) {
+      if (e.code !== 'CORRUPT_SOURCE' || swapsUsed >= MAX_SWAPS) throw e;
+      const beatIdx = renderInput.footage.findIndex((b) => b && b.url === e.corruptUrl);
+      if (beatIdx < 0) throw e;
+      const failedBeat = renderInput.footage[beatIdx];
+      console.warn(`[${job.id}] beat ${beatIdx + 1} corrupted (${e.corruptUrl.slice(0, 80)}) — replacing with Flux`);
+      if (!failedBeat.fluxPrompt) throw e;
+      let replacementUrl;
+      try {
+        replacementUrl = await generateFluxImage(failedBeat.fluxPrompt);
+      } catch (fluxErr) {
+        throw new Error(`Render failed on corrupted Pexels clip and Flux fallback also failed: ${e.message} | ${fluxErr.message}`);
+      }
+      renderInput.footage[beatIdx] = {
+        ...failedBeat,
+        source: 'flux',
+        url: replacementUrl,
+        replacedReason: 'corrupted Pexels clip caught at render time',
+        previousUrl: failedBeat.url,
+      };
+      swapsUsed++;
+      await jobRef.update({
+        footage: renderInput.footage,
+        pexelsReplacedCount: FieldValue.increment(1),
+        currentStep: `Beat ${beatIdx + 1} clip was corrupted — replaced with AI-generated image, retrying render`,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }
+  }
   await jobRef.update({
     currentStep: 'Copying render to Firebase Storage',
     progress: 95,

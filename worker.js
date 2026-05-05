@@ -85,7 +85,7 @@ async function renderOnLambda(inputProps, jobRef) {
     codec: 'h264',
     privacy: 'public',
     imageFormat: 'jpeg',
-    framesPerLambda: 1500,
+    framesPerLambda: 1000,
     concurrencyPerLambda: 2,
     maxRetries: 5,
   };
@@ -465,31 +465,45 @@ function naiveGroupSentences(sentences) {
 }
 
 // ─── Pexels (single-result per beat) ────────────────────────────────
-async function pexelsSearchSingle(query) {
+async function pexelsSearchTop(query, n = 3) {
   if (!process.env.PEXELS_API_KEY) throw new Error('PEXELS_API_KEY env var missing');
   const url = new URL('https://api.pexels.com/videos/search');
   url.searchParams.set('query', query);
-  url.searchParams.set('per_page', '5');
+  url.searchParams.set('per_page', '10');
   url.searchParams.set('orientation', 'landscape');
   url.searchParams.set('size', 'large');
-
-  const resp = await fetch(url, {
-    headers: { Authorization: process.env.PEXELS_API_KEY },
-  });
-  if (!resp.ok) {
-    console.warn(`  Pexels ${resp.status} for "${query}"`);
-    return null;
-  }
+  const resp = await fetch(url, {headers: {Authorization: process.env.PEXELS_API_KEY}});
+  if (!resp.ok) return [];
   const data = await resp.json();
-  const video = (data.videos || [])[0];
-  if (!video) return null;
-  const files = (video.video_files || []).filter((f) => f.file_type === 'video/mp4');
-  if (!files.length) return null;
-  // Prefer ~1080p sources over 4K — our render output is 1080p, and 4K
-  // source files are 5-10x bigger which blows out Lambda disk and adds
-  // decode time without adding pixels to the output.
-  files.sort((a, b) => Math.abs((a.height || 0) - 1080) - Math.abs((b.height || 0) - 1080));
-  return files[0].link;
+  const out = [];
+  for (const video of data.videos || []) {
+    const files = (video.video_files || []).filter((f) => f.file_type === 'video/mp4');
+    if (!files.length) continue;
+    files.sort((a, b) => Math.abs((a.height || 0) - 1080) - Math.abs((b.height || 0) - 1080));
+    out.push(files[0].link);
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
+async function validatePexelsVideo(url) {
+  try {
+    const head = await fetch(url, {method: 'HEAD'});
+    if (!head.ok) return {ok: false, reason: `HEAD ${head.status}`};
+    const contentType = head.headers.get('content-type') || '';
+    if (!/^video\//i.test(contentType)) return {ok: false, reason: `bad content-type: ${contentType}`};
+    const len = parseInt(head.headers.get('content-length') || '0', 10);
+    if (!len || len < 100_000 || len > 500_000_000) return {ok: false, reason: `bad content-length: ${len}`};
+    const ranged = await fetch(url, {headers: {Range: 'bytes=0-1048575'}});
+    if (!ranged.ok && ranged.status !== 206) return {ok: false, reason: `Range ${ranged.status}`};
+    const buf = Buffer.from(await ranged.arrayBuffer());
+    if (buf.length < 12) return {ok: false, reason: 'range body too small'};
+    const magic = buf.toString('ascii', 4, 8);
+    if (magic !== 'ftyp') return {ok: false, reason: `no ftyp box (got "${magic}")`};
+    return {ok: true, length: len};
+  } catch (e) {
+    return {ok: false, reason: e.message};
+  }
 }
 
 // ─── Replicate Flux 1.1 Pro (16:9 photorealistic image generation) ──
@@ -565,14 +579,19 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
 
     let url = null;
     let source = null;
+    const validationFailures = [];
 
     if (query) {
-      url = await pexelsSearchSingle(query);
-      if (url) source = 'pexels';
+      const candidates = await pexelsSearchTop(query, 3);
+      for (const cand of candidates) {
+        const v = await validatePexelsVideo(cand);
+        if (v.ok) { url = cand; source = 'pexels'; break; }
+        validationFailures.push({url: cand, reason: v.reason});
+      }
     }
 
     if (!url && beat.fluxPrompt) {
-      console.log(`  beat ${i + 1}: Pexels miss for "${query}" — generating with Flux`);
+      console.log(`  beat ${i + 1}: ${validationFailures.length ? 'all Pexels candidates failed validation' : 'Pexels miss'} — Flux fallback`);
       try {
         url = await generateFluxImage(beat.fluxPrompt);
         source = 'flux';
@@ -590,6 +609,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       fluxPrompt: beat.fluxPrompt || null,
       source,
       url,
+      ...(validationFailures.length ? {pexelsValidationFailures: validationFailures} : {}),
     });
     console.log(`  beat ${i + 1}: ${source || 'NO MATCH'} — ${(url || '').slice(0, 80)}`);
   }
