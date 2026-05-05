@@ -85,7 +85,7 @@ async function renderOnLambda(inputProps, jobRef) {
     codec: 'h264',
     privacy: 'public',
     imageFormat: 'jpeg',
-    framesPerLambda: 2000,
+    framesPerLambda: 4000,
     concurrencyPerLambda: 2,
     maxRetries: 5,
   };

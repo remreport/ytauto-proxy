@@ -43,7 +43,7 @@ const NEWSAPI_KEY = defineSecret('NEWSAPI_KEY');
 // ─── Non-secret config ──────────────────────────────────────────────
 const AWS_REGION = 'us-east-1';
 const REMOTION_LAMBDA_FUNCTION_NAME =
-  'remotion-render-4-0-456-mem3008mb-disk10240mb-300sec';
+  'remotion-render-4-0-456-mem3008mb-disk10240mb-900sec';
 const REMOTION_LAMBDA_SERVE_URL =
   'https://remotionlambda-useast1-1zsfacnzw9.s3.us-east-1.amazonaws.com/sites/rem-report/index.html';
 
@@ -599,10 +599,12 @@ async function renderOnLambda(inputProps, jobRef) {
     privacy: 'public',
     imageFormat: 'jpeg',
     // Higher framesPerLambda = fewer concurrent Lambdas. New AWS accounts
-    // start with a 10 concurrent execution quota; 2000 frames/Lambda keeps
-    // a 5-min/30fps render to ~5 Lambdas, a 10-min render to ~9. Once the
-    // quota increase comes through we can drop this back down for speed.
-    framesPerLambda: 2000,
+    // start with a 10 concurrent execution quota; 4000 frames/Lambda keeps
+    // a 5-min/30fps render to ~3 Lambdas, a 10-min render to ~5. Requires
+    // the 900s function timeout (a 4000-frame chunk at concurrencyPerLambda=2
+    // takes well under that). Once the quota increase lands we can drop
+    // this back to 1000-2000 for faster wall-clock renders.
+    framesPerLambda: 4000,
     // Frames rendered concurrently inside each Lambda. Capped to the
     // number of vCPUs the function has (Remotion validates this and
     // throws otherwise). Our 3008MB memory tier maps to ~2 vCPUs, so
