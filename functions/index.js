@@ -603,10 +603,13 @@ async function renderOnLambda(inputProps, jobRef) {
     // a 5-min/30fps render to ~5 Lambdas, a 10-min render to ~9. Once the
     // quota increase comes through we can drop this back down for speed.
     framesPerLambda: 2000,
-    // 4 frames rendered concurrently inside each Lambda — uses the 3GB
-    // memory better and ~4× the effective render speed without spawning
-    // more outer Lambdas. Stays inside the function's 300s timeout.
-    concurrencyPerLambda: 4,
+    // Frames rendered concurrently inside each Lambda. Capped to the
+    // number of vCPUs the function has (Remotion validates this and
+    // throws otherwise). Our 3008MB memory tier maps to ~2 vCPUs, so
+    // concurrencyPerLambda=2 gives roughly 2× per-Lambda speed without
+    // spawning more outer Lambdas. Bump to 4 after redeploying Lambda
+    // at >=5120MB (3+ vCPUs).
+    concurrencyPerLambda: 2,
     // Per-Lambda invocation retries; Remotion handles transient throttles
     // at the chunk level automatically.
     maxRetries: 5,
