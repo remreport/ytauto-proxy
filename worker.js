@@ -28,6 +28,7 @@
 //   3. .\start-worker.ps1   (loads .env automatically)
 
 const fs = require('fs');
+const crypto = require('node:crypto');
 const admin = require('firebase-admin');
 const {renderMediaOnLambda, getRenderProgress} = require('@remotion/lambda/client');
 
@@ -88,6 +89,7 @@ async function renderOnLambda(inputProps, jobRef) {
     framesPerLambda: 1000,
     concurrencyPerLambda: 2,
     maxRetries: 5,
+    delayRenderTimeoutInMilliseconds: 60000,
   };
 
   let renderId;
@@ -465,6 +467,25 @@ function naiveGroupSentences(sentences) {
 }
 
 // ─── Pexels (single-result per beat) ────────────────────────────────
+async function cacheRemoteToFirebase(sourceUrl, {prefix = 'cache/footage', defaultExt = 'mp4'} = {}) {
+  const hash = crypto.createHash('sha1').update(sourceUrl).digest('hex');
+  const extMatch = sourceUrl.match(/\.([a-z0-9]{2,4})(?:\?|$)/i);
+  const ext = (extMatch ? extMatch[1].toLowerCase() : defaultExt);
+  const path = `${prefix}/${hash}.${ext}`;
+  const bucket = admin.storage().bucket();
+  const file = bucket.file(path);
+  const [exists] = await file.exists();
+  if (exists) return `https://storage.googleapis.com/${bucket.name}/${path}`;
+  const resp = await fetch(sourceUrl);
+  if (!resp.ok) throw new Error(`Cache fetch ${resp.status}`);
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  await file.save(buffer, {
+    metadata: {contentType: resp.headers.get('content-type') || 'application/octet-stream'},
+  });
+  await file.makePublic();
+  return `https://storage.googleapis.com/${bucket.name}/${path}`;
+}
+
 async function pexelsSearchTop(query, n = 3) {
   if (!process.env.PEXELS_API_KEY) throw new Error('PEXELS_API_KEY env var missing');
   const url = new URL('https://api.pexels.com/videos/search');
@@ -613,7 +634,25 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     });
     console.log(`  beat ${i + 1}: ${source || 'NO MATCH'} — ${(url || '').slice(0, 80)}`);
   }
-  return footage;
+  // Cache external assets to Firebase Storage (parity with functions/index.js)
+  await jobRef.update({
+    currentStep: `Caching ${footage.length} clips to Firebase Storage`,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  const cached = await Promise.all(footage.map(async (beat, idx) => {
+    if (!beat.url) return beat;
+    try {
+      const cachedUrl = await cacheRemoteToFirebase(beat.url, {
+        prefix: beat.source === 'flux' ? 'cache/flux' : 'cache/footage',
+        defaultExt: beat.source === 'flux' ? 'jpg' : 'mp4',
+      });
+      return {...beat, originalUrl: beat.url, url: cachedUrl};
+    } catch (e) {
+      console.warn(`  beat ${idx + 1}: caching failed: ${e.message}`);
+      return {...beat, cachingError: e.message};
+    }
+  }));
+  return cached;
 }
 
 // ─── Job processor ──────────────────────────────────────────────────

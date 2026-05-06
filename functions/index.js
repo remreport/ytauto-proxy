@@ -14,6 +14,7 @@ const {onSchedule} = require('firebase-functions/v2/scheduler');
 const {defineSecret} = require('firebase-functions/params');
 const {setGlobalOptions} = require('firebase-functions/v2');
 const admin = require('firebase-admin');
+const crypto = require('node:crypto');
 // @remotion/lambda-client is heavy (pulls in AWS SDK) and pushes the
 // module-load past Cloud Functions' 10s analysis budget. Lazy-loaded
 // inside renderOnLambda below.
@@ -513,6 +514,38 @@ async function validatePexelsVideo(url) {
   }
 }
 
+// ─── Universal source cache to Firebase Storage ─────────────────────
+// Lambda fetches every render asset from this cache instead of the
+// original source. Firebase Storage is fast, never rate-limited, and
+// stays available even if Pexels deletes a video or a Replicate URL
+// expires. Cache key = sha1(sourceUrl) so the same external file maps
+// to one canonical cache entry across all renders.
+async function cacheRemoteToFirebase(sourceUrl, {prefix = 'cache/footage', defaultExt = 'mp4'} = {}) {
+  const hash = crypto.createHash('sha1').update(sourceUrl).digest('hex');
+  const extMatch = sourceUrl.match(/\.([a-z0-9]{2,4})(?:\?|$)/i);
+  const ext = (extMatch ? extMatch[1].toLowerCase() : defaultExt);
+  const path = `${prefix}/${hash}.${ext}`;
+  const bucket = admin.storage().bucket();
+  const file = bucket.file(path);
+
+  // Cache hit — file.exists() is a single HEAD; very fast.
+  const [exists] = await file.exists();
+  if (exists) {
+    return `https://storage.googleapis.com/${bucket.name}/${path}`;
+  }
+
+  // Miss — download and upload. Stream-to-buffer is fine for our sizes
+  // (Pexels 1080p mp4s ~10-30MB, Flux jpgs <200KB).
+  const resp = await fetch(sourceUrl);
+  if (!resp.ok) throw new Error(`Cache fetch ${resp.status} for ${sourceUrl.slice(0, 80)}`);
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  await file.save(buffer, {
+    metadata: {contentType: resp.headers.get('content-type') || 'application/octet-stream'},
+  });
+  await file.makePublic();
+  return `https://storage.googleapis.com/${bucket.name}/${path}`;
+}
+
 // ─── Replicate Flux ─────────────────────────────────────────────────
 async function generateFluxImage(prompt) {
   if (!process.env.REPLICATE_API_KEY) throw new Error('REPLICATE_API_KEY not bound');
@@ -617,7 +650,30 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     });
     console.log(`beat ${i + 1}: ${source || 'NO MATCH'}`);
   }
-  return footage;
+
+  // Cache every external asset to Firebase Storage so Lambda fetches
+  // them from a fast, reliable, rate-limit-free source. This eliminates
+  // Pexels CDN timeouts mid-render and the whole "delayRender from
+  // localhost:3000/proxy?src=..." failure class.
+  await jobRef.update({
+    currentStep: `Caching ${footage.length} clips to Firebase Storage`,
+    updatedAt: FieldValue.serverTimestamp(),
+  });
+  const cached = await Promise.all(footage.map(async (beat, idx) => {
+    if (!beat.url) return beat;
+    try {
+      const cachedUrl = await cacheRemoteToFirebase(beat.url, {
+        prefix: beat.source === 'flux' ? 'cache/flux' : 'cache/footage',
+        defaultExt: beat.source === 'flux' ? 'jpg' : 'mp4',
+      });
+      return {...beat, originalUrl: beat.url, url: cachedUrl};
+    } catch (e) {
+      console.warn(`beat ${idx + 1}: caching failed (${e.message}) — Lambda will hit ${beat.source} directly`);
+      return {...beat, cachingError: e.message};
+    }
+  }));
+  console.log(`cached ${cached.filter((b) => b.url && b.url.includes('storage.googleapis.com')).length}/${cached.length} beats to Firebase Storage`);
+  return cached;
 }
 
 // ─── Remotion Lambda ────────────────────────────────────────────────
@@ -643,16 +699,13 @@ async function renderOnLambda(inputProps, jobRef) {
     // under the 900s function timeout. A 12k-frame video → 12 chunks
     // running fully in parallel → ~150-200s total wall time.
     framesPerLambda: 1000,
-    // Frames rendered concurrently inside each Lambda. Capped to the
-    // number of vCPUs the function has (Remotion validates this and
-    // throws otherwise). Our 3008MB memory tier maps to ~2 vCPUs, so
-    // concurrencyPerLambda=2 gives roughly 2× per-Lambda speed without
-    // spawning more outer Lambdas. Bump to 4 after redeploying Lambda
-    // at >=5120MB (3+ vCPUs).
     concurrencyPerLambda: 2,
-    // Per-Lambda invocation retries; Remotion handles transient throttles
-    // at the chunk level automatically.
     maxRetries: 5,
+    // Per-asset fetch budget inside each Lambda's Chromium. Default 28s
+    // killed renders when Pexels CDN was slow even on validated files.
+    // Most assets are now Firebase-Storage cached (fast, no throttle)
+    // but the higher cap is cheap headroom for the rare slow case.
+    delayRenderTimeoutInMilliseconds: 60000,
   };
 
   // Outer retry: the initial spawn can be rejected by AWS even when later
