@@ -6,14 +6,21 @@
 // can clean up after a Cloud Function crash before the next watchdog tick.
 //
 // Usage:
-//   FIREBASE_SERVICE_ACCOUNT_FILE=...firebase-key.json node scripts/kill-zombie-jobs.js [maxAgeMinutes]
+//   node scripts/kill-zombie-jobs.js [maxAgeMinutes]              all stuck jobs
+//   node scripts/kill-zombie-jobs.js 0                            everything in progress
+//   node scripts/kill-zombie-jobs.js --project <projectId>        target one project
+//   node scripts/kill-zombie-jobs.js 0 --project <projectId>      both
 //
-// Default cutoff: 10 minutes since last updatedAt.
+// Default age cutoff: 10 minutes since last updatedAt.
 
 const fs = require('fs');
 const admin = require('firebase-admin');
 
-const maxAgeMin = parseInt(process.argv[2] || '10', 10);
+const args = process.argv.slice(2);
+const projectFlag = args.indexOf('--project');
+const projectId = projectFlag >= 0 ? args[projectFlag + 1] : null;
+const positional = args.filter((a, i) => a !== '--project' && args[i - 1] !== '--project');
+const maxAgeMin = parseInt(positional[0] || '10', 10);
 
 const svcPath = process.env.FIREBASE_SERVICE_ACCOUNT_FILE;
 if (!svcPath) {
@@ -35,11 +42,12 @@ const FieldValue = admin.firestore.FieldValue;
     let killed = 0;
     for (const doc of snap.docs) {
       const data = doc.data();
+      if (projectId && data.projectId !== projectId) continue;
       const updatedMs = data.updatedAt?.toMillis ? data.updatedAt.toMillis() : 0;
       const ageMin = updatedMs ? Math.round((Date.now() - updatedMs) / 60000) : '?';
       const stuck = !updatedMs || updatedMs < cutoffMs;
       if (!stuck) continue;
-      console.log(`  killing ${collection}/${doc.id}  status=${data.status}  age=${ageMin}min`);
+      console.log(`  killing ${collection}/${doc.id}  project=${data.projectId || '?'}  status=${data.status}  age=${ageMin}min`);
       await doc.ref.update({
         status: 'failed',
         currentStep: 'Failed',
@@ -51,7 +59,8 @@ const FieldValue = admin.firestore.FieldValue;
     return killed;
   }
 
-  console.log(`Sweeping jobs older than ${maxAgeMin} minutes...`);
+  const filterDesc = projectId ? ` for project ${projectId}` : '';
+  console.log(`Sweeping jobs older than ${maxAgeMin} minutes${filterDesc}...`);
   const e = await sweep('editingJobs', ['pending', 'researching', 'sourcing', 'captions', 'rendering']);
   const d = await sweep('discoveryJobs', ['pending', 'researching', 'proposing']);
   console.log(`Done. Killed ${e} editingJobs + ${d} discoveryJobs.`);
