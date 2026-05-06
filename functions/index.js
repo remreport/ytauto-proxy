@@ -681,6 +681,35 @@ function isAwsRateLimitError(message) {
   return /rate.{0,5}exceeded|concurrency.{0,5}limit|throttl/i.test(message || '');
 }
 
+// Pull every plausible source URL out of a Lambda error message. Covers
+// every Remotion failure shape we've seen so far where a single beat's
+// asset is the culprit:
+//   "original source = https://…"               (compositor frame errors)
+//   "Fetching … &src=URL_ENCODED …"             (delayRender timeouts)
+//   bare "https://…/file.mp4" anywhere in text  (catch-all)
+// Returns a deduped array. Empty array means "no actionable URL" — the
+// caller treats those as non-recoverable.
+function extractFailedUrlsFromError(message) {
+  if (!message) return [];
+  const urls = new Set();
+
+  const reOriginal = /original source\s*=\s*(https?:\/\/[^)\s'"]+)/gi;
+  let m;
+  while ((m = reOriginal.exec(message)) !== null) urls.add(m[1]);
+
+  const reSrcEnc = /[?&]src=(https?(?:%3A%2F%2F|:\/\/)[^&'"\s)]+)/gi;
+  while ((m = reSrcEnc.exec(message)) !== null) {
+    let url = m[1];
+    try { if (url.includes('%')) url = decodeURIComponent(url); } catch {}
+    urls.add(url);
+  }
+
+  const reAnyMedia = /https?:\/\/[^\s'"<>)]+\.(?:mp4|jpg|jpeg|png|webp|mov|avi|mkv)/gi;
+  while ((m = reAnyMedia.exec(message)) !== null) urls.add(m[0]);
+
+  return Array.from(urls);
+}
+
 async function renderOnLambda(inputProps, jobRef) {
   const {renderMediaOnLambda, getRenderProgress} = require('@remotion/lambda-client');
 
@@ -752,14 +781,14 @@ async function renderOnLambda(inputProps, jobRef) {
           `AWS render slot was busy and the per-chunk retries also exhausted. Your AWS account is at its concurrent-Lambda quota (default 10 for new accounts). Wait a few minutes and click Retry, or request a quota increase from AWS Service Quotas.`,
         );
       }
-      // "No frame found at position X for source /tmp/... (original source = URL)"
-      // — corrupted Pexels file. Surface the URL on the error so the recovery
-      // wrapper around renderOnLambda can swap it for Flux + retry.
-      const corruptUrlMatch = /original source = (https?:\/\/[^)\s]+)/i.exec(raw);
-      if (corruptUrlMatch) {
-        const err = new Error(`Render failed on a corrupted source clip: ${raw}`);
+      // Try to surface every URL that might have caused the failure so
+      // processJob's swap loop can map them back to beats and patch.
+      const failedUrls = extractFailedUrlsFromError(raw);
+      if (failedUrls.length) {
+        const err = new Error(`Render failed on a problematic source clip: ${raw.slice(0, 300)}`);
         err.code = 'CORRUPT_SOURCE';
-        err.corruptUrl = corruptUrlMatch[1];
+        err.failedUrls = failedUrls;
+        err.rawErrorMessage = raw;
         throw err;
       }
       throw new Error(`Lambda render failed: ${raw}`);
@@ -878,39 +907,79 @@ async function processJob(job) {
     progress: 70,
     updatedAt: FieldValue.serverTimestamp(),
   });
+  // Mid-render recovery loop: if the render fails on a specific clip,
+  // swap that beat to Flux + retry — captions, beats, music, and all
+  // unaffected footage are reused. NOTHING upstream re-runs.
   const renderInput = {voiceoverUrl: job.voiceoverUrl, footage, captions, musicUrl};
   let s3OutputUrl;
-  let swapsUsed = 0;
-  const MAX_SWAPS = 3;
+  let attempt = 0;
+  const MAX_RENDER_ATTEMPTS = 5;
   while (true) {
+    attempt++;
     try {
       s3OutputUrl = await renderOnLambda(renderInput, jobRef);
       break;
     } catch (e) {
-      if (e.code !== 'CORRUPT_SOURCE' || swapsUsed >= MAX_SWAPS) throw e;
-      const beatIdx = renderInput.footage.findIndex((b) => b && b.url === e.corruptUrl);
-      if (beatIdx < 0) throw e;
+      if (e.code !== 'CORRUPT_SOURCE' || attempt >= MAX_RENDER_ATTEMPTS) throw e;
+      const failedUrls = e.failedUrls || [];
+
+      // Find any beat whose url (or originalUrl pre-cache) appears in
+      // the failed-URL list. Cached urls live on Firebase Storage but
+      // beat.originalUrl preserves the upstream Pexels/Flux URL.
+      const beatIdx = renderInput.footage.findIndex((b) => {
+        if (!b || !b.url) return false;
+        return failedUrls.some((u) =>
+          u === b.url || u === b.originalUrl ||
+          (b.url && b.url.includes(u)) ||
+          (b.originalUrl && b.originalUrl.includes(u)),
+        );
+      });
+      if (beatIdx < 0) {
+        console.warn(`[${job.id}] render failed but no beat matches failed URLs: ${failedUrls.join(', ')}`);
+        throw e;
+      }
+
       const failedBeat = renderInput.footage[beatIdx];
-      console.warn(`[${job.id}] beat ${beatIdx + 1} corrupted (${e.corruptUrl.slice(0, 80)}) — replacing with Flux`);
-      if (!failedBeat.fluxPrompt) throw e;
+      if (!failedBeat.fluxPrompt) {
+        throw new Error(`Render failed on beat ${beatIdx + 1} and that beat has no fluxPrompt for fallback`);
+      }
+      console.warn(`[${job.id}] attempt ${attempt}: beat ${beatIdx + 1} failed — generating Flux replacement`);
+
       let replacementUrl;
       try {
-        replacementUrl = await generateFluxImage(failedBeat.fluxPrompt);
+        const fluxRaw = await generateFluxImage(failedBeat.fluxPrompt);
+        // Cache the Flux output too so subsequent retries don't re-pay
+        // and Lambda fetches from a fast source.
+        replacementUrl = await cacheRemoteToFirebase(fluxRaw, {
+          prefix: 'cache/flux',
+          defaultExt: 'jpg',
+        }).catch(() => fluxRaw);
       } catch (fluxErr) {
-        throw new Error(`Render failed on corrupted Pexels clip and Flux fallback also failed: ${e.message} | ${fluxErr.message}`);
+        throw new Error(`Render failed on beat ${beatIdx + 1} and Flux fallback also failed: ${e.message} | ${fluxErr.message}`);
       }
+
+      const previousUrl = failedBeat.url;
       renderInput.footage[beatIdx] = {
         ...failedBeat,
         source: 'flux',
         url: replacementUrl,
-        replacedReason: 'corrupted Pexels clip caught at render time',
-        previousUrl: failedBeat.url,
+        replacedReason: 'render-time failure',
+        previousUrl,
       };
-      swapsUsed++;
+
       await jobRef.update({
         footage: renderInput.footage,
         pexelsReplacedCount: FieldValue.increment(1),
-        currentStep: `Beat ${beatIdx + 1} clip was corrupted — replaced with AI-generated image, retrying render`,
+        renderAttempts: FieldValue.arrayUnion({
+          attempt,
+          failedBeatIndex: beatIdx,
+          failedUrl: previousUrl,
+          failedUrlsSeen: failedUrls,
+          replacementSource: 'flux',
+          replacementUrl,
+          ts: Date.now(),
+        }),
+        currentStep: `Beat ${beatIdx + 1} clip failed — replaced with AI image, render attempt ${attempt + 1}/${MAX_RENDER_ATTEMPTS}`,
         updatedAt: FieldValue.serverTimestamp(),
       });
     }
