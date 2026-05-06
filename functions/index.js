@@ -599,9 +599,16 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     progress: baseProgress,
     updatedAt: FieldValue.serverTimestamp(),
   });
+  const beatsT0 = Date.now();
   const rawBeats = await breakIntoBeats(captions, anthropicKey);
-  console.log(`got ${rawBeats.length} beats from Claude`);
+  const beatsExtractMs = Date.now() - beatsT0;
+  await jobRef.update({
+    'timings.beatsExtractMs': beatsExtractMs,
+    'timings.beatsCount': rawBeats.length,
+  }).catch(() => {});
+  console.log(`got ${rawBeats.length} beats from Claude (${(beatsExtractMs / 1000).toFixed(1)}s)`);
 
+  const perBeatT0 = Date.now();
   const footage = [];
   for (let i = 0; i < rawBeats.length; i++) {
     const beat = rawBeats[i];
@@ -651,6 +658,10 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     console.log(`beat ${i + 1}: ${source || 'NO MATCH'}`);
   }
 
+  const perBeatSourcingMs = Date.now() - perBeatT0;
+  await jobRef.update({'timings.perBeatSourcingMs': perBeatSourcingMs}).catch(() => {});
+  console.log(`  per-beat sourcing total: ${(perBeatSourcingMs / 1000).toFixed(1)}s for ${footage.length} beats (avg ${Math.round(perBeatSourcingMs / Math.max(footage.length, 1))}ms/beat)`);
+
   // Cache every external asset to Firebase Storage so Lambda fetches
   // them from a fast, reliable, rate-limit-free source. This eliminates
   // Pexels CDN timeouts mid-render and the whole "delayRender from
@@ -659,6 +670,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     currentStep: `Caching ${footage.length} clips to Firebase Storage`,
     updatedAt: FieldValue.serverTimestamp(),
   });
+  const cachingT0 = Date.now();
   const cached = await Promise.all(footage.map(async (beat, idx) => {
     if (!beat.url) return beat;
     try {
@@ -672,7 +684,9 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       return {...beat, cachingError: e.message};
     }
   }));
-  console.log(`cached ${cached.filter((b) => b.url && b.url.includes('storage.googleapis.com')).length}/${cached.length} beats to Firebase Storage`);
+  const cachingMs = Date.now() - cachingT0;
+  await jobRef.update({'timings.cachingMs': cachingMs}).catch(() => {});
+  console.log(`cached ${cached.filter((b) => b.url && b.url.includes('storage.googleapis.com')).length}/${cached.length} beats to Firebase Storage (took ${(cachingMs / 1000).toFixed(1)}s)`);
   return cached;
 }
 
@@ -834,6 +848,11 @@ async function processJob(job) {
   const proj = projSnap.data();
   console.log(`processing "${proj.title}"`);
 
+  // Total wall clock measured for the whole job — saved to job.timings
+  // continuously so the UI can show which step ran when, even if the
+  // function process dies mid-run.
+  const totalStart = Date.now();
+
   // Step 1 — captions
   await jobRef.update({
     status: 'captions',
@@ -841,11 +860,16 @@ async function processJob(job) {
     progress: 10,
     updatedAt: FieldValue.serverTimestamp(),
   });
+  const captionsT0 = Date.now();
   const captions = await generateCaptionsFromAssemblyAI(job.voiceoverUrl);
+  const captionsMs = Date.now() - captionsT0;
+  console.log(`[${job.id}] ⏱ captions: ${(captionsMs / 1000).toFixed(1)}s, ${captions.length} sentences`);
   await jobRef.update({
     captions,
     progress: 30,
     currentStep: `Transcribed ${captions.length} sentences`,
+    'timings.captionsMs': captionsMs,
+    'timings.sentencesCount': captions.length,
     updatedAt: FieldValue.serverTimestamp(),
   });
 
@@ -861,7 +885,11 @@ async function processJob(job) {
   if (!anthropicKey) {
     throw new Error('Owner has no Anthropic key — set it under Settings → Integrations');
   }
+  const sourcingT0 = Date.now();
   const footage = await sourceBeatAwareFootage(captions, anthropicKey, jobRef, 35, 25);
+  const sourcingMs = Date.now() - sourcingT0;
+  console.log(`[${job.id}] ⏱ sourcing: ${(sourcingMs / 1000).toFixed(1)}s`);
+  await jobRef.update({'timings.sourcingMs': sourcingMs}).catch(() => {});
   const footageUrls = footage.map((f) => f.url).filter(Boolean);
   const pex = footage.filter((f) => f.source === 'pexels').length;
   const flux = footage.filter((f) => f.source === 'flux').length;
@@ -878,6 +906,7 @@ async function processJob(job) {
   // random. Failure is non-fatal — render proceeds without music.
   let musicUrl = null;
   let pickedMood = null;
+  const musicT0 = Date.now();
   try {
     pickedMood = await classifyTone(
       captions.map((c) => c.text).join(' '),
@@ -888,6 +917,7 @@ async function processJob(job) {
   } catch (e) {
     console.warn(`Music pick failed: ${e.message} — proceeding without`);
   }
+  await jobRef.update({'timings.musicMs': Date.now() - musicT0}).catch(() => {});
   await jobRef.update({
     musicUrl,
     pickedMood,
@@ -914,10 +944,18 @@ async function processJob(job) {
   let s3OutputUrl;
   let attempt = 0;
   const MAX_RENDER_ATTEMPTS = 5;
+  const renderStart = Date.now();
   while (true) {
     attempt++;
     try {
       s3OutputUrl = await renderOnLambda(renderInput, jobRef);
+      timings[`renderAttempt${attempt}`] = Date.now() - renderStart;
+      timings.render = timings[`renderAttempt${attempt}`];
+      await jobRef.update({
+        [`timings.renderAttempt${attempt}`]: timings[`renderAttempt${attempt}`],
+        'timings.render': timings.render,
+      }).catch(() => {});
+      console.log(`[${job.id}] ⏱ render (attempt ${attempt}): ${(timings.render / 1000).toFixed(1)}s`);
       break;
     } catch (e) {
       if (e.code !== 'CORRUPT_SOURCE' || attempt >= MAX_RENDER_ATTEMPTS) throw e;
@@ -989,11 +1027,19 @@ async function processJob(job) {
     progress: 95,
     updatedAt: FieldValue.serverTimestamp(),
   });
+  const uploadT0 = Date.now();
   const finalFile = await uploadRenderToFirebaseStorage(
     s3OutputUrl,
     job.channelId,
     job.projectId,
   );
+  const uploadMs = Date.now() - uploadT0;
+  const totalMs = Date.now() - totalStart;
+  console.log(`[${job.id}] ⏱ upload: ${(uploadMs / 1000).toFixed(1)}s · TOTAL: ${(totalMs / 1000).toFixed(1)}s`);
+  await jobRef.update({
+    'timings.uploadMs': uploadMs,
+    'timings.totalMs': totalMs,
+  }).catch(() => {});
 
   // Step 4 — done (atomic batch)
   const batch = db.batch();
