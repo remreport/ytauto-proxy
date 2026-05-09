@@ -37,6 +37,12 @@ function makeOAuthClient() {
 const YT_SCOPES = [
   'https://www.googleapis.com/auth/youtube.upload',
   'https://www.googleapis.com/auth/youtube.readonly',
+  // Read-only analytics scope. Required for channels/{cid}/analytics
+  // pulls (channel summary, retention curves, traffic sources, etc).
+  // Channels connected before this scope existed need to re-OAuth —
+  // the dashboard will surface a "re-connect" affordance based on the
+  // youtubeAnalyticsConnected flag set on callback below.
+  'https://www.googleapis.com/auth/yt-analytics.readonly',
 ];
 
 // ── Tiny helpers ────────────────────────────────────────────────
@@ -141,9 +147,20 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         console.error('Could not fetch YT channel info:', e.message);
       }
+      // Inspect granted scopes — Google may grant a subset if the user
+      // unchecks scopes on the consent screen. youtubeAnalyticsConnected
+      // gates the dashboard + analytics refresh; lets us surface a
+      // "re-connect for analytics" prompt without confusing UX when
+      // upload-only auth is fine for the publish step.
+      const grantedScopes = (tokens.scope || '').split(/\s+/);
+      const youtubeAnalyticsConnected = grantedScopes.includes(
+        'https://www.googleapis.com/auth/yt-analytics.readonly',
+      );
       // Save tokens to Firestore on the channel doc
       await db.collection('channels').doc(channelId).update({
         youtubeConnected: true,
+        youtubeAnalyticsConnected,
+        youtubeGrantedScopes: grantedScopes,
         youtubeRefreshToken: tokens.refresh_token || null,
         youtubeAccessToken: tokens.access_token || null,
         youtubeTokenExpiry: tokens.expiry_date || null,
@@ -167,13 +184,279 @@ const server = http.createServer(async (req, res) => {
       if (!channelId) return sendJSON(res, 400, { error: 'channelId required' });
       await db.collection('channels').doc(channelId).update({
         youtubeConnected: false,
+        youtubeAnalyticsConnected: false,
         youtubeRefreshToken: admin.firestore.FieldValue.delete(),
         youtubeAccessToken: admin.firestore.FieldValue.delete(),
         youtubeTokenExpiry: admin.firestore.FieldValue.delete(),
+        youtubeGrantedScopes: admin.firestore.FieldValue.delete(),
         youtubeChannel: admin.firestore.FieldValue.delete(),
       });
       return sendJSON(res, 200, { ok: true });
     } catch (e) {
+      return sendJSON(res, 500, { error: e.message });
+    }
+  }
+
+  // ── YouTube: analytics refresh ────────────────────────────────
+  // POST /youtube/analytics/refresh  body: { channelId }
+  // Pulls 90-day analytics for ONE channel, stores at
+  // channels/{cid}/analytics. Cache TTL is 24h — front-end can decide
+  // when to call this; this endpoint always re-fetches.
+  if (req.method === 'POST' && pathname === '/youtube/analytics/refresh') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const { channelId } = JSON.parse(body);
+      if (!channelId) return sendJSON(res, 400, { error: 'channelId required' });
+
+      const snap = await db.collection('channels').doc(channelId).get();
+      if (!snap.exists) return sendJSON(res, 404, { error: 'Channel not found' });
+      const data = snap.data();
+      if (!data.youtubeRefreshToken) return sendJSON(res, 400, { error: 'YouTube not connected for this channel' });
+      if (data.youtubeAnalyticsConnected === false) {
+        return sendJSON(res, 403, { error: 'Analytics scope not granted — re-connect this channel and approve the analytics scope' });
+      }
+
+      const oauth = makeOAuthClient();
+      oauth.setCredentials({
+        refresh_token: data.youtubeRefreshToken,
+        access_token: data.youtubeAccessToken || undefined,
+        expiry_date: data.youtubeTokenExpiry || undefined,
+      });
+      const analytics = google.youtubeAnalytics({ version: 'v2', auth: oauth });
+      const yt = google.youtube({ version: 'v3', auth: oauth });
+
+      // 90-day window — most recent full day to avoid partial-day data.
+      const today = new Date();
+      const endDate = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+      const startDate = new Date(endDate.getTime() - 90 * 24 * 60 * 60 * 1000);
+      const fmt = (d) => d.toISOString().slice(0, 10);
+
+      // 1) Channel-level summary (daily granularity for trend chart)
+      let channelSummary = null;
+      try {
+        const r = await analytics.reports.query({
+          ids: 'channel==MINE',
+          startDate: fmt(startDate),
+          endDate: fmt(endDate),
+          metrics: 'views,estimatedMinutesWatched,averageViewDuration,subscribersGained,likes,comments,shares',
+          dimensions: 'day',
+        });
+        const rows = r.data.rows || [];
+        const headers = (r.data.columnHeaders || []).map((h) => h.name);
+        const sumIdx = (m) => headers.indexOf(m);
+        const totals = {
+          totalViews: 0,
+          totalWatchTimeMinutes: 0,
+          totalSubscribersGained: 0,
+          totalLikes: 0,
+          totalComments: 0,
+          totalShares: 0,
+        };
+        for (const row of rows) {
+          totals.totalViews += row[sumIdx('views')] || 0;
+          totals.totalWatchTimeMinutes += row[sumIdx('estimatedMinutesWatched')] || 0;
+          totals.totalSubscribersGained += row[sumIdx('subscribersGained')] || 0;
+          totals.totalLikes += row[sumIdx('likes')] || 0;
+          totals.totalComments += row[sumIdx('comments')] || 0;
+          totals.totalShares += row[sumIdx('shares')] || 0;
+        }
+        const avgViewDur = rows.length
+          ? rows.reduce((s, r) => s + (r[sumIdx('averageViewDuration')] || 0), 0) / rows.length
+          : 0;
+        channelSummary = {
+          ...totals,
+          avgViewDuration: Math.round(avgViewDur),
+          dailyTrend: rows.map((row) => ({
+            day: row[sumIdx('day')],
+            views: row[sumIdx('views')] || 0,
+            watchMinutes: row[sumIdx('estimatedMinutesWatched')] || 0,
+            subsGained: row[sumIdx('subscribersGained')] || 0,
+          })),
+        };
+      } catch (e) {
+        console.warn('channelSummary failed:', e.message);
+      }
+
+      // 2) Top 50 videos by views
+      let topVideos = [];
+      try {
+        const r = await analytics.reports.query({
+          ids: 'channel==MINE',
+          startDate: fmt(startDate),
+          endDate: fmt(endDate),
+          metrics: 'views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,subscribersGained',
+          dimensions: 'video',
+          sort: '-views',
+          maxResults: 50,
+        });
+        const rows = r.data.rows || [];
+        const headers = (r.data.columnHeaders || []).map((h) => h.name);
+        const idx = (m) => headers.indexOf(m);
+        // Resolve video titles in batches of 50
+        const videoIds = rows.map((row) => row[idx('video')]).filter(Boolean);
+        const titleMap = {};
+        if (videoIds.length) {
+          const vr = await yt.videos.list({ part: ['snippet'], id: videoIds.slice(0, 50) });
+          for (const v of (vr.data.items || [])) {
+            titleMap[v.id] = {
+              title: v.snippet?.title || '',
+              publishedAt: v.snippet?.publishedAt || null,
+              thumbnail: v.snippet?.thumbnails?.medium?.url || '',
+            };
+          }
+        }
+        topVideos = rows.map((row) => {
+          const vid = row[idx('video')];
+          return {
+            videoId: vid,
+            title: titleMap[vid]?.title || '',
+            publishedAt: titleMap[vid]?.publishedAt || null,
+            thumbnail: titleMap[vid]?.thumbnail || '',
+            views: row[idx('views')] || 0,
+            watchMinutes: row[idx('estimatedMinutesWatched')] || 0,
+            avgViewDuration: row[idx('averageViewDuration')] || 0,
+            avgViewPercentage: row[idx('averageViewPercentage')] || 0,
+            subsGained: row[idx('subscribersGained')] || 0,
+          };
+        });
+      } catch (e) {
+        console.warn('topVideos failed:', e.message);
+      }
+
+      // 3) Retention curves for top 20 videos (1 API call per video — costly)
+      const retentionCurves = {};
+      const top20 = topVideos.slice(0, 20);
+      for (const v of top20) {
+        try {
+          const r = await analytics.reports.query({
+            ids: 'channel==MINE',
+            startDate: fmt(startDate),
+            endDate: fmt(endDate),
+            metrics: 'audienceWatchRatio,relativeRetentionPerformance',
+            dimensions: 'elapsedVideoTimeRatio',
+            filters: `video==${v.videoId}`,
+          });
+          const rows = r.data.rows || [];
+          const curve = rows.map((row) => ({
+            x: row[0], // elapsedVideoTimeRatio 0.0-1.0
+            retention: row[1], // audienceWatchRatio
+            relative: row[2], // relativeRetentionPerformance
+          }));
+          // Find first significant drop-off
+          let dropoffX = null;
+          for (let i = 1; i < curve.length; i++) {
+            if ((curve[i].retention || 0) < 0.5 && dropoffX === null) {
+              dropoffX = curve[i].x;
+              break;
+            }
+          }
+          retentionCurves[v.videoId] = {
+            title: v.title,
+            published: v.publishedAt,
+            curve,
+            dropoffX,
+          };
+        } catch (e) {
+          console.warn(`retention for ${v.videoId} failed:`, e.message);
+        }
+      }
+
+      // 4) Demographics (age + gender)
+      let demographics = null;
+      try {
+        const r = await analytics.reports.query({
+          ids: 'channel==MINE',
+          startDate: fmt(startDate),
+          endDate: fmt(endDate),
+          metrics: 'viewerPercentage',
+          dimensions: 'ageGroup,gender',
+        });
+        const rows = r.data.rows || [];
+        const ageGroups = {};
+        const gender = {};
+        for (const row of rows) {
+          const [age, g, pct] = row;
+          ageGroups[age] = (ageGroups[age] || 0) + (pct || 0);
+          gender[g] = (gender[g] || 0) + (pct || 0);
+        }
+        demographics = { ageGroups, gender };
+      } catch (e) {
+        console.warn('demographics failed:', e.message);
+      }
+
+      // 5) Top search terms driving channel views
+      let searchTerms = [];
+      try {
+        const r = await analytics.reports.query({
+          ids: 'channel==MINE',
+          startDate: fmt(startDate),
+          endDate: fmt(endDate),
+          metrics: 'views',
+          dimensions: 'insightTrafficSourceDetail',
+          filters: 'insightTrafficSourceType==YT_SEARCH',
+          maxResults: 50,
+          sort: '-views',
+        });
+        const rows = r.data.rows || [];
+        const total = rows.reduce((s, r) => s + (r[1] || 0), 0);
+        searchTerms = rows.map((row) => ({
+          term: row[0],
+          views: row[1] || 0,
+          percentage: total ? Math.round(((row[1] || 0) / total) * 100 * 10) / 10 : 0,
+        }));
+      } catch (e) {
+        console.warn('searchTerms failed:', e.message);
+      }
+
+      // Programmatic insights — non-LLM patterns extracted from the
+      // raw data. Phase 3C's full Claude pass should run separately
+      // (next session) and replace this with richer recommendations.
+      const insights = {
+        topPerformingTitlePatterns: topVideos.slice(0, 10).map((v) => v.title).filter(Boolean),
+        retentionDropoffPattern: (() => {
+          const dropoffs = Object.values(retentionCurves)
+            .map((c) => c.dropoffX)
+            .filter((x) => typeof x === 'number');
+          if (!dropoffs.length) return null;
+          const avg = dropoffs.reduce((s, x) => s + x, 0) / dropoffs.length;
+          return {
+            typicalDropoffPercent: Math.round(avg * 100),
+            sampleSize: dropoffs.length,
+            severity: avg < 0.3 ? 'severe' : avg < 0.5 ? 'moderate' : 'mild',
+          };
+        })(),
+        audienceProfile: (() => {
+          if (!demographics) return null;
+          const ages = Object.entries(demographics.ageGroups).sort((a, b) => b[1] - a[1]);
+          const genders = Object.entries(demographics.gender).sort((a, b) => b[1] - a[1]);
+          if (!ages.length) return null;
+          return `${ages[0][0]} ${genders[0]?.[0] || ''} primary (${Math.round(ages[0][1])}% / ${Math.round(genders[0]?.[1] || 0)}%)`.trim();
+        })(),
+        trendingTopics: searchTerms.slice(0, 10).map((t) => t.term),
+      };
+
+      const payload = {
+        refreshedAt: admin.firestore.FieldValue.serverTimestamp(),
+        daysCovered: 90,
+        channelSummary,
+        topVideos,
+        retentionCurves,
+        demographics,
+        searchTerms,
+        insights,
+      };
+
+      // Store under a single doc — cap on retention curves keeps doc <1MB.
+      await db.collection('channels').doc(channelId).collection('analytics').doc('summary').set(payload);
+      console.log(`Analytics refresh complete for ${channelId}: ${topVideos.length} videos, ${Object.keys(retentionCurves).length} curves`);
+      return sendJSON(res, 200, {
+        ok: true,
+        topVideosCount: topVideos.length,
+        retentionCurvesCount: Object.keys(retentionCurves).length,
+      });
+    } catch (e) {
+      console.error('analytics refresh error:', e);
       return sendJSON(res, 500, { error: e.message });
     }
   }
