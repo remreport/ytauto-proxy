@@ -43,6 +43,12 @@ const YT_SCOPES = [
   // the dashboard will surface a "re-connect" affordance based on the
   // youtubeAnalyticsConnected flag set on callback below.
   'https://www.googleapis.com/auth/yt-analytics.readonly',
+  // Captions API scope. Needed to fetch caption tracks (transcripts)
+  // from the user's own videos for the forensic per-video analyzer.
+  // youtube.readonly does NOT cover captions.download — youtube.force-ssl
+  // is the documented scope. Channels connected before this scope was
+  // added need to re-OAuth (youtubeCaptionsConnected flag below).
+  'https://www.googleapis.com/auth/youtube.force-ssl',
 ];
 
 // ── Tiny helpers ────────────────────────────────────────────────
@@ -80,6 +86,191 @@ function downloadToBuffer(url) {
       response.on('end', () => resolve(Buffer.concat(chunks)));
       response.on('error', reject);
     }).on('error', reject);
+  });
+}
+
+// ── Forensic helpers (used by /youtube/analytics/forensic) ──────
+// Convert YouTube ISO 8601 duration ("PT1H23M45S") to seconds.
+function parseISO8601Duration(s) {
+  const m = (s || '').match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!m) return 0;
+  return (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0);
+}
+
+// Parse SRT or VTT text into [{start, end, text}]. Tolerates both
+// comma + period decimal separators, BOM, CRLF, and inline HTML
+// styling tags YouTube sometimes emits in auto-captions.
+function parseSRT(text) {
+  if (!text || typeof text !== 'string') return [];
+  const out = [];
+  const t = text.replace(/^﻿/, '').replace(/\r\n/g, '\n');
+  const blocks = t.split(/\n\n+/);
+  for (const block of blocks) {
+    if (/^WEBVTT/.test(block)) continue;
+    const lines = block.split('\n').filter(Boolean);
+    const tsLine = lines.find(L => L.includes('-->'));
+    if (!tsLine) continue;
+    const m = tsLine.match(/(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})/);
+    if (!m) continue;
+    const start = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 1000;
+    const end   = (+m[5]) * 3600 + (+m[6]) * 60 + (+m[7]) + (+m[8]) / 1000;
+    const textLines = lines.slice(lines.indexOf(tsLine) + 1).join(' ').replace(/<[^>]+>/g, '').trim();
+    if (textLines) out.push({ start: +start.toFixed(2), end: +end.toFixed(2), text: textLines });
+  }
+  return out;
+}
+
+// Identify retention events on a 100-point curve. Thresholds match
+// the spec: spike = +1.5% over 1% interval, dip = -2.5% over 1%,
+// cliff = -5% over 2%, sustained = continuous ≥10% region where
+// retention stays above 75% of curve peak.
+function analyzeRetentionCurve(curve) {
+  if (!Array.isArray(curve) || curve.length < 5) return { spikes: [], dips: [], cliffs: [], sustained: [], peak: 0 };
+  const sorted = curve
+    .filter(p => typeof p?.x === 'number' && typeof p?.retention === 'number')
+    .slice()
+    .sort((a, b) => a.x - b.x);
+  const peak = Math.max(...sorted.map(p => p.retention));
+  const spikes = [];
+  const dips = [];
+  const cliffs = [];
+  // 1% interval events
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1];
+    const curr = sorted[i];
+    const delta = curr.retention - prev.retention;
+    const dx = curr.x - prev.x;
+    if (dx <= 0.012) {
+      if (delta >= 0.015) spikes.push({ x: +curr.x.toFixed(4), delta: +delta.toFixed(4), retentionAtPoint: +curr.retention.toFixed(4) });
+      else if (delta <= -0.025) dips.push({ x: +curr.x.toFixed(4), delta: +delta.toFixed(4), retentionAtPoint: +curr.retention.toFixed(4) });
+    }
+  }
+  // 2% interval cliffs
+  for (let i = 2; i < sorted.length; i++) {
+    const prev = sorted[i - 2];
+    const curr = sorted[i];
+    const delta = curr.retention - prev.retention;
+    const dx = curr.x - prev.x;
+    if (dx <= 0.025 && delta <= -0.05) {
+      cliffs.push({ x: +curr.x.toFixed(4), delta: +delta.toFixed(4), retentionAtPoint: +curr.retention.toFixed(4) });
+    }
+  }
+  // Sustained high zones
+  const threshold = peak * 0.75;
+  const sustained = [];
+  let zoneStart = null, zoneSum = 0, zoneCount = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const r = sorted[i].retention;
+    if (r >= threshold) {
+      if (zoneStart === null) zoneStart = sorted[i].x;
+      zoneSum += r;
+      zoneCount++;
+    } else if (zoneStart !== null) {
+      const zoneEnd = sorted[i - 1].x;
+      if (zoneEnd - zoneStart >= 0.10) {
+        sustained.push({ startX: +zoneStart.toFixed(4), endX: +zoneEnd.toFixed(4), avgRetention: +(zoneSum / zoneCount).toFixed(4) });
+      }
+      zoneStart = null; zoneSum = 0; zoneCount = 0;
+    }
+  }
+  if (zoneStart !== null) {
+    const zoneEnd = sorted[sorted.length - 1].x;
+    if (zoneEnd - zoneStart >= 0.10) {
+      sustained.push({ startX: +zoneStart.toFixed(4), endX: +zoneEnd.toFixed(4), avgRetention: +(zoneSum / zoneCount).toFixed(4) });
+    }
+  }
+  return { spikes, dips, cliffs, sustained, peak: +peak.toFixed(4) };
+}
+
+// Given a transcript and a target time in seconds, return the
+// 5-10 spoken words around that moment (window: t-1s..t+3s).
+function spokenWordsAt(transcript, tSec) {
+  const window = (transcript || []).filter(seg => seg.end >= tSec - 1 && seg.start <= tSec + 3);
+  return window.map(s => s.text).join(' ').replace(/\s+/g, ' ').trim().slice(0, 240);
+}
+
+// Phase C — Claude pattern pass over forensic data. Uses the user's
+// own Anthropic key (passed in the request body as _apiKey) so we
+// don't burn a shared key. Server-side rather than client-side
+// because the per-video data can be hundreds of KB and we already
+// have it in memory after the forensic loop.
+function claudePatternPass(perVideo, apiKey) {
+  return new Promise((resolve, reject) => {
+    if (!apiKey) return reject(new Error('Anthropic API key required for pattern pass'));
+    const compact = Object.entries(perVideo)
+      .filter(([, v]) => !v.error && (v.captionsAvailable || (v.bestSections || []).length))
+      .slice(0, 10)
+      .map(([, v]) => ({
+        title: v.title,
+        views: v.views,
+        avgViewPercentage: v.avgViewPercentage,
+        durationSec: v.durationSec,
+        firstHookText: (v.transcript || []).filter(t => t.start < 30).map(t => t.text).join(' ').slice(0, 400),
+        spikes: (v.spikeMoments || []).slice(0, 6).map(s => ({ x: +s.x.toFixed(2), gain: s.retentionGain, words: s.spokenWords })),
+        dips: (v.dipMoments || []).slice(0, 6).map(d => ({ x: +d.x.toFixed(2), loss: d.retentionLoss, words: d.spokenWords })),
+        cliffs: (v.cliffDrops || []).slice(0, 3).map(c => ({ x: +c.x.toFixed(2), severity: c.severity, words: c.spokenWords })),
+        bestSections: (v.bestSections || []).slice(0, 3).map(b => ({ start: +b.startX.toFixed(2), end: +b.endX.toFixed(2), avg: b.avgRetention, snippet: b.transcriptSnippet })),
+      }));
+    if (compact.length === 0) return reject(new Error('No videos with usable forensic data'));
+    const prompt = `Analyse these ${compact.length} top videos' retention data + transcripts. Each video has:
+- firstHookText: the first 30s of the video's transcript = the hook
+- spikes: where retention went UP (with the words spoken at that moment)
+- dips: where retention went DOWN (with the words spoken)
+- cliffs: sudden retention cliffs
+- bestSections: sustained high-retention zones (with transcript snippet)
+
+Extract STRUCTURAL PATTERNS shared across videos — patterns that explain WHY retention behaves the way it does, so we can replicate the wins and avoid the dips on new videos. Be specific (quote actual phrases from the data). If you can't find a pattern, say "insufficient data" rather than fabricating.
+
+Output ONLY a JSON object, no prose, no fences:
+
+{
+  "hookPatterns": [{"pattern": "describe the hook structure", "example": "exact phrase from one of the firstHookText fields", "avgRetentionImpact": "+X% in first 30s or insufficient data"}],
+  "spikeWordPatterns": [{"phrase": "exact phrase or pattern that recurs at spike moments", "occurrences": N, "avgSpike": 0.025, "where": "early|mid|late"}],
+  "dipWordPatterns": [{"phrase": "phrase or pattern that recurs at dip moments", "occurrences": N, "avgDrop": 0.04, "advice": "concrete advice — what to do instead"}],
+  "optimalPacing": {"introHookByXSec": 12, "sustainedSectionLength": "describe", "statRevealTiming": "X-Y% mark"},
+  "structuralTemplate": {"intro": "0-X%: description", "setup": "X-Y%: description", "body": "Y-Z%: description", "climax": "Z-W%: description", "conclusion": "W-100%: description"},
+  "audienceInsights": {"profile": "1-2 sentences", "triggers": "what activates retention for this audience", "repellents": "what kills retention"}
+}
+
+DATA (JSON):
+${JSON.stringify(compact)}`;
+    const payload = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 3000,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const options = {
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+    };
+    const apiReq = https.request(options, apiRes => {
+      let buf = '';
+      apiRes.on('data', c => { buf += c; });
+      apiRes.on('end', () => {
+        try {
+          const j = JSON.parse(buf);
+          if (j.error) return reject(new Error(j.error.message || 'Anthropic error'));
+          const text = (j.content || []).find(b => b.type === 'text')?.text || '';
+          const cleaned = text.replace(/```json|```/g, '').trim();
+          const first = cleaned.indexOf('{');
+          const last = cleaned.lastIndexOf('}');
+          const sliced = first >= 0 && last > first ? cleaned.slice(first, last + 1) : cleaned;
+          resolve(JSON.parse(sliced));
+        } catch (e) {
+          reject(new Error('Failed to parse Claude pattern response: ' + e.message));
+        }
+      });
+    });
+    apiReq.on('error', reject);
+    apiReq.write(payload);
+    apiReq.end();
   });
 }
 
@@ -156,10 +347,14 @@ const server = http.createServer(async (req, res) => {
       const youtubeAnalyticsConnected = grantedScopes.includes(
         'https://www.googleapis.com/auth/yt-analytics.readonly',
       );
+      const youtubeCaptionsConnected = grantedScopes.includes(
+        'https://www.googleapis.com/auth/youtube.force-ssl',
+      );
       // Save tokens to Firestore on the channel doc
       await db.collection('channels').doc(channelId).update({
         youtubeConnected: true,
         youtubeAnalyticsConnected,
+        youtubeCaptionsConnected,
         youtubeGrantedScopes: grantedScopes,
         youtubeRefreshToken: tokens.refresh_token || null,
         youtubeAccessToken: tokens.access_token || null,
@@ -185,6 +380,7 @@ const server = http.createServer(async (req, res) => {
       await db.collection('channels').doc(channelId).update({
         youtubeConnected: false,
         youtubeAnalyticsConnected: false,
+        youtubeCaptionsConnected: false,
         youtubeRefreshToken: admin.firestore.FieldValue.delete(),
         youtubeAccessToken: admin.firestore.FieldValue.delete(),
         youtubeTokenExpiry: admin.firestore.FieldValue.delete(),
@@ -457,6 +653,245 @@ const server = http.createServer(async (req, res) => {
       });
     } catch (e) {
       console.error('analytics refresh error:', e);
+      return sendJSON(res, 500, { error: e.message });
+    }
+  }
+
+  // ── YouTube: forensic per-video analysis ─────────────────────
+  // POST /youtube/analytics/forensic  body: { channelId, _apiKey }
+  //
+  // For each of TOP 10 videos, pulls retention curve + caption
+  // transcript, identifies retention spikes / dips / cliffs /
+  // sustained-high zones, and maps each event to the words spoken
+  // at that exact moment. Then runs a Claude pass over the whole
+  // structured dataset to extract reusable patterns (hook templates,
+  // spike phrases, dip phrases, optimal pacing, structural template).
+  // Saves to channels/{cid}/analytics/forensic.
+  //
+  // LIMITATIONS — be honest with the user about what is + isn't here:
+  //   ✔ retention curve (100 datapoints) per video
+  //   ✔ auto + manual captions per video
+  //   ✗ music tracks used in past videos (not in API)
+  //   ✗ specific clips / footage used (not in API)
+  //   ✗ thumbnail visuals (only title text overlap is observable)
+  //   ✗ WHY viewers drop off (only WHEN)
+  //
+  // Captions API has a separate quota bucket — be efficient. We only
+  // fetch top 10 (not all 50 from the analytics summary) and cap the
+  // transcript at 200 cues per video to keep the doc <1MB.
+  if (req.method === 'POST' && pathname === '/youtube/analytics/forensic') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const parsed = JSON.parse(body);
+      const { channelId } = parsed;
+      const userApiKey = parsed._apiKey || ''; // user's Anthropic key for the pattern pass
+      if (!channelId) return sendJSON(res, 400, { error: 'channelId required' });
+
+      const snap = await db.collection('channels').doc(channelId).get();
+      if (!snap.exists) return sendJSON(res, 404, { error: 'Channel not found' });
+      const data = snap.data();
+      if (!data.youtubeRefreshToken) return sendJSON(res, 400, { error: 'YouTube not connected for this channel' });
+      if (data.youtubeAnalyticsConnected === false) {
+        return sendJSON(res, 403, { error: 'Analytics scope not granted — re-connect this channel' });
+      }
+      if (data.youtubeCaptionsConnected === false) {
+        return sendJSON(res, 403, { error: 'Captions scope not granted — re-connect this channel and approve all scopes' });
+      }
+
+      // Need /analytics/refresh to have run first so we already have
+      // top-videos + cached retention curves. Cheaper than re-querying.
+      const summarySnap = await db.collection('channels').doc(channelId).collection('analytics').doc('summary').get();
+      if (!summarySnap.exists) {
+        return sendJSON(res, 400, { error: 'Run /youtube/analytics/refresh first to populate top-videos data' });
+      }
+      const summary = summarySnap.data();
+      const top10 = (summary.topVideos || []).slice(0, 10);
+      if (top10.length === 0) {
+        return sendJSON(res, 400, { error: 'No top videos in analytics summary — channel may have no public views in the last 90 days' });
+      }
+
+      const oauth = makeOAuthClient();
+      oauth.setCredentials({
+        refresh_token: data.youtubeRefreshToken,
+        access_token: data.youtubeAccessToken || undefined,
+        expiry_date: data.youtubeTokenExpiry || undefined,
+      });
+      const yt = google.youtube({ version: 'v3', auth: oauth });
+      const analytics = google.youtubeAnalytics({ version: 'v2', auth: oauth });
+      const fmt = (d) => d.toISOString().slice(0, 10);
+
+      // Resolve real durations once (single API call) so retention
+      // x-ratios convert correctly to seconds for caption mapping.
+      const videoIds = top10.map(v => v.videoId).filter(Boolean);
+      const durMap = {};
+      try {
+        const vr = await yt.videos.list({ part: ['contentDetails'], id: videoIds });
+        for (const item of (vr.data.items || [])) {
+          durMap[item.id] = parseISO8601Duration(item.contentDetails?.duration || 'PT0S');
+        }
+      } catch (e) {
+        console.warn('forensic: videos.list duration fetch failed:', e.message);
+      }
+
+      const perVideo = {};
+      for (const v of top10) {
+        const vid = v.videoId;
+        try {
+          // Retention curve — prefer cached from /analytics/refresh.
+          let curve = summary.retentionCurves?.[vid]?.curve || null;
+          if (!curve || curve.length < 5) {
+            const today = new Date();
+            const endDate = new Date(today.getTime() - 86400_000);
+            const startDate = new Date(endDate.getTime() - 90 * 86400_000);
+            const r = await analytics.reports.query({
+              ids: 'channel==MINE',
+              startDate: fmt(startDate),
+              endDate: fmt(endDate),
+              metrics: 'audienceWatchRatio',
+              dimensions: 'elapsedVideoTimeRatio',
+              filters: `video==${vid}`,
+            });
+            curve = (r.data.rows || []).map(row => ({ x: row[0], retention: row[1] }));
+          }
+          if (!curve || curve.length < 5) {
+            perVideo[vid] = { title: v.title || '', views: v.views || 0, error: 'no retention curve' };
+            continue;
+          }
+
+          // Caption track lookup — prefer English, fall back to first track.
+          let captionTrack = null;
+          try {
+            const cl = await yt.captions.list({ part: ['snippet'], videoId: vid });
+            const tracks = cl.data.items || [];
+            captionTrack = tracks.find(t => (t.snippet?.language || '').toLowerCase().startsWith('en'))
+                        || tracks[0]
+                        || null;
+          } catch (e) {
+            console.warn(`forensic: captions.list failed for ${vid}:`, e.message);
+          }
+          let transcript = [];
+          if (captionTrack) {
+            try {
+              const dl = await yt.captions.download({ id: captionTrack.id, tfmt: 'srt' });
+              const raw = typeof dl.data === 'string' ? dl.data : Buffer.from(dl.data || '').toString('utf-8');
+              transcript = parseSRT(raw);
+            } catch (e) {
+              console.warn(`forensic: captions.download failed for ${vid}:`, e.message);
+            }
+          }
+
+          // Duration fallback chain: API → last caption end → 600s.
+          const durationSec = durMap[vid]
+            || (transcript.length ? transcript[transcript.length - 1].end : 600);
+
+          const events = analyzeRetentionCurve(curve);
+
+          const spikeMoments = events.spikes.map(s => ({
+            x: s.x,
+            timestampSec: Math.round(s.x * durationSec),
+            retentionGain: s.delta,
+            retentionAtPoint: s.retentionAtPoint,
+            spokenWords: spokenWordsAt(transcript, s.x * durationSec),
+          }));
+          const dipMoments = events.dips.map(d => ({
+            x: d.x,
+            timestampSec: Math.round(d.x * durationSec),
+            retentionLoss: d.delta,
+            retentionAtPoint: d.retentionAtPoint,
+            spokenWords: spokenWordsAt(transcript, d.x * durationSec),
+          }));
+          const cliffDrops = events.cliffs.map(c => ({
+            x: c.x,
+            timestampSec: Math.round(c.x * durationSec),
+            severity: c.delta,
+            retentionAtPoint: c.retentionAtPoint,
+            spokenWords: spokenWordsAt(transcript, c.x * durationSec),
+          }));
+          const bestSections = events.sustained.map(z => {
+            const startSec = z.startX * durationSec;
+            const endSec = z.endX * durationSec;
+            const window = transcript.filter(seg => seg.end >= startSec && seg.start <= endSec);
+            const snippet = window.map(s => s.text).join(' ').replace(/\s+/g, ' ').trim().slice(0, 360);
+            return {
+              startX: z.startX,
+              endX: z.endX,
+              startSec: Math.round(startSec),
+              endSec: Math.round(endSec),
+              avgRetention: z.avgRetention,
+              transcriptSnippet: snippet,
+            };
+          });
+
+          // Combined "retention mapped to transcript" stream for any
+          // downstream consumer that wants events in time order.
+          const retentionMappedToTranscript = [
+            ...spikeMoments.map(e => ({ timestamp: e.timestampSec, retentionAtPoint: e.retentionAtPoint, spokenContext: e.spokenWords, eventType: 'spike' })),
+            ...dipMoments.map(e => ({ timestamp: e.timestampSec, retentionAtPoint: e.retentionAtPoint, spokenContext: e.spokenWords, eventType: 'dip' })),
+            ...cliffDrops.map(e => ({ timestamp: e.timestampSec, retentionAtPoint: e.retentionAtPoint, spokenContext: e.spokenWords, eventType: 'cliff' })),
+            ...bestSections.map(b => ({ timestamp: b.startSec, retentionAtPoint: b.avgRetention, spokenContext: b.transcriptSnippet, eventType: 'sustained' })),
+          ].sort((a, b) => a.timestamp - b.timestamp);
+
+          perVideo[vid] = {
+            title: v.title || '',
+            views: v.views || 0,
+            publishedAt: v.publishedAt || null,
+            durationSec,
+            avgRetention: v.avgViewPercentage || 0,
+            avgViewPercentage: v.avgViewPercentage || 0,
+            captionsAvailable: !!captionTrack && transcript.length > 0,
+            captionTrackLanguage: captionTrack?.snippet?.language || null,
+            transcript: transcript.slice(0, 200), // doc-size cap
+            retentionMappedToTranscript,
+            spikeMoments,
+            dipMoments,
+            cliffDrops,
+            bestSections,
+          };
+        } catch (e) {
+          console.warn(`forensic: per-video failed for ${vid}:`, e.message);
+          perVideo[vid] = { title: v.title || '', views: v.views || 0, error: e.message };
+        }
+      }
+
+      // Save raw per-video forensic data BEFORE the Claude pass — if
+      // the LLM call fails the user still has the structured data
+      // saved and the pattern step can be retried independently.
+      await db.collection('channels').doc(channelId).collection('analytics').doc('forensic').set({
+        refreshedAt: admin.firestore.FieldValue.serverTimestamp(),
+        perVideo,
+        videosAnalyzed: Object.keys(perVideo).length,
+        videosWithCaptions: Object.values(perVideo).filter(p => p.captionsAvailable).length,
+      });
+
+      // Phase C — pattern extraction. Only runs if user passed their
+      // Anthropic key. Pattern object is saved as a separate field on
+      // the same doc so consumers can read either layer independently.
+      let patterns = null;
+      let patternsError = null;
+      if (userApiKey) {
+        try {
+          patterns = await claudePatternPass(perVideo, userApiKey);
+          await db.collection('channels').doc(channelId).collection('analytics').doc('forensic').update({
+            patterns,
+            patternsGeneratedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } catch (e) {
+          patternsError = e.message;
+          console.warn('forensic: claude pattern pass failed:', e.message);
+        }
+      }
+
+      console.log(`Forensic complete for ${channelId}: ${Object.keys(perVideo).length} videos, ${Object.values(perVideo).filter(p => p.captionsAvailable).length} with captions, patterns=${!!patterns}`);
+      return sendJSON(res, 200, {
+        ok: true,
+        videosAnalyzed: Object.keys(perVideo).length,
+        videosWithCaptions: Object.values(perVideo).filter(p => p.captionsAvailable).length,
+        patternsExtracted: !!patterns,
+        patternsError,
+      });
+    } catch (e) {
+      console.error('forensic error:', e);
       return sendJSON(res, 500, { error: e.message });
     }
   }
