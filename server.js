@@ -53,6 +53,117 @@ function elevenLabsLimit(modelId) {
   return (ELEVENLABS_MODELS[modelId] || ELEVENLABS_MODELS[ELEVENLABS_DEFAULT_MODEL]).charLimit;
 }
 
+// Split a long script into chunks that each fit under the model's
+// char limit. Targets 80% of the limit so we leave headroom (the
+// per-chunk char count is approximate and ElevenLabs sometimes
+// objects to texts close to the cap). Boundaries:
+//   1. Paragraph breaks (\n\n)
+//   2. Sentence boundaries (. ! ?) — when a single paragraph is over
+//   3. Hard slice — only if a single sentence exceeds the limit
+//      (essentially never for normal scripts).
+// Frontend mirrors this exact algorithm so the chunk-count preview
+// matches what the server actually does.
+function chunkTextForTts(text, modelId) {
+  const limit = elevenLabsLimit(modelId);
+  const target = Math.floor(limit * 0.8);
+  if (!text || text.length <= limit) return [text || ''];
+  const out = [];
+  let cur = '';
+  const flush = () => { if (cur.trim()) out.push(cur.trim()); cur = ''; };
+  const paragraphs = text.split(/\n\s*\n+/);
+  for (const p of paragraphs) {
+    if (p.length > limit) {
+      flush();
+      const sentences = p.match(/[^.!?]+[.!?]+\s*/g) || [p];
+      for (const s of sentences) {
+        if (cur.length + s.length > target) flush();
+        if (s.length > limit) {
+          // Pathological — single sentence over limit. Slice hard.
+          for (let i = 0; i < s.length; i += target) out.push(s.slice(i, i + target));
+        } else {
+          cur += s;
+        }
+      }
+      flush();
+    } else if (cur.length + p.length + 2 > target) {
+      flush();
+      cur = p;
+    } else {
+      cur += (cur ? '\n\n' : '') + p;
+    }
+  }
+  flush();
+  return out.filter(Boolean);
+}
+
+// Single-chunk TTS request. Returns the MP3 bytes as a Buffer so the
+// caller can concatenate multiple chunks before uploading. Used by
+// the chunked path; the single-chunk path uses it too so behavior
+// stays identical.
+function ttsOneChunk(text, voiceId, modelId, apiKey) {
+  return new Promise((resolve, reject) => {
+    const ttsBody = JSON.stringify({
+      text,
+      model_id: modelId,
+      voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true },
+    });
+    const options = {
+      hostname: 'api.elevenlabs.io',
+      path: `/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
+      method: 'POST',
+      headers: {
+        'xi-api-key': apiKey,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(ttsBody),
+        'Accept': 'audio/mpeg',
+      },
+    };
+    const req = https.request(options, (apiRes) => {
+      const chunks = [];
+      apiRes.on('data', (c) => chunks.push(c));
+      apiRes.on('end', () => {
+        if (apiRes.statusCode !== 200) {
+          const errBuf = Buffer.concat(chunks).toString('utf-8');
+          let parsedErr = null;
+          try { parsedErr = JSON.parse(errBuf); } catch {}
+          let friendly = parsedErr?.detail?.message || parsedErr?.detail?.status || errBuf.slice(0, 240);
+          if (apiRes.statusCode === 401) friendly = 'Invalid ElevenLabs API key';
+          else if (apiRes.statusCode === 402) friendly = 'ElevenLabs account out of characters / payment required';
+          else if (apiRes.statusCode === 429) friendly = 'ElevenLabs rate limit hit';
+          const err = new Error(friendly);
+          err.status = apiRes.statusCode;
+          return reject(err);
+        }
+        resolve(Buffer.concat(chunks));
+      });
+      apiRes.on('error', reject);
+    });
+    req.on('error', reject);
+    req.write(ttsBody);
+    req.end();
+  });
+}
+
+// Retry wrapper for transient ElevenLabs failures (429 rate limit /
+// 5xx). 401/402 are NOT retried — those are real auth/billing errors.
+async function ttsOneChunkWithRetry(text, voiceId, modelId, apiKey, maxRetries = 2) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await ttsOneChunk(text, voiceId, modelId, apiKey);
+    } catch (e) {
+      lastErr = e;
+      if (e.status === 401 || e.status === 402) throw e; // don't retry auth/billing
+      if (attempt < maxRetries) {
+        const backoffMs = 2000 * (attempt + 1);
+        console.warn(`[elevenlabs] chunk failed (${e.message}) — retry ${attempt + 1}/${maxRetries} in ${backoffMs}ms`);
+        await new Promise((r) => setTimeout(r, backoffMs));
+      }
+    }
+  }
+  throw lastErr || new Error('TTS chunk failed after retries');
+}
+
 // ── Google OAuth client factory ─────────────────────────────────
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
@@ -1321,115 +1432,94 @@ const server = http.createServer(async (req, res) => {
     if (!text || typeof text !== 'string') return sendJSON(res, 400, { error: 'text is required' });
     if (!voiceId) return sendJSON(res, 400, { error: 'voiceId is required' });
 
-    // Resolve model + reject upfront if the script blows past its char
-    // limit — avoids a wasted Anthropic-style 422 from ElevenLabs.
+    // Resolve model. We no longer reject over-limit scripts — the
+    // chunker below splits them into chunks that fit, generates each
+    // one, and concats the MP3 bytes. ElevenLabs returns same-sample-
+    // rate / same-bitrate MP3 frames per call when model+voice+output
+    // format match, so binary concat produces a valid playable file.
     const resolvedModelId = modelId && ELEVENLABS_MODELS[modelId] ? modelId : ELEVENLABS_DEFAULT_MODEL;
     const charLimit = elevenLabsLimit(resolvedModelId);
     const chars = text.length;
-    if (chars > charLimit) {
-      return sendJSON(res, 400, {
-        error: `Script is ${chars.toLocaleString()} chars but ${resolvedModelId} limit is ${charLimit.toLocaleString()}. Switch model in Settings or shorten the script.`,
-        chars,
-        charLimit,
-        modelId: resolvedModelId,
-      });
-    }
     const costUsd = +(chars / 1000 * elevenLabsRate(resolvedModelId)).toFixed(4);
     const filename = `ai-${Date.now()}.mp3`;
     const storagePath = `channels/${channelId}/projects/${projectId}/voiceover/${filename}`;
-    const file = bucket.file(storagePath);
-    const writeStream = file.createWriteStream({
-      metadata: { contentType: 'audio/mpeg' },
-      // resumable false → simple upload, fewer round-trips for files <5MB
-      resumable: false,
-    });
 
-    const ttsBody = JSON.stringify({
-      text,
-      model_id: resolvedModelId,
-      voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true },
-    });
-    const options = {
-      hostname: 'api.elevenlabs.io',
-      path: `/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
-      method: 'POST',
-      headers: {
-        'xi-api-key': elKey,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(ttsBody),
-        'Accept': 'audio/mpeg',
-      },
-    };
+    const startMs = Date.now();
+    const chunks = chunkTextForTts(text, resolvedModelId);
+    if (chunks.length === 0) {
+      return sendJSON(res, 400, { error: 'No usable text to synthesize after chunking' });
+    }
+    const chunkSizes = chunks.map((c) => c.length);
+    console.log(`[elevenlabs] ${chars} chars → ${chunks.length} chunks (sizes: ${chunkSizes.join('+')})`);
 
-    let totalBytes = 0;
-    const apiReq = https.request(options, (apiRes) => {
-      if (apiRes.statusCode !== 200) {
-        // Drain the error body for the error message — it'll be JSON.
-        let errBuf = '';
-        apiRes.on('data', (c) => { errBuf += c; });
-        apiRes.on('end', () => {
-          let parsedErr = null;
-          try { parsedErr = JSON.parse(errBuf); } catch {}
-          // Translate the most common ElevenLabs failure codes into
-          // friendlier messages so the frontend can act on them.
-          let friendly = parsedErr?.detail?.message || parsedErr?.detail?.status || errBuf.slice(0, 240);
-          if (apiRes.statusCode === 401) friendly = 'Invalid ElevenLabs API key';
-          else if (apiRes.statusCode === 402) friendly = 'ElevenLabs account out of characters / payment required';
-          else if (apiRes.statusCode === 429) friendly = 'ElevenLabs rate limit hit — wait and retry';
-          writeStream.destroy();
-          return sendJSON(res, apiRes.statusCode, { error: friendly, status: apiRes.statusCode });
-        });
-        return;
+    // Generate sequentially. ElevenLabs rate-limits parallel calls on
+    // smaller plans; sequential is reliable + the wall-clock penalty
+    // is small (each chunk ≤ ~7s typically).
+    const buffers = [];
+    try {
+      for (let i = 0; i < chunks.length; i++) {
+        const ck = chunks[i];
+        const chunkStart = Date.now();
+        const buf = await ttsOneChunkWithRetry(ck, voiceId, resolvedModelId, elKey, 2);
+        const ms = Date.now() - chunkStart;
+        console.log(`[elevenlabs] chunk ${i + 1}/${chunks.length} done — ${ck.length}ch / ${buf.length}B / ${ms}ms`);
+        buffers.push(buf);
       }
-      apiRes.on('data', (c) => { totalBytes += c.length; });
-      apiRes.pipe(writeStream);
-      writeStream.on('error', (err) => {
-        console.error('elevenlabs/tts: storage write failed:', err);
-        return sendJSON(res, 500, { error: 'Storage upload failed: ' + err.message });
+    } catch (e) {
+      console.error('[elevenlabs] chunk generation failed:', e.message);
+      const status = e.status || 500;
+      return sendJSON(res, status, {
+        error: e.message,
+        status,
+        partialChunks: buffers.length,
+        totalChunks: chunks.length,
       });
-      writeStream.on('finish', async () => {
-        try {
-          // Make the file public so Lambda + the browser can read
-          // it without a token. Same convention the existing pipeline
-          // uses for footage + thumbnails.
-          await file.makePublic();
-          const publicUrl = `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
-          // Record cost + write a row to the per-channel history
-          // subcollection so the Settings widget can aggregate spend.
-          await db.collection('channels').doc(channelId).collection('voiceoverCostHistory').add({
-            generatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            projectId,
-            voiceId,
-            chars,
-            costUsd,
-            sizeBytes: totalBytes,
-            modelId: resolvedModelId,
-          });
-          console.log(`[elevenlabs] generated ${chars}ch / ${totalBytes}B → ${storagePath} ($${costUsd.toFixed(4)})`);
-          return sendJSON(res, 200, {
-            ok: true,
-            url: publicUrl,
-            name: filename,
-            sizeBytes: totalBytes,
-            chars,
-            costUsd,
-            voiceId,
-            modelId: resolvedModelId,
-          });
-        } catch (e) {
-          console.error('elevenlabs/tts: post-upload error:', e);
-          return sendJSON(res, 500, { error: e.message });
-        }
+    }
+
+    // Concat. MP3 frames are self-contained and ElevenLabs returns
+    // clean frame boundaries (no ID3 mid-stream) for the same model+
+    // voice+output_format, so binary concat produces a valid file.
+    const finalBuffer = Buffer.concat(buffers);
+    const totalBytes = finalBuffer.length;
+
+    try {
+      const file = bucket.file(storagePath);
+      await file.save(finalBuffer, {
+        metadata: { contentType: 'audio/mpeg' },
+        resumable: false,
       });
-    });
-    apiReq.on('error', (err) => {
-      writeStream.destroy();
-      console.error('elevenlabs/tts: api request failed:', err);
-      return sendJSON(res, 500, { error: 'Network error: ' + err.message });
-    });
-    apiReq.write(ttsBody);
-    apiReq.end();
-    return;
+      await file.makePublic();
+      const publicUrl = `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
+      const generationTimeMs = Date.now() - startMs;
+      await db.collection('channels').doc(channelId).collection('voiceoverCostHistory').add({
+        generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        projectId,
+        voiceId,
+        chars,
+        costUsd,
+        sizeBytes: totalBytes,
+        modelId: resolvedModelId,
+        chunkCount: chunks.length,
+        generationTimeMs,
+      });
+      console.log(`[elevenlabs] uploaded ${storagePath}: ${chunks.length} chunks / ${chars}ch / ${totalBytes}B / $${costUsd.toFixed(4)} / ${generationTimeMs}ms`);
+      return sendJSON(res, 200, {
+        ok: true,
+        url: publicUrl,
+        name: filename,
+        sizeBytes: totalBytes,
+        chars,
+        costUsd,
+        voiceId,
+        modelId: resolvedModelId,
+        chunkCount: chunks.length,
+        chunkSizes,
+        generationTimeMs,
+      });
+    } catch (e) {
+      console.error('elevenlabs/tts: storage upload failed:', e);
+      return sendJSON(res, 500, { error: 'Storage upload failed: ' + e.message });
+    }
   }
 
   // ── Pikzels endpoint ────────────────────────────────────────
