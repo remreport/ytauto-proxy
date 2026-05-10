@@ -2,6 +2,11 @@
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const path = require('path');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const os = require('os');
+const { spawn } = require('child_process');
 const { google } = require('googleapis');
 const admin = require('firebase-admin');
 
@@ -188,6 +193,104 @@ function spokenWordsAt(transcript, tSec) {
   const window = (transcript || []).filter(seg => seg.end >= tSec - 1 && seg.start <= tSec + 3);
   return window.map(s => s.text).join(' ').replace(/\s+/g, ' ').trim().slice(0, 240);
 }
+
+// Resolve the path to the yt-dlp binary. On Render this lives next
+// to server.js (downloaded by buildCommand in render.yaml). Local
+// dev: try YT_DLP_PATH env var, then PATH lookup. Returns null if
+// no binary found — forensic endpoint then degrades gracefully and
+// reports captionsAvailable=false instead of crashing.
+function resolveYtDlpPath() {
+  if (process.env.YT_DLP_PATH && fs.existsSync(process.env.YT_DLP_PATH)) {
+    return process.env.YT_DLP_PATH;
+  }
+  const local = path.resolve(__dirname, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+  if (fs.existsSync(local)) return local;
+  // PATH fallback (dev): on Linux/macOS `yt-dlp` is enough; on Windows
+  // it'd need .exe — child_process.spawn with shell:true would resolve
+  // either, but we prefer explicit paths so production behavior is
+  // predictable. Returning null here triggers a clear server error.
+  return null;
+}
+
+// Fetch caption track for a YouTube video via yt-dlp (works without
+// Content-ID verification — the YouTube Data API's captions.list
+// silently returns empty for non-verified apps even on the user's
+// own videos, hence the workaround). Returns parsed transcript
+// [{start, end, text}]. Empty array if no captions exist OR if
+// yt-dlp fails — caller should treat empty as "no captions".
+//
+// Strategy: --skip-download with --write-sub + --write-auto-sub so
+// we get manual captions if present, auto-generated otherwise. We
+// constrain --sub-lang to en/en-* and --sub-format to vtt because
+// the parseSRT helper handles VTT cleanly. Output goes to a temp
+// file we clean up after parsing. yt-dlp writes the actual file
+// path to stdout (json line via --print after_move:filepath); we
+// avoid that complexity and instead read every .vtt file in our
+// per-call temp dir.
+function fetchCaptionsViaYtdlp(videoId, ytDlpPath, timeoutMs = 30000) {
+  return new Promise(async (resolve) => {
+    if (!ytDlpPath) return resolve({ transcript: [], source: null, error: 'yt-dlp binary not found on host' });
+    let workDir = null;
+    let timer = null;
+    let proc = null;
+    try {
+      workDir = await fsp.mkdtemp(path.join(os.tmpdir(), `ytforensic-${videoId}-`));
+      const url = `https://www.youtube.com/watch?v=${videoId}`;
+      const args = [
+        '--skip-download',
+        '--write-sub',
+        '--write-auto-sub',
+        '--sub-lang', 'en.*,en',
+        '--sub-format', 'vtt',
+        '--no-warnings',
+        '--no-playlist',
+        '--no-progress',
+        '--socket-timeout', '15',
+        '--retries', '2',
+        '-o', path.join(workDir, '%(id)s.%(ext)s'),
+        url,
+      ];
+      proc = spawn(ytDlpPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stderr = '';
+      proc.stderr.on('data', (c) => { stderr += c.toString(); });
+      const finished = new Promise((r) => proc.on('close', r));
+      timer = setTimeout(() => {
+        try { proc.kill('SIGKILL'); } catch {}
+      }, timeoutMs);
+      const code = await finished;
+      clearTimeout(timer);
+      if (code !== 0) {
+        // Non-zero often just means "no subs available" — yt-dlp
+        // doesn't always exit 0 in that case. Fall through and
+        // check the temp dir; empty result is the fallback.
+        if (stderr) console.warn(`[yt-dlp] ${videoId} exit=${code}: ${stderr.split('\n')[0].slice(0, 160)}`);
+      }
+      const files = await fsp.readdir(workDir);
+      const vtt = files.find(f => f.endsWith('.vtt'));
+      if (!vtt) {
+        return resolve({ transcript: [], source: null, error: code !== 0 ? 'yt-dlp failed and no subs file produced' : 'no captions available' });
+      }
+      const raw = await fsp.readFile(path.join(workDir, vtt), 'utf-8');
+      const transcript = parseSRT(raw);
+      // Detect manual vs auto from the filename suffix yt-dlp writes:
+      // user-uploaded:    {id}.en.vtt  /  {id}.en-US.vtt
+      // auto-generated:   {id}.en.vtt  too — but yt-dlp tags it via
+      // language code list. We can't easily tell from filename alone.
+      // Just record "yt-dlp" as source for now.
+      return resolve({ transcript, source: 'yt-dlp', error: null });
+    } catch (e) {
+      if (timer) clearTimeout(timer);
+      return resolve({ transcript: [], source: null, error: e.message });
+    } finally {
+      if (workDir) {
+        fsp.rm(workDir, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  });
+}
+
+const YT_DLP_PATH = resolveYtDlpPath();
+console.log(YT_DLP_PATH ? `✓ yt-dlp binary at ${YT_DLP_PATH}` : '⚠ yt-dlp binary not found — forensic captions will be unavailable');
 
 // Phase C — Claude pattern pass over forensic data. Uses the user's
 // own Anthropic key (passed in the request body as _apiKey) so we
@@ -695,9 +798,10 @@ const server = http.createServer(async (req, res) => {
       if (data.youtubeAnalyticsConnected === false) {
         return sendJSON(res, 403, { error: 'Analytics scope not granted — re-connect this channel' });
       }
-      if (data.youtubeCaptionsConnected === false) {
-        return sendJSON(res, 403, { error: 'Captions scope not granted — re-connect this channel and approve all scopes' });
-      }
+      // NOTE: captions scope is no longer required. We previously used
+      // youtube.force-ssl + yt.captions.list/download but YouTube
+      // silently returns 0 results from that path for apps without
+      // Content-ID verification. yt-dlp bypasses the restriction.
 
       // Need /analytics/refresh to have run first so we already have
       // top-videos + cached retention curves. Cheaper than re-querying.
@@ -759,26 +863,21 @@ const server = http.createServer(async (req, res) => {
             continue;
           }
 
-          // Caption track lookup — prefer English, fall back to first track.
-          let captionTrack = null;
-          try {
-            const cl = await yt.captions.list({ part: ['snippet'], videoId: vid });
-            const tracks = cl.data.items || [];
-            captionTrack = tracks.find(t => (t.snippet?.language || '').toLowerCase().startsWith('en'))
-                        || tracks[0]
-                        || null;
-          } catch (e) {
-            console.warn(`forensic: captions.list failed for ${vid}:`, e.message);
-          }
+          // Caption fetch via yt-dlp. The YouTube Data API's
+          // captions.list/download silently returns 0 results for
+          // apps without YouTube Content-ID verification — even on
+          // the user's own videos. yt-dlp bypasses that restriction
+          // by parsing the public watch page (legitimate use; same
+          // mechanism every YouTube downloader uses). 1-3s/video.
           let transcript = [];
-          if (captionTrack) {
-            try {
-              const dl = await yt.captions.download({ id: captionTrack.id, tfmt: 'srt' });
-              const raw = typeof dl.data === 'string' ? dl.data : Buffer.from(dl.data || '').toString('utf-8');
-              transcript = parseSRT(raw);
-            } catch (e) {
-              console.warn(`forensic: captions.download failed for ${vid}:`, e.message);
-            }
+          let captionSource = null;
+          let captionError = null;
+          const ytdlpResult = await fetchCaptionsViaYtdlp(vid, YT_DLP_PATH);
+          transcript = ytdlpResult.transcript;
+          captionSource = ytdlpResult.source;
+          captionError = ytdlpResult.error;
+          if (captionError) {
+            console.warn(`forensic: yt-dlp captions failed for ${vid}: ${captionError}`);
           }
 
           // Duration fallback chain: API → last caption end → 600s.
@@ -839,8 +938,9 @@ const server = http.createServer(async (req, res) => {
             durationSec,
             avgRetention: v.avgViewPercentage || 0,
             avgViewPercentage: v.avgViewPercentage || 0,
-            captionsAvailable: !!captionTrack && transcript.length > 0,
-            captionTrackLanguage: captionTrack?.snippet?.language || null,
+            captionsAvailable: transcript.length > 0,
+            captionsSource: captionSource,
+            captionsError: captionError,
             transcript: transcript.slice(0, 200), // doc-size cap
             retentionMappedToTranscript,
             spikeMoments,

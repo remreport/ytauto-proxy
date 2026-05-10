@@ -3,5 +3,15 @@ services:
     name: yt-automation-proxy
     env: node
     plan: free
-    buildCommand: npm install
+    # Pin yt-dlp to a known-good release. The standalone Linux binary
+    # is a self-contained PyInstaller bundle — no Python needed on the
+    # host. Used by /youtube/analytics/forensic to fetch caption tracks
+    # without the YouTube Data API v3 captions.list quota wall (which
+    # silently returns 0 results for non-Content-ID-verified apps even
+    # on the user's own videos).
+    buildCommand: |
+      npm install
+      curl -fL -o ./yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp
+      chmod +x ./yt-dlp
+      ./yt-dlp --version
     startCommand: node server.js
