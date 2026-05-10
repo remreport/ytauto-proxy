@@ -18,7 +18,12 @@ try {
   const svcRaw = process.env.FIREBASE_SERVICE_ACCOUNT;
   if (svcRaw) {
     const svc = JSON.parse(svcRaw);
-    admin.initializeApp({ credential: admin.credential.cert(svc) });
+    admin.initializeApp({
+      credential: admin.credential.cert(svc),
+      // Storage bucket needed by /elevenlabs/tts so it can write the
+      // generated MP3 directly with admin privileges (bypassing rules).
+      storageBucket: 'ytauto-95f91.firebasestorage.app',
+    });
     firebaseReady = true;
     console.log('✓ Firebase Admin initialised');
   } else {
@@ -28,6 +33,12 @@ try {
   console.error('⚠ Firebase Admin init failed:', e.message);
 }
 const db = firebaseReady ? admin.firestore() : null;
+const bucket = firebaseReady ? admin.storage().bucket() : null;
+
+// Cost rate per 1k chars on ElevenLabs Creator+ ($99/mo, 500k chars).
+// 99/500 = $0.198 per 1k chars. Shown to the user pre-generation as
+// an estimate, recorded after the actual char count is known.
+const ELEVENLABS_COST_PER_1K_CHARS_USD = 0.198;
 
 // ── Google OAuth client factory ─────────────────────────────────
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
@@ -1218,6 +1229,184 @@ const server = http.createServer(async (req, res) => {
 
   const apiKey = parsed._apiKey || '';
   delete parsed._apiKey;
+
+  // ── ElevenLabs: list voices ─────────────────────────────────
+  // POST /elevenlabs/voices  body: { _apiKey }
+  // Pass-through to GET https://api.elevenlabs.io/v1/voices.
+  // Returns the user's voice library (cloned + premade) so the
+  // Settings UI can render a dropdown.
+  if (pathname === '/elevenlabs/voices') {
+    const elKey = apiKey;
+    if (!elKey) return sendJSON(res, 400, { error: 'ElevenLabs _apiKey required' });
+    https.get({
+      hostname: 'api.elevenlabs.io',
+      path: '/v1/voices',
+      headers: { 'xi-api-key': elKey, 'Accept': 'application/json' },
+    }, (apiRes) => {
+      let buf = '';
+      apiRes.on('data', (c) => { buf += c; });
+      apiRes.on('end', () => {
+        res.writeHead(apiRes.statusCode, { 'Content-Type': 'application/json' });
+        res.end(buf);
+      });
+    }).on('error', (err) => sendJSON(res, 500, { error: err.message }));
+    return;
+  }
+
+  // ── ElevenLabs: auth check ──────────────────────────────────
+  // POST /elevenlabs/test  body: { _apiKey }
+  // Hits /v1/user — fast, cheap, returns 401 for bad keys. Used by
+  // the "Test connection" button in Settings to confirm the key is
+  // valid before the user wastes characters on a real generation.
+  if (pathname === '/elevenlabs/test') {
+    const elKey = apiKey;
+    if (!elKey) return sendJSON(res, 400, { error: 'ElevenLabs _apiKey required' });
+    https.get({
+      hostname: 'api.elevenlabs.io',
+      path: '/v1/user',
+      headers: { 'xi-api-key': elKey, 'Accept': 'application/json' },
+    }, (apiRes) => {
+      let buf = '';
+      apiRes.on('data', (c) => { buf += c; });
+      apiRes.on('end', () => {
+        if (apiRes.statusCode === 200) {
+          try {
+            const j = JSON.parse(buf);
+            return sendJSON(res, 200, {
+              ok: true,
+              email: j.email || null,
+              tier: j.subscription?.tier || null,
+              characterCount: j.subscription?.character_count || 0,
+              characterLimit: j.subscription?.character_limit || 0,
+            });
+          } catch (e) {
+            return sendJSON(res, 500, { ok: false, error: 'Failed to parse user response' });
+          }
+        }
+        return sendJSON(res, apiRes.statusCode, { ok: false, error: `ElevenLabs returned ${apiRes.statusCode}` });
+      });
+    }).on('error', (err) => sendJSON(res, 500, { ok: false, error: err.message }));
+    return;
+  }
+
+  // ── ElevenLabs: text-to-speech generation ──────────────────
+  // POST /elevenlabs/tts
+  // body: { channelId, projectId, text, voiceId, modelId?, _apiKey }
+  //
+  // Calls ElevenLabs /v1/text-to-speech/{voiceId}, streams the MP3
+  // response directly into Firebase Storage at
+  //   channels/{cid}/projects/{pid}/voiceover/ai-{ts}.mp3
+  // (no buffering on the proxy — the same OOM fix as /youtube/upload).
+  // After upload, makes the file public, records the cost, and
+  // returns { ok, url, sizeBytes, chars, costUsd, voiceId }.
+  if (pathname === '/elevenlabs/tts') {
+    if (!db || !bucket) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    const elKey = apiKey;
+    const { channelId, projectId, text, voiceId, modelId } = parsed;
+    if (!elKey) return sendJSON(res, 400, { error: 'ElevenLabs _apiKey required' });
+    if (!channelId || !projectId) return sendJSON(res, 400, { error: 'channelId and projectId required' });
+    if (!text || typeof text !== 'string') return sendJSON(res, 400, { error: 'text is required' });
+    if (!voiceId) return sendJSON(res, 400, { error: 'voiceId is required' });
+
+    const chars = text.length;
+    const costUsd = +(chars / 1000 * ELEVENLABS_COST_PER_1K_CHARS_USD).toFixed(4);
+    const filename = `ai-${Date.now()}.mp3`;
+    const storagePath = `channels/${channelId}/projects/${projectId}/voiceover/${filename}`;
+    const file = bucket.file(storagePath);
+    const writeStream = file.createWriteStream({
+      metadata: { contentType: 'audio/mpeg' },
+      // resumable false → simple upload, fewer round-trips for files <5MB
+      resumable: false,
+    });
+
+    const ttsBody = JSON.stringify({
+      text,
+      // model_id: eleven_multilingual_v2 = good general-purpose, ~$0.30/1k
+      // turbo_v2_5 is cheaper but lower quality. User can override.
+      model_id: modelId || 'eleven_multilingual_v2',
+      voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true },
+    });
+    const options = {
+      hostname: 'api.elevenlabs.io',
+      path: `/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
+      method: 'POST',
+      headers: {
+        'xi-api-key': elKey,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(ttsBody),
+        'Accept': 'audio/mpeg',
+      },
+    };
+
+    let totalBytes = 0;
+    const apiReq = https.request(options, (apiRes) => {
+      if (apiRes.statusCode !== 200) {
+        // Drain the error body for the error message — it'll be JSON.
+        let errBuf = '';
+        apiRes.on('data', (c) => { errBuf += c; });
+        apiRes.on('end', () => {
+          let parsedErr = null;
+          try { parsedErr = JSON.parse(errBuf); } catch {}
+          // Translate the most common ElevenLabs failure codes into
+          // friendlier messages so the frontend can act on them.
+          let friendly = parsedErr?.detail?.message || parsedErr?.detail?.status || errBuf.slice(0, 240);
+          if (apiRes.statusCode === 401) friendly = 'Invalid ElevenLabs API key';
+          else if (apiRes.statusCode === 402) friendly = 'ElevenLabs account out of characters / payment required';
+          else if (apiRes.statusCode === 429) friendly = 'ElevenLabs rate limit hit — wait and retry';
+          writeStream.destroy();
+          return sendJSON(res, apiRes.statusCode, { error: friendly, status: apiRes.statusCode });
+        });
+        return;
+      }
+      apiRes.on('data', (c) => { totalBytes += c.length; });
+      apiRes.pipe(writeStream);
+      writeStream.on('error', (err) => {
+        console.error('elevenlabs/tts: storage write failed:', err);
+        return sendJSON(res, 500, { error: 'Storage upload failed: ' + err.message });
+      });
+      writeStream.on('finish', async () => {
+        try {
+          // Make the file public so Lambda + the browser can read
+          // it without a token. Same convention the existing pipeline
+          // uses for footage + thumbnails.
+          await file.makePublic();
+          const publicUrl = `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
+          // Record cost + write a row to the per-channel history
+          // subcollection so the Settings widget can aggregate spend.
+          await db.collection('channels').doc(channelId).collection('voiceoverCostHistory').add({
+            generatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            projectId,
+            voiceId,
+            chars,
+            costUsd,
+            sizeBytes: totalBytes,
+            modelId: modelId || 'eleven_multilingual_v2',
+          });
+          console.log(`[elevenlabs] generated ${chars}ch / ${totalBytes}B → ${storagePath} ($${costUsd.toFixed(4)})`);
+          return sendJSON(res, 200, {
+            ok: true,
+            url: publicUrl,
+            name: filename,
+            sizeBytes: totalBytes,
+            chars,
+            costUsd,
+            voiceId,
+          });
+        } catch (e) {
+          console.error('elevenlabs/tts: post-upload error:', e);
+          return sendJSON(res, 500, { error: e.message });
+        }
+      });
+    });
+    apiReq.on('error', (err) => {
+      writeStream.destroy();
+      console.error('elevenlabs/tts: api request failed:', err);
+      return sendJSON(res, 500, { error: 'Network error: ' + err.message });
+    });
+    apiReq.write(ttsBody);
+    apiReq.end();
+    return;
+  }
 
   // ── Pikzels endpoint ────────────────────────────────────────
   if (pathname === '/pikzels') {
