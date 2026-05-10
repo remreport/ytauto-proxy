@@ -1012,6 +1012,72 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ── YouTube: forensic patterns-only re-run ───────────────────
+  // POST /youtube/analytics/forensic/patterns  body: { channelId, _apiKey }
+  //
+  // Runs ONLY the Claude pattern pass over already-saved forensic
+  // data — no yt-dlp, no Decodo bandwidth, no captions re-fetch.
+  // Cost is just the Anthropic call (~$0.05 in tokens, ~10s).
+  // Returns the extracted patterns + per-video caption status so
+  // the caller can immediately surface which videos had errors.
+  if (req.method === 'POST' && pathname === '/youtube/analytics/forensic/patterns') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const parsed = JSON.parse(body);
+      const { channelId } = parsed;
+      const userApiKey = parsed._apiKey || '';
+      if (!channelId) return sendJSON(res, 400, { error: 'channelId required' });
+      if (!userApiKey) return sendJSON(res, 400, { error: 'Anthropic _apiKey required for the pattern pass' });
+
+      const forensicSnap = await db.collection('channels').doc(channelId)
+        .collection('analytics').doc('forensic').get();
+      if (!forensicSnap.exists) {
+        return sendJSON(res, 400, { error: 'No forensic data yet — run /youtube/analytics/forensic first to capture per-video transcripts + retention events' });
+      }
+      const forensicData = forensicSnap.data();
+      const perVideo = forensicData.perVideo || {};
+      if (Object.keys(perVideo).length === 0) {
+        return sendJSON(res, 400, { error: 'forensic.perVideo is empty' });
+      }
+
+      // Per-video caption status — caller can show "which video failed"
+      // in the dashboard / CLI without re-reading Firestore.
+      const captionsStatus = Object.entries(perVideo).map(([vid, v]) => ({
+        videoId: vid,
+        title: v.title || '',
+        captionsAvailable: !!v.captionsAvailable,
+        captionsError: v.captionsError || null,
+      }));
+
+      let patterns = null;
+      let patternsError = null;
+      try {
+        patterns = await claudePatternPass(perVideo, userApiKey);
+        await db.collection('channels').doc(channelId).collection('analytics').doc('forensic').update({
+          patterns,
+          patternsGeneratedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (e) {
+        patternsError = e.message;
+        console.warn('forensic/patterns: claude pass failed:', e.message);
+      }
+
+      return sendJSON(res, patterns ? 200 : 500, {
+        ok: !!patterns,
+        patternsExtracted: !!patterns,
+        patterns: patterns || null,
+        patternsError,
+        captionsStatus,
+        totalVideos: Object.keys(perVideo).length,
+        videosWithCaptions: captionsStatus.filter(c => c.captionsAvailable).length,
+      });
+    } catch (e) {
+      console.error('forensic/patterns error:', e);
+      return sendJSON(res, 500, { error: e.message });
+    }
+  }
+
   // ── YouTube: upload video ─────────────────────────────────────
   // POST /youtube/upload
   // body: { channelId, title, description, videoUrl, thumbnailUrl, tags, privacyStatus }
