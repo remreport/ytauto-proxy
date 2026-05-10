@@ -41,9 +41,12 @@ const bucket = firebaseReady ? admin.storage().bucket() : null;
 // 6× cheaper than multilingual_v2 — matters because typical 11-12k
 // finance scripts blow past v2's 10k cap.
 const ELEVENLABS_MODELS = {
-  'eleven_turbo_v2_5':     { label: 'Turbo v2.5 (fast + cheap, 40k limit)', charLimit: 40000, costPer1kUsd: 0.05 },
-  'eleven_multilingual_v2':{ label: 'Multilingual v2 (highest quality, 10k limit)', charLimit: 10000, costPer1kUsd: 0.30 },
-  'eleven_v3':             { label: 'Eleven v3 (newest, 10k limit)', charLimit: 10000, costPer1kUsd: 0.30 },
+  'eleven_turbo_v2_5':     { label: 'Turbo v2.5 (fast + cheap)',          charLimit: 40000, costPer1kUsd: 0.05 },
+  'eleven_multilingual_v2':{ label: 'Multilingual v2 (highest quality)', charLimit: 10000, costPer1kUsd: 0.30 },
+  // v3's actual TTS endpoint limit is 5000 chars/request, not 10000
+  // (verified by Rem hitting a server-side reject at 5001+). Chunker
+  // will split typical 11k scripts into ~3 parts.
+  'eleven_v3':             { label: 'Eleven v3 (newest, multilingual)',  charLimit: 5000,  costPer1kUsd: 0.30 },
 };
 const ELEVENLABS_DEFAULT_MODEL = 'eleven_turbo_v2_5';
 function elevenLabsRate(modelId) {
