@@ -227,7 +227,7 @@ function resolveYtDlpPath() {
 // path to stdout (json line via --print after_move:filepath); we
 // avoid that complexity and instead read every .vtt file in our
 // per-call temp dir.
-function fetchCaptionsViaYtdlp(videoId, ytDlpPath, timeoutMs = 30000) {
+function fetchCaptionsViaYtdlp(videoId, ytDlpPath, timeoutMs = 60000) {
   return new Promise(async (resolve) => {
     if (!ytDlpPath) return resolve({ transcript: [], source: null, error: 'yt-dlp binary not found on host' });
     let workDir = null;
@@ -245,11 +245,22 @@ function fetchCaptionsViaYtdlp(videoId, ytDlpPath, timeoutMs = 30000) {
         '--no-warnings',
         '--no-playlist',
         '--no-progress',
-        '--socket-timeout', '15',
+        '--socket-timeout', '20',
         '--retries', '2',
         '-o', path.join(workDir, '%(id)s.%(ext)s'),
-        url,
       ];
+      // Residential proxy — required to bypass YouTube's bot detection
+      // on cloud-provider IP ranges. Without this, every yt-dlp call
+      // from Render/AWS/GCP IPs gets a "Sign in to confirm you're not a
+      // bot" error. Decodo's gate.decodo.com endpoint rotates real
+      // residential IPs per request. Cost: ~$0.20-0.40 per forensic
+      // run (10 videos, ~50-100MB total).
+      if (process.env.DECODO_USER && process.env.DECODO_PASS && process.env.DECODO_ENDPOINT) {
+        const u = encodeURIComponent(process.env.DECODO_USER);
+        const p = encodeURIComponent(process.env.DECODO_PASS);
+        args.push('--proxy', `http://${u}:${p}@${process.env.DECODO_ENDPOINT}`);
+      }
+      args.push(url);
       proc = spawn(ytDlpPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
       let stderr = '';
       proc.stderr.on('data', (c) => { stderr += c.toString(); });
@@ -291,6 +302,11 @@ function fetchCaptionsViaYtdlp(videoId, ytDlpPath, timeoutMs = 30000) {
 
 const YT_DLP_PATH = resolveYtDlpPath();
 console.log(YT_DLP_PATH ? `✓ yt-dlp binary at ${YT_DLP_PATH}` : '⚠ yt-dlp binary not found — forensic captions will be unavailable');
+if (process.env.DECODO_USER && process.env.DECODO_PASS && process.env.DECODO_ENDPOINT) {
+  console.log(`[yt-dlp] Using proxy: ${process.env.DECODO_ENDPOINT} (user: ${process.env.DECODO_USER.slice(0, 4)}****)`);
+} else {
+  console.log('[yt-dlp] No proxy configured (DECODO_* env vars not set) — direct connection, may be bot-blocked on cloud IPs');
+}
 
 // Phase C — Claude pattern pass over forensic data. Uses the user's
 // own Anthropic key (passed in the request body as _apiKey) so we
