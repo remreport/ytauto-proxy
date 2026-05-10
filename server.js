@@ -94,6 +94,31 @@ function downloadToBuffer(url) {
   });
 }
 
+// Stream a remote URL directly without buffering. Returns the
+// IncomingMessage so the caller can pipe it straight into another
+// upload (e.g. YouTube). Critical for /youtube/upload — Render free
+// tier has 512MB RAM and a several-hundred-MB MP4 OOM-killed the
+// container when downloadToBuffer() was used. The browser then saw
+// "Failed to fetch" because the connection was severed mid-upload.
+function streamFromUrl(url, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, response => {
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        // Drain the redirect body so the socket can be reused.
+        response.resume();
+        if (redirectsLeft <= 0) return reject(new Error('Too many redirects'));
+        return streamFromUrl(response.headers.location, redirectsLeft - 1).then(resolve).catch(reject);
+      }
+      if (response.statusCode !== 200) {
+        response.resume();
+        return reject(new Error('Stream open failed with status ' + response.statusCode));
+      }
+      resolve(response);
+    });
+    req.on('error', reject);
+  });
+}
+
 // ── Forensic helpers (used by /youtube/analytics/forensic) ──────
 // Convert YouTube ISO 8601 duration ("PT1H23M45S") to seconds.
 function parseISO8601Duration(s) {
@@ -402,6 +427,14 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
+
+  // Lightweight wake-up probe. Frontend pings this before /youtube/upload
+  // so the user gets a "Connecting…" toast during the 30-60s Render free
+  // tier cold start instead of a stalled fetch that ends in
+  // "Failed to fetch". Returns immediately when the container is warm.
+  if (req.method === 'GET' && (parsedUrl.pathname === '/health' || parsedUrl.pathname === '/')) {
+    return sendJSON(res, 200, { ok: true, ts: Date.now() });
+  }
   const pathname = parsedUrl.pathname;
 
   // Health check
@@ -1106,14 +1139,16 @@ const server = http.createServer(async (req, res) => {
 
       const yt = google.youtube({ version: 'v3', auth: oauth });
 
-      // 3) Download the video from Firebase Storage into memory
-      console.log('Downloading video from storage:', videoUrl);
-      const videoBuffer = await downloadToBuffer(videoUrl);
-      console.log('Video downloaded:', videoBuffer.length, 'bytes');
-
-      // 4) Upload to YouTube as a draft (private by default)
-      const { Readable } = require('stream');
-      const videoStream = Readable.from(videoBuffer);
+      // 3) Open a streaming download from Firebase Storage. We pipe the
+      //    response straight into yt.videos.insert below — the bytes
+      //    never sit in a Buffer, which keeps Render free's 512MB RAM
+      //    ceiling intact on multi-hundred-MB MP4s. Previous version
+      //    used downloadToBuffer() which OOM-killed the container at
+      //    ~300MB and produced "Failed to fetch" in the browser.
+      console.log('Streaming video from storage:', videoUrl);
+      const videoStream = await streamFromUrl(videoUrl);
+      const reportedSize = parseInt(videoStream.headers?.['content-length'] || '0', 10);
+      if (reportedSize) console.log('Video size:', reportedSize, 'bytes — streaming directly to YouTube');
 
       const uploadResp = await yt.videos.insert({
         part: ['snippet', 'status'],
