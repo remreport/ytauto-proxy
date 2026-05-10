@@ -7,6 +7,7 @@ const fs = require('fs');
 const fsp = require('fs/promises');
 const os = require('os');
 const { spawn } = require('child_process');
+const { Readable } = require('stream');
 const { google } = require('googleapis');
 const admin = require('firebase-admin');
 
@@ -1251,13 +1252,19 @@ const server = http.createServer(async (req, res) => {
 
   // ── YouTube: upload video ─────────────────────────────────────
   // POST /youtube/upload
-  // body: { channelId, title, description, videoUrl, thumbnailUrl, tags, privacyStatus }
+  // body: { channelId, title, description, videoUrl, thumbnailUrl,
+  //         tags, privacyStatus, publishAt? }
+  //
+  // publishAt is an optional ISO 8601 string. When set, YouTube
+  // schedules the video to go public at that time and treats the
+  // immediate state as 'private'. Auto-schedule path uses this so
+  // no follow-up update call is needed for the common case.
   if (req.method === 'POST' && pathname === '/youtube/upload') {
     if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
     try {
       const body = await readBody(req);
       const p = JSON.parse(body);
-      const { channelId, title, description, videoUrl, thumbnailUrl, tags, privacyStatus } = p;
+      const { channelId, title, description, videoUrl, thumbnailUrl, tags, privacyStatus, publishAt } = p;
       if (!channelId || !videoUrl) return sendJSON(res, 400, { error: 'channelId and videoUrl required' });
 
       // 1) Load tokens from Firestore
@@ -1288,6 +1295,14 @@ const server = http.createServer(async (req, res) => {
       const reportedSize = parseInt(videoStream.headers?.['content-length'] || '0', 10);
       if (reportedSize) console.log('Video size:', reportedSize, 'bytes — streaming directly to YouTube');
 
+      // YouTube requires privacyStatus='private' when publishAt is
+      // set — it'll error out if you try to schedule a public video.
+      const status = {
+        privacyStatus: publishAt ? 'private' : (privacyStatus || 'private'),
+        selfDeclaredMadeForKids: false,
+      };
+      if (publishAt) status.publishAt = publishAt;
+
       const uploadResp = await yt.videos.insert({
         part: ['snippet', 'status'],
         requestBody: {
@@ -1297,18 +1312,20 @@ const server = http.createServer(async (req, res) => {
             tags: Array.isArray(tags) ? tags.slice(0, 15) : [],
             categoryId: '22', // "People & Blogs" — safe default
           },
-          status: {
-            privacyStatus: privacyStatus || 'private', // private = draft; can also be 'unlisted' or 'public'
-            selfDeclaredMadeForKids: false,
-          },
+          status,
         },
         media: { body: videoStream },
       });
 
       const videoId = uploadResp.data.id;
-      console.log('YouTube upload complete. videoId:', videoId);
+      console.log(`YouTube upload complete. videoId: ${videoId}${publishAt ? ` · scheduled for ${publishAt}` : ''}`);
 
-      // 5) Upload thumbnail if provided
+      // 5) Upload thumbnail if provided. Failure is non-fatal — the
+      // video is already on YouTube; user can still set the thumbnail
+      // manually in Studio. We surface thumbnailError in the response
+      // so the frontend can show a yellow warning toast.
+      let thumbnailError = null;
+      let thumbnailUploaded = false;
       if (thumbnailUrl) {
         try {
           const thumbBuffer = await downloadToBuffer(thumbnailUrl);
@@ -1317,9 +1334,11 @@ const server = http.createServer(async (req, res) => {
             videoId,
             media: { body: thumbStream, mimeType: 'image/jpeg' },
           });
+          thumbnailUploaded = true;
           console.log('Thumbnail uploaded');
         } catch (thumbErr) {
-          console.error('Thumbnail upload failed (non-fatal):', thumbErr.message);
+          thumbnailError = thumbErr.message || 'thumbnail upload failed';
+          console.error('Thumbnail upload failed (non-fatal):', thumbnailError);
         }
       }
 
@@ -1337,10 +1356,106 @@ const server = http.createServer(async (req, res) => {
         videoId,
         watchUrl: `https://youtube.com/watch?v=${videoId}`,
         studioUrl: `https://studio.youtube.com/video/${videoId}/edit`,
+        scheduledPublishAt: publishAt || null,
+        thumbnailUploaded,
+        thumbnailError,
       });
     } catch (e) {
       console.error('YouTube upload error:', e);
       return sendJSON(res, 500, { error: e.message || 'Upload failed' });
+    }
+  }
+
+  // ── YouTube: schedule (set publishAt on already-uploaded video) ──
+  // POST /youtube/schedule  body: { channelId, videoId, publishAt }
+  //
+  // For videos uploaded as drafts that the user (or auto-scheduler)
+  // wants to schedule after the fact. Sets privacyStatus='private'
+  // + publishAt; YouTube flips it to 'public' at that time on its own.
+  if (req.method === 'POST' && pathname === '/youtube/schedule') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const { channelId, videoId, publishAt } = JSON.parse(body);
+      if (!channelId || !videoId || !publishAt) return sendJSON(res, 400, { error: 'channelId, videoId and publishAt required' });
+      const snap = await db.collection('channels').doc(channelId).get();
+      if (!snap.exists) return sendJSON(res, 404, { error: 'Channel not found' });
+      const data = snap.data();
+      if (!data.youtubeRefreshToken) return sendJSON(res, 400, { error: 'YouTube not connected for this channel' });
+      const oauth = makeOAuthClient();
+      oauth.setCredentials({
+        refresh_token: data.youtubeRefreshToken,
+        access_token: data.youtubeAccessToken || undefined,
+        expiry_date: data.youtubeTokenExpiry || undefined,
+      });
+      const yt = google.youtube({ version: 'v3', auth: oauth });
+      // Need to read snippet+status first because videos.update
+      // requires a complete snippet (otherwise YouTube clears fields).
+      const cur = await yt.videos.list({ part: ['snippet', 'status'], id: [videoId] });
+      const item = cur.data.items?.[0];
+      if (!item) return sendJSON(res, 404, { error: 'Video not found on this YouTube channel' });
+      await yt.videos.update({
+        part: ['status'],
+        requestBody: {
+          id: videoId,
+          status: {
+            privacyStatus: 'private',
+            publishAt,
+            selfDeclaredMadeForKids: item.status?.selfDeclaredMadeForKids || false,
+          },
+        },
+      });
+      console.log(`[schedule] ${videoId} → ${publishAt}`);
+      return sendJSON(res, 200, { ok: true, videoId, publishAt });
+    } catch (e) {
+      console.error('YouTube schedule error:', e);
+      return sendJSON(res, 500, { error: e.message || 'Schedule failed' });
+    }
+  }
+
+  // ── YouTube: unschedule (clear publishAt, keep private) ──────
+  // POST /youtube/unschedule  body: { channelId, videoId, makePublic? }
+  // makePublic=true flips privacyStatus to 'public' immediately
+  // (the "Publish now" override). makePublic=false just clears the
+  // schedule and leaves the video as a private draft.
+  if (req.method === 'POST' && pathname === '/youtube/unschedule') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const { channelId, videoId, makePublic } = JSON.parse(body);
+      if (!channelId || !videoId) return sendJSON(res, 400, { error: 'channelId and videoId required' });
+      const snap = await db.collection('channels').doc(channelId).get();
+      if (!snap.exists) return sendJSON(res, 404, { error: 'Channel not found' });
+      const data = snap.data();
+      if (!data.youtubeRefreshToken) return sendJSON(res, 400, { error: 'YouTube not connected for this channel' });
+      const oauth = makeOAuthClient();
+      oauth.setCredentials({
+        refresh_token: data.youtubeRefreshToken,
+        access_token: data.youtubeAccessToken || undefined,
+        expiry_date: data.youtubeTokenExpiry || undefined,
+      });
+      const yt = google.youtube({ version: 'v3', auth: oauth });
+      const cur = await yt.videos.list({ part: ['status'], id: [videoId] });
+      const item = cur.data.items?.[0];
+      if (!item) return sendJSON(res, 404, { error: 'Video not found' });
+      // Setting publishAt to undefined removes it; the SDK serialises
+      // missing fields as cleared so we explicitly omit.
+      await yt.videos.update({
+        part: ['status'],
+        requestBody: {
+          id: videoId,
+          status: {
+            privacyStatus: makePublic ? 'public' : 'private',
+            selfDeclaredMadeForKids: item.status?.selfDeclaredMadeForKids || false,
+            // Leaving publishAt out of the body clears it.
+          },
+        },
+      });
+      console.log(`[unschedule] ${videoId} → ${makePublic ? 'public' : 'private (scheduled cleared)'}`);
+      return sendJSON(res, 200, { ok: true, videoId, privacyStatus: makePublic ? 'public' : 'private' });
+    } catch (e) {
+      console.error('YouTube unschedule error:', e);
+      return sendJSON(res, 500, { error: e.message || 'Unschedule failed' });
     }
   }
 
