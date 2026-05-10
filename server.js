@@ -35,10 +35,23 @@ try {
 const db = firebaseReady ? admin.firestore() : null;
 const bucket = firebaseReady ? admin.storage().bucket() : null;
 
-// Cost rate per 1k chars on ElevenLabs Creator+ ($99/mo, 500k chars).
-// 99/500 = $0.198 per 1k chars. Shown to the user pre-generation as
-// an estimate, recorded after the actual char count is known.
-const ELEVENLABS_COST_PER_1K_CHARS_USD = 0.198;
+// Per-model ElevenLabs config — char limits + per-1k-char rates.
+// Frontend mirrors this list so the user can pick a model in Settings.
+// turbo_v2_5 is now the default: 4× the char limit (40k vs 10k) and
+// 6× cheaper than multilingual_v2 — matters because typical 11-12k
+// finance scripts blow past v2's 10k cap.
+const ELEVENLABS_MODELS = {
+  'eleven_turbo_v2_5':     { label: 'Turbo v2.5 (fast + cheap, 40k limit)', charLimit: 40000, costPer1kUsd: 0.05 },
+  'eleven_multilingual_v2':{ label: 'Multilingual v2 (highest quality, 10k limit)', charLimit: 10000, costPer1kUsd: 0.30 },
+  'eleven_v3':             { label: 'Eleven v3 (newest, 10k limit)', charLimit: 10000, costPer1kUsd: 0.30 },
+};
+const ELEVENLABS_DEFAULT_MODEL = 'eleven_turbo_v2_5';
+function elevenLabsRate(modelId) {
+  return (ELEVENLABS_MODELS[modelId] || ELEVENLABS_MODELS[ELEVENLABS_DEFAULT_MODEL]).costPer1kUsd;
+}
+function elevenLabsLimit(modelId) {
+  return (ELEVENLABS_MODELS[modelId] || ELEVENLABS_MODELS[ELEVENLABS_DEFAULT_MODEL]).charLimit;
+}
 
 // ── Google OAuth client factory ─────────────────────────────────
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
@@ -1308,8 +1321,20 @@ const server = http.createServer(async (req, res) => {
     if (!text || typeof text !== 'string') return sendJSON(res, 400, { error: 'text is required' });
     if (!voiceId) return sendJSON(res, 400, { error: 'voiceId is required' });
 
+    // Resolve model + reject upfront if the script blows past its char
+    // limit — avoids a wasted Anthropic-style 422 from ElevenLabs.
+    const resolvedModelId = modelId && ELEVENLABS_MODELS[modelId] ? modelId : ELEVENLABS_DEFAULT_MODEL;
+    const charLimit = elevenLabsLimit(resolvedModelId);
     const chars = text.length;
-    const costUsd = +(chars / 1000 * ELEVENLABS_COST_PER_1K_CHARS_USD).toFixed(4);
+    if (chars > charLimit) {
+      return sendJSON(res, 400, {
+        error: `Script is ${chars.toLocaleString()} chars but ${resolvedModelId} limit is ${charLimit.toLocaleString()}. Switch model in Settings or shorten the script.`,
+        chars,
+        charLimit,
+        modelId: resolvedModelId,
+      });
+    }
+    const costUsd = +(chars / 1000 * elevenLabsRate(resolvedModelId)).toFixed(4);
     const filename = `ai-${Date.now()}.mp3`;
     const storagePath = `channels/${channelId}/projects/${projectId}/voiceover/${filename}`;
     const file = bucket.file(storagePath);
@@ -1321,9 +1346,7 @@ const server = http.createServer(async (req, res) => {
 
     const ttsBody = JSON.stringify({
       text,
-      // model_id: eleven_multilingual_v2 = good general-purpose, ~$0.30/1k
-      // turbo_v2_5 is cheaper but lower quality. User can override.
-      model_id: modelId || 'eleven_multilingual_v2',
+      model_id: resolvedModelId,
       voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true },
     });
     const options = {
@@ -1380,7 +1403,7 @@ const server = http.createServer(async (req, res) => {
             chars,
             costUsd,
             sizeBytes: totalBytes,
-            modelId: modelId || 'eleven_multilingual_v2',
+            modelId: resolvedModelId,
           });
           console.log(`[elevenlabs] generated ${chars}ch / ${totalBytes}B → ${storagePath} ($${costUsd.toFixed(4)})`);
           return sendJSON(res, 200, {
@@ -1391,6 +1414,7 @@ const server = http.createServer(async (req, res) => {
             chars,
             costUsd,
             voiceId,
+            modelId: resolvedModelId,
           });
         } catch (e) {
           console.error('elevenlabs/tts: post-upload error:', e);
