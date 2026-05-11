@@ -1459,6 +1459,79 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ── YouTube: public competitor channel top videos ─────────────
+  // Used by the scheduled scrapeCompetitorThumbnails Cloud Function.
+  // Reuses an existing channel's OAuth refresh token to query the
+  // public YouTube Data API for a competitor's top videos — saves
+  // having to provision a separate public API key. The OAuth quota
+  // hit is small (~15 units per competitor channel).
+  //
+  // POST /youtube/competitor-top-videos
+  // Body: { authChannelId, competitorHandle, limit? }
+  //   authChannelId    — channelId in OUR Firestore whose OAuth tokens to borrow
+  //   competitorHandle — YouTube handle like "MagnatesMedia" (without @)
+  //   limit            — max videos to return, default 20
+  // Response: { ok, channel: {id, title}, videos: [{videoId, title, views, publishedAt, thumbnailUrl}] }
+  if (req.method === 'POST' && pathname === '/youtube/competitor-top-videos') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const { authChannelId, competitorHandle, limit } = JSON.parse(body);
+      if (!authChannelId || !competitorHandle) {
+        return sendJSON(res, 400, { error: 'authChannelId and competitorHandle required' });
+      }
+      const cap = Math.max(1, Math.min(50, parseInt(limit, 10) || 20));
+      const snap = await db.collection('channels').doc(authChannelId).get();
+      if (!snap.exists) return sendJSON(res, 404, { error: 'auth channel not found' });
+      const data = snap.data();
+      if (!data.youtubeRefreshToken) return sendJSON(res, 400, { error: 'auth channel has no YouTube refresh token' });
+      const oauth = makeOAuthClient();
+      oauth.setCredentials({
+        refresh_token: data.youtubeRefreshToken,
+        access_token: data.youtubeAccessToken || undefined,
+        expiry_date: data.youtubeTokenExpiry || undefined,
+      });
+      const yt = google.youtube({ version: 'v3', auth: oauth });
+
+      // 1. Resolve handle → channel ID + uploads playlist
+      const handleClean = competitorHandle.startsWith('@') ? competitorHandle.slice(1) : competitorHandle;
+      const chResp = await yt.channels.list({ part: ['id', 'snippet', 'contentDetails'], forHandle: handleClean });
+      const chItem = (chResp.data.items || [])[0];
+      if (!chItem) return sendJSON(res, 404, { error: `competitor handle @${handleClean} not found` });
+      const uploadsPlaylist = chItem.contentDetails?.relatedPlaylists?.uploads;
+      if (!uploadsPlaylist) return sendJSON(res, 500, { error: 'no uploads playlist on competitor channel' });
+
+      // 2. Pull 50 most recent uploads from the playlist
+      const plResp = await yt.playlistItems.list({ part: ['contentDetails'], playlistId: uploadsPlaylist, maxResults: 50 });
+      const videoIds = (plResp.data.items || []).map((i) => i.contentDetails?.videoId).filter(Boolean);
+      if (!videoIds.length) return sendJSON(res, 200, { ok: true, channel: { id: chItem.id, title: chItem.snippet?.title || handleClean }, videos: [] });
+
+      // 3. Batch videos.list for stats + thumbnails (max 50/call)
+      const vResp = await yt.videos.list({ part: ['snippet', 'statistics'], id: videoIds });
+      const videos = (vResp.data.items || []).map((v) => ({
+        videoId: v.id,
+        title: v.snippet?.title || '',
+        publishedAt: v.snippet?.publishedAt || null,
+        views: parseInt(v.statistics?.viewCount, 10) || 0,
+        thumbnailUrl: v.snippet?.thumbnails?.maxres?.url
+          || v.snippet?.thumbnails?.high?.url
+          || v.snippet?.thumbnails?.medium?.url
+          || v.snippet?.thumbnails?.default?.url
+          || null,
+      })).filter((v) => v.thumbnailUrl);
+      // Sort by views desc, cap.
+      videos.sort((a, b) => b.views - a.views);
+      return sendJSON(res, 200, {
+        ok: true,
+        channel: { id: chItem.id, title: chItem.snippet?.title || handleClean },
+        videos: videos.slice(0, cap),
+      });
+    } catch (e) {
+      console.error('competitor-top-videos error:', e.message);
+      return sendJSON(res, 500, { error: e.message || 'competitor lookup failed' });
+    }
+  }
+
   // ── Everything else requires POST with body ───────────────────
   if (req.method !== 'POST') {
     return sendText(res, 404, 'Not found');
