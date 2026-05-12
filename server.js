@@ -1511,6 +1511,7 @@ const server = http.createServer(async (req, res) => {
           hasVoiceoverFile: !!p.voiceoverFile,
           hasEditingFile: !!p.editingFile,
           hasThumbnail: !!p.thumbnailUrl,
+          editingJobId: p.editingJobId || null,
           createdAt: p.createdAt?.toMillis ? p.createdAt.toMillis() : null,
         });
       }
@@ -1518,6 +1519,76 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       console.error('admin/autopilot-state error:', e);
       return sendJSON(res, 500, { error: e.message || 'inspect failed' });
+    }
+  }
+
+  // ── Admin: inspect an editingJob doc ─────────────────────────
+  // POST /admin/editing-job  body: { jobId }
+  //
+  // Returns the editingJob doc minus heavy payloads we don't need
+  // for diagnostics. Used to verify what beats Claude returned, how
+  // many overlays were planned vs rendered, entity enrichment counts,
+  // AI-clip counts, and final render outcomes.
+  if (req.method === 'POST' && pathname === '/admin/editing-job') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const { jobId } = JSON.parse(body);
+      if (!jobId) return sendJSON(res, 400, { error: 'jobId required' });
+      const snap = await db.collection('editingJobs').doc(jobId).get();
+      if (!snap.exists) return sendJSON(res, 404, { error: 'editingJob not found' });
+      const j = snap.data() || {};
+      // Beat summary: keep only what matters for editing diagnostics.
+      const beats = Array.isArray(j.beats) ? j.beats : [];
+      const beatSummary = beats.slice(0, 12).map((b, i) => ({
+        i,
+        text: (b.text || '').slice(0, 80),
+        start: b.start, end: b.end,
+        overlayCount: Array.isArray(b.overlays) ? b.overlays.length : 0,
+        overlayTypes: Array.isArray(b.overlays) ? b.overlays.map((ov) => ov.type) : [],
+        entityCount: Array.isArray(b.entities) ? b.entities.length : 0,
+        entities: Array.isArray(b.entities) ? b.entities.map((e) => e?.name || e).slice(0, 5) : [],
+        shouldAnimate: !!b.shouldAnimate,
+        heroMoment: !!b.heroMoment,
+        hasFluxPrompt: !!b.fluxPrompt,
+        kenBurnsIntensity: b.kenBurnsIntensity || null,
+      }));
+      const overlaysByType = {};
+      let totalOverlays = 0, totalEntities = 0, totalShouldAnimate = 0, totalHero = 0;
+      for (const b of beats) {
+        if (Array.isArray(b.overlays)) {
+          totalOverlays += b.overlays.length;
+          for (const ov of b.overlays) {
+            overlaysByType[ov.type] = (overlaysByType[ov.type] || 0) + 1;
+          }
+        }
+        if (Array.isArray(b.entities)) totalEntities += b.entities.length;
+        if (b.shouldAnimate) totalShouldAnimate++;
+        if (b.heroMoment) totalHero++;
+      }
+      return sendJSON(res, 200, {
+        ok: true,
+        jobId,
+        status: j.status || null,
+        currentStep: j.currentStep || null,
+        progress: j.progress || 0,
+        error: (j.error || '').slice(0, 400),
+        updatedAtMs: j.updatedAt?.toMillis ? j.updatedAt.toMillis() : null,
+        renderUrl: j.renderUrl || null,
+        timings: j.timings || {},
+        beats: {
+          count: beats.length,
+          totalOverlays,
+          totalEntities,
+          totalShouldAnimate,
+          totalHero,
+          overlaysByType,
+          sample: beatSummary,
+        },
+      });
+    } catch (e) {
+      console.error('admin/editing-job error:', e);
+      return sendJSON(res, 500, { error: e.message || 'editing-job inspect failed' });
     }
   }
 
