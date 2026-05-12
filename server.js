@@ -1511,6 +1511,12 @@ const server = http.createServer(async (req, res) => {
           hasVoiceoverFile: !!p.voiceoverFile,
           hasEditingFile: !!p.editingFile,
           hasThumbnail: !!p.thumbnailUrl,
+          thumbnailUrl: p.thumbnailUrl || null,
+          // Either explicitly written by Stage 5 (new) or inferred from URL.
+          thumbnailSource: p.thumbnailSource
+            || (p.thumbnailUrl?.includes('placehold.co') ? 'placeholder'
+              : p.thumbnailUrl?.includes('replicate') ? 'flux'
+              : p.thumbnailUrl ? 'pikzels' : null),
           editingJobId: p.editingJobId || null,
           createdAt: p.createdAt?.toMillis ? p.createdAt.toMillis() : null,
         });
