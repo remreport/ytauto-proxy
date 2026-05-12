@@ -1592,6 +1592,79 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ── Admin: classify performance lessons for a channel ────────
+  // POST /admin/classify-channel-lessons  body: { channelId }
+  //
+  // Mirror of the Cloud Function classifyAndLogPerformanceLessons —
+  // reads analytics/summary.topVideos, computes the median view count,
+  // classifies winners (>2× median) and weaknesses (<0.5× median), and
+  // writes them to channel.forensic. Idempotent; safe to re-run.
+  if (req.method === 'POST' && pathname === '/admin/classify-channel-lessons') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const { channelId } = JSON.parse(body);
+      if (!channelId) return sendJSON(res, 400, { error: 'channelId required' });
+      const chRef = db.collection('channels').doc(channelId);
+      const summarySnap = await chRef.collection('analytics').doc('summary').get();
+      if (!summarySnap.exists) return sendJSON(res, 404, { error: 'no analytics/summary on channel — run /youtube/analytics/refresh first' });
+      const summary = summarySnap.data() || {};
+      const topVideos = Array.isArray(summary.topVideos) ? summary.topVideos : [];
+      if (topVideos.length < 3) return sendJSON(res, 400, { error: `only ${topVideos.length} videos in summary — need ≥3 to classify` });
+
+      const viewsSorted = topVideos.map((v) => v.views || 0).sort((a, b) => a - b);
+      const median = viewsSorted[Math.floor(viewsSorted.length / 2)] || 1;
+      const winningCutoff = median * 2;
+      const weakCutoff = median * 0.5;
+      const winningPatterns = [];
+      const lessons = [];
+      for (const v of topVideos) {
+        if (!v || !v.title || typeof v.views !== 'number') continue;
+        if (v.views >= winningCutoff) {
+          winningPatterns.push({
+            videoId: v.videoId || v.id || null,
+            title: v.title.slice(0, 120),
+            views: v.views,
+            viewsVsMedian: +(v.views / median).toFixed(2),
+            ctr: typeof v.ctr === 'number' ? v.ctr : null,
+            retentionAt30s: typeof v.retentionAt30s === 'number' ? v.retentionAt30s : null,
+            publishedAt: v.publishedAt || null,
+            lesson: 'Replicate this title pattern + topic angle in future videos.',
+          });
+        } else if (v.views > 0 && v.views <= weakCutoff) {
+          lessons.push({
+            videoId: v.videoId || v.id || null,
+            title: v.title.slice(0, 120),
+            views: v.views,
+            viewsVsMedian: +(v.views / median).toFixed(2),
+            ctr: typeof v.ctr === 'number' ? v.ctr : null,
+            retentionAt30s: typeof v.retentionAt30s === 'number' ? v.retentionAt30s : null,
+            publishedAt: v.publishedAt || null,
+            lesson: 'Underperformed — avoid this title pattern + topic angle in future videos.',
+          });
+        }
+      }
+      winningPatterns.sort((a, b) => b.viewsVsMedian - a.viewsVsMedian);
+      lessons.sort((a, b) => a.viewsVsMedian - b.viewsVsMedian);
+      await chRef.update({
+        'forensic.lessons': lessons.slice(0, 10),
+        'forensic.winningPatterns': winningPatterns.slice(0, 10),
+        'forensic.lessonsClassifiedAt': admin.firestore.FieldValue.serverTimestamp(),
+        'forensic.lessonsMedianViews': median,
+      });
+      console.log(`[admin/classify-channel-lessons] ${channelId}: ${winningPatterns.length}w / ${lessons.length}weak (median=${median})`);
+      return sendJSON(res, 200, {
+        ok: true, channelId,
+        winningPatterns: winningPatterns.length,
+        lessons: lessons.length,
+        medianViews: median,
+      });
+    } catch (e) {
+      console.error('admin/classify-channel-lessons error:', e);
+      return sendJSON(res, 500, { error: e.message || 'classify failed' });
+    }
+  }
+
   // ── Admin: resume a stuck/cancelled autoPilot run ────────────
   // POST /admin/autopilot-resume  body: { channelId, projectId }
   //
