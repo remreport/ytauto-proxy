@@ -1459,6 +1459,68 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ── Admin: read autoPilot state for a channel's projects ─────
+  // POST /admin/autopilot-state  body: { channelId }
+  //
+  // Read-only endpoint that returns each project's stage/status/error
+  // for diagnostic purposes. Gated by knowing the channelId — owner-only
+  // by construction since channel IDs aren't broadly published. Does
+  // NOT expose any API keys or PII. Used by Claude (CLI) to diagnose
+  // stuck pipelines without requiring service-account credentials.
+  if (req.method === 'POST' && pathname === '/admin/autopilot-state') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const { channelId } = JSON.parse(body);
+      if (!channelId) return sendJSON(res, 400, { error: 'channelId required' });
+      const projSnap = await db.collection('channels').doc(channelId).collection('projects')
+        .orderBy('createdAt', 'desc')
+        .limit(20)
+        .get();
+      const projects = [];
+      for (const doc of projSnap.docs) {
+        const p = doc.data() || {};
+        const ap = p.autoPilot || {};
+        const updatedMs = ap.updatedAt?.toMillis ? ap.updatedAt.toMillis() : 0;
+        // Include projects that look in-flight OR recently terminal.
+        const interesting = ap.status === 'running' || ap.status === 'awaiting-render' ||
+          ap.status === 'failed' || ap.status === 'cancelled' ||
+          ap.requestStart === true || ap.requestCancel === true;
+        if (!interesting && projects.length > 5) continue;
+        projects.push({
+          projectId: doc.id,
+          title: (p.title || p.topic || '').slice(0, 80),
+          topic: (p.topic || '').slice(0, 120),
+          pickedTopic: (typeof p.pickedTopic === 'string' ? p.pickedTopic : p.pickedTopic?.value || '').slice(0, 120),
+          discoveryStatus: p.discoveryStatus || null,
+          discoveryError: (p.discoveryError || '').slice(0, 200),
+          autoPilot: {
+            status: ap.status || null,
+            currentStage: ap.currentStage || null,
+            stageLabel: ap.stageLabel || null,
+            error: (ap.error || '').slice(0, 300),
+            costUsd: ap.costUsd || 0,
+            requestStart: ap.requestStart === true,
+            requestCancel: ap.requestCancel === true,
+            updatedAtMs: updatedMs,
+            heartbeatAgeMs: updatedMs ? (Date.now() - updatedMs) : null,
+            heartbeatAgeSec: updatedMs ? Math.round((Date.now() - updatedMs) / 1000) : null,
+          },
+          stageStatus: p.status || {},
+          hasScript: !!p.script,
+          hasVoiceoverFile: !!p.voiceoverFile,
+          hasEditingFile: !!p.editingFile,
+          hasThumbnail: !!p.thumbnailUrl,
+          createdAt: p.createdAt?.toMillis ? p.createdAt.toMillis() : null,
+        });
+      }
+      return sendJSON(res, 200, { ok: true, channelId, projects });
+    } catch (e) {
+      console.error('admin/autopilot-state error:', e);
+      return sendJSON(res, 500, { error: e.message || 'inspect failed' });
+    }
+  }
+
   // ── YouTube: list THIS channel's scheduled videos ────────────
   // POST /youtube/list-scheduled  body: { channelId, lookback? }
   //
