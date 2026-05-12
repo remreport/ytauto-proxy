@@ -1459,6 +1459,93 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ── YouTube: list THIS channel's scheduled videos ────────────
+  // POST /youtube/list-scheduled  body: { channelId, lookback? }
+  //
+  // Returns the recently-uploaded videos that are currently private
+  // with a publishAt set (i.e. scheduled to go public). Used by the
+  // duplicate-cleanup UI to find videos that need to be either
+  // un-scheduled or set permanently private before they go live.
+  // lookback caps how many recent uploads we scan (default 50, max 200).
+  if (req.method === 'POST' && pathname === '/youtube/list-scheduled') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const { channelId, lookback } = JSON.parse(body);
+      if (!channelId) return sendJSON(res, 400, { error: 'channelId required' });
+      const snap = await db.collection('channels').doc(channelId).get();
+      if (!snap.exists) return sendJSON(res, 404, { error: 'Channel not found' });
+      const data = snap.data();
+      if (!data.youtubeRefreshToken) return sendJSON(res, 400, { error: 'YouTube not connected for this channel' });
+      const cap = Math.max(20, Math.min(200, parseInt(lookback, 10) || 50));
+
+      const oauth = makeOAuthClient();
+      oauth.setCredentials({
+        refresh_token: data.youtubeRefreshToken,
+        access_token: data.youtubeAccessToken || undefined,
+        expiry_date: data.youtubeTokenExpiry || undefined,
+      });
+      const yt = google.youtube({ version: 'v3', auth: oauth });
+
+      // 1) Resolve the user's own uploads playlist.
+      const mineResp = await yt.channels.list({ part: ['contentDetails'], mine: true });
+      const uploadsPlaylist = (mineResp.data.items || [])[0]?.contentDetails?.relatedPlaylists?.uploads;
+      if (!uploadsPlaylist) return sendJSON(res, 500, { error: 'no uploads playlist on this channel' });
+
+      // 2) Walk the uploads playlist (50/page) until we hit the cap.
+      const collected = [];
+      let pageToken = undefined;
+      while (collected.length < cap) {
+        const pageSize = Math.min(50, cap - collected.length);
+        const pl = await yt.playlistItems.list({
+          part: ['contentDetails'],
+          playlistId: uploadsPlaylist,
+          maxResults: pageSize,
+          pageToken,
+        });
+        for (const it of (pl.data.items || [])) {
+          const vid = it.contentDetails?.videoId;
+          if (vid) collected.push(vid);
+        }
+        pageToken = pl.data.nextPageToken;
+        if (!pageToken) break;
+      }
+      if (!collected.length) return sendJSON(res, 200, { ok: true, scheduled: [] });
+
+      // 3) Batch videos.list (50/call) for snippet + status. publishAt
+      // lives on status, not snippet. Filter to scheduled-only.
+      const scheduled = [];
+      for (let i = 0; i < collected.length; i += 50) {
+        const batch = collected.slice(i, i + 50);
+        const vr = await yt.videos.list({ part: ['snippet', 'status'], id: batch });
+        for (const v of (vr.data.items || [])) {
+          const privacy = v.status?.privacyStatus;
+          const publishAt = v.status?.publishAt;
+          if (privacy === 'private' && publishAt) {
+            const pubMs = Date.parse(publishAt);
+            scheduled.push({
+              videoId: v.id,
+              title: v.snippet?.title || '',
+              description: (v.snippet?.description || '').slice(0, 200),
+              publishedAt: v.snippet?.publishedAt || null,
+              publishAt,
+              publishAtMs: Number.isFinite(pubMs) ? pubMs : null,
+              thumbnailUrl: v.snippet?.thumbnails?.medium?.url || v.snippet?.thumbnails?.default?.url || null,
+              privacyStatus: privacy,
+            });
+          }
+        }
+      }
+      // Earliest publish-time first so the UI can mark dupes "newest is
+      // the keeper" deterministically.
+      scheduled.sort((a, b) => (a.publishAtMs || 0) - (b.publishAtMs || 0));
+      return sendJSON(res, 200, { ok: true, scheduled });
+    } catch (e) {
+      console.error('list-scheduled error:', e);
+      return sendJSON(res, 500, { error: e.message || 'list-scheduled failed' });
+    }
+  }
+
   // ── YouTube: public competitor channel top videos ─────────────
   // Used by the scheduled scrapeCompetitorThumbnails Cloud Function.
   // Reuses an existing channel's OAuth refresh token to query the
