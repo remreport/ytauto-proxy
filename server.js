@@ -1521,6 +1521,43 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ── Admin: resume a stuck/cancelled autoPilot run ────────────
+  // POST /admin/autopilot-resume  body: { channelId, projectId }
+  //
+  // Writes requestStart=true + clears the cancelled/failed status so
+  // the autoPilotKicker fires a fresh worker. The worker resumes at
+  // whatever stage's output is missing. Owner-only by knowledge of
+  // channelId + projectId (both are private to the workspace).
+  if (req.method === 'POST' && pathname === '/admin/autopilot-resume') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const { channelId, projectId } = JSON.parse(body);
+      if (!channelId || !projectId) return sendJSON(res, 400, { error: 'channelId and projectId required' });
+      const projRef = db.collection('channels').doc(channelId).collection('projects').doc(projectId);
+      const snap = await projRef.get();
+      if (!snap.exists) return sendJSON(res, 404, { error: 'Project not found' });
+      const before = snap.data()?.autoPilot || {};
+      // Two-step write so the kicker (onDocumentUpdated) sees
+      // requestStart go false→true. If it's already true we have to
+      // toggle it explicitly.
+      if (before.requestStart === true) {
+        await projRef.update({ 'autoPilot.requestStart': false });
+      }
+      await projRef.update({
+        'autoPilot.requestStart': true,
+        'autoPilot.requestCancel': false,
+        'autoPilot.status': 'idle',
+        'autoPilot.error': null,
+      });
+      console.log(`[admin/autopilot-resume] ${channelId}/${projectId} resumed (prev status=${before.status || 'unknown'})`);
+      return sendJSON(res, 200, { ok: true, channelId, projectId, prevStatus: before.status || null });
+    } catch (e) {
+      console.error('admin/autopilot-resume error:', e);
+      return sendJSON(res, 500, { error: e.message || 'resume failed' });
+    }
+  }
+
   // ── YouTube: list THIS channel's scheduled videos ────────────
   // POST /youtube/list-scheduled  body: { channelId, lookback? }
   //
