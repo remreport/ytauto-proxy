@@ -164,6 +164,18 @@ async function callAnthropicWithTool(apiKey, prompt, tool, maxTokens = 4096) {
     err.fallbackText = fallbackText.slice(0, 2000);
     throw err;
   }
+  // Surface stop_reason. If max_tokens hit, the tool_use input is
+  // partial — Claude prunes optional fields to stay under budget. That's
+  // exactly the "134 beats with 0 overlays" bug: max_tokens=4096 wasn't
+  // enough for a 134-beat tool call so Claude omitted every non-required
+  // field. Caller can decide whether to retry with larger budget.
+  if (data.stop_reason === 'max_tokens') {
+    const inputBytes = JSON.stringify(toolUse.input || {}).length;
+    console.warn(`[callAnthropicWithTool] STOP_REASON=max_tokens — tool=${tool.name} budget=${maxTokens} returned input size=${inputBytes} bytes. Tool output likely pruned of optional fields.`);
+  }
+  if (data.usage) {
+    console.log(`[callAnthropicWithTool] ${tool.name} usage: in=${data.usage.input_tokens} out=${data.usage.output_tokens} stop=${data.stop_reason}`);
+  }
   return toolUse.input;
 }
 
@@ -380,7 +392,7 @@ ${JSON.stringify(sentences)}`;
 
   let result;
   try {
-    result = await callAnthropicWithTool(anthropicKey, prompt, BEATS_TOOL, 4096);
+    result = await callAnthropicWithTool(anthropicKey, prompt, BEATS_TOOL, 32768);
   } catch (e) {
     // First call may fail with "no tool_use block" if Claude refused entirely.
     // Fall through to the retry path so we get one more shot.
@@ -397,7 +409,7 @@ You MUST submit submit_beats with at least 1 beat. The submit_beats input_schema
 Sentences:
 ${JSON.stringify(sentences)}`;
     try {
-      result = await callAnthropicWithTool(anthropicKey, retryPrompt, BEATS_TOOL, 4096);
+      result = await callAnthropicWithTool(anthropicKey, retryPrompt, BEATS_TOOL, 32768);
     } catch (e) {
       console.warn(`breakIntoBeats retry threw (${e.message}) — falling back to naive grouping`);
       result = {beats: []};
@@ -741,7 +753,7 @@ async function renderOnLambda(inputProps, jobRef) {
     // Each chunk renders in ~100-150s at concurrencyPerLambda=2, well
     // under the 900s function timeout. A 12k-frame video → 12 chunks
     // running fully in parallel → ~150-200s total wall time.
-    framesPerLambda: 1000,
+    framesPerLambda: 400,
     concurrencyPerLambda: 2,
     maxRetries: 5,
     // Per-asset fetch budget inside each Lambda's Chromium. Default 28s
