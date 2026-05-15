@@ -74,6 +74,19 @@ const REMOTION_LAMBDA_SERVE_URL_STAGING =
 function getRemotionServeUrl(useStagingRender) {
   return useStagingRender === true ? REMOTION_LAMBDA_SERVE_URL_STAGING : REMOTION_LAMBDA_SERVE_URL_PROD;
 }
+// Music volume default. Per-channel UI override (channelMusicSettings.volume)
+// still wins. 0.05 is a deliberately quiet bed — never competes with voice.
+const DEFAULT_MUSIC_VOLUME = 0.05;
+function getDefaultMusicVolume() {
+  return DEFAULT_MUSIC_VOLUME;
+}
+// Fallback-of-last-resort music track. Used only when the entire dynamic
+// selection pipeline (Claude → mood-random → channel/global library) returns
+// nothing OR the picked URL fails a HEAD probe. Hardcoded so music is
+// GUARANTEED to play even if Firestore is empty, the channel has zero tracks,
+// or the picked CDN URL is broken. Real production renders should rarely hit
+// this — when they do, the [music-fallback] log line is the signal.
+const FALLBACK_MUSIC_URL = 'https://storage.googleapis.com/ytauto-95f91.firebasestorage.app/globalMusic/1778202535455_24_Nastelbom_Inspirational_Inspirational_Music.mp3';
 // Back-compat alias for any code still referencing the old name.
 const REMOTION_LAMBDA_SERVE_URL = REMOTION_LAMBDA_SERVE_URL_PROD;
 // Render-hosted proxy — used by the auto-forensic scheduler to call
@@ -4084,10 +4097,30 @@ async function probeUrl(url, {expectImage = false} = {}) {
     clearTimeout(timer);
   }
 }
+// Defensive music URL resolver. The dynamic music pipeline (Claude pick →
+// mood-random → channel/global library) can return null when Firestore
+// has no usable tracks for a mood, when the channel pool is empty, or
+// when every fallback throws. It can also return a URL that 404s at
+// render time. Either way, the editingJob silently produced a video
+// with no music. This helper closes the gap: if the resolved URL is
+// missing OR fails a HEAD probe, swap in FALLBACK_MUSIC_URL so music
+// is GUARANTEED to play. Logs a [music-fallback] line so the operator
+// can tell a "real pick" render apart from a "fallback fired" render.
+async function ensureMusicUrl(url) {
+  if (url) {
+    const probe = await probeUrl(url);
+    if (probe.ok) return url;
+    console.warn(`[music-fallback] picked musicUrl probe failed (${probe.reason}) — substituting hardcoded fallback track`);
+    return FALLBACK_MUSIC_URL;
+  }
+  console.warn('[music-fallback] no musicUrl from selection pipeline — substituting hardcoded fallback track');
+  return FALLBACK_MUSIC_URL;
+}
+
 async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'}) {
   const errors = [];
   const warnings = [];
-  const {voiceoverUrl, footage, overlayLayer, captions} = inputProps || {};
+  const {voiceoverUrl, footage, overlayLayer, captions, musicUrl} = inputProps || {};
 
   // ─ Structural checks ─
   if (!voiceoverUrl) errors.push('voiceoverUrl is missing');
@@ -4121,6 +4154,11 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
   // ─ URL probes (parallel) ─
   const probeJobs = [];
   if (voiceoverUrl) probeJobs.push(probeUrl(voiceoverUrl).then((r) => ({label: 'voiceover', url: voiceoverUrl, ...r})));
+  // Music is allowed to be absent in inputProps (rare path) but if present
+  // it must be reachable. ensureMusicUrl() upstream guarantees a fallback,
+  // so this probe is defense-in-depth: catches the case where even the
+  // hardcoded fallback URL is unreachable (S3 outage, project rename, etc).
+  if (musicUrl) probeJobs.push(probeUrl(musicUrl).then((r) => ({label: 'music', url: musicUrl, ...r})));
   for (const f of footage || []) {
     if (f?.url) probeJobs.push(probeUrl(f.url).then((r) => ({label: `footage[${f.beatIndex ?? '?'}]`, url: f.url, ...r})));
   }
@@ -4875,7 +4913,7 @@ async function processJob(job) {
   let musicUrl = null;
   let pickedMood = null;
   let sfxLayer = [];
-  let musicVolume = 0.08;
+  let musicVolume = getDefaultMusicVolume();
   let musicSelection = null;
   const musicT0 = Date.now();
   const channelMusicSettings = await getChannelMusicSettings(job.channelId);
@@ -4902,9 +4940,7 @@ async function processJob(job) {
       });
       musicUrl = sel.url;
       musicSelection = sel;
-      // Constant volume — channel default (0.06) unless overridden.
-      // No per-track / per-frame dynamic mixing.
-      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : 0.06;
+      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : getDefaultMusicVolume();
       console.log(`music: "${sel.trackName}" id=${sel.trackId} mood=${sel.trackMood} dur=${Math.round(sel.trackDuration)}s vol=${musicVolume.toFixed(3)} — ${sel.reasoning}`);
       // Save the pick on the project doc so the user can trace which
       // track was used if a YouTube Content ID claim shows up later.
@@ -4925,11 +4961,15 @@ async function processJob(job) {
     } catch (selErr) {
       console.warn(`Claude music selection failed (${selErr.message}) — falling back to mood-random`);
       musicUrl = await pickMusicTrack(job.channelId, pickedMood);
-      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : 0.06;
+      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : getDefaultMusicVolume();
     }
   } catch (e) {
-    console.warn(`Music pick failed entirely: ${e.message} — proceeding without`);
+    console.warn(`Music pick failed entirely: ${e.message} — fallback will substitute`);
   }
+  // Defensive layer: guarantee musicUrl is set + reachable. Either keeps
+  // the dynamic pick (if probe passes) or substitutes FALLBACK_MUSIC_URL.
+  // After this line, musicUrl is NEVER null.
+  musicUrl = await ensureMusicUrl(musicUrl);
   try {
     sfxLayer = await resolveSfxLayer(footage, job.channelId);
     if (sfxLayer.length) {

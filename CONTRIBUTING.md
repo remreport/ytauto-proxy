@@ -111,6 +111,60 @@ functions from `develop`, the new code path runs for ALL renders
 without affecting prod renders, gate the new behavior behind
 `useStagingRender` checks inside the function itself.
 
+## Gating rule for new features (HARD REQUIREMENT)
+
+**Every new feature on `develop` that touches `functions/index.js`
+MUST be gated behind `useStagingRender` until explicitly approved
+for production.** This rule exists because of day-11: the music-volume
+fix was deployed from `develop` and silently changed production
+behavior even though only the staging Lambda site was bundled with
+the new visuals.
+
+Two acceptable shapes:
+
+**A) Gate inside the function** (any code-path change):
+
+```js
+// At the start of the section that branches behavior:
+const useStaging = !!job.useStagingRender;
+
+// Conditional default
+const newFeatureValue = useStaging ? NEW_BEHAVIOR : OLD_BEHAVIOR;
+
+// OR conditional execution
+if (useStaging) {
+  // new code path — only runs for v7 renders
+} else {
+  // existing code path — v6 production unchanged
+}
+```
+
+(Example placeholder — no live gated default exists right now. Earlier
+day-11 music-volume gate was reverted after short-test showed 0.06 is
+correct and the v6 "no music" issue had a different root cause. When a
+new gated default is added, it should follow the same shape: a helper
+that branches on `useStagingRender`, with per-channel UI override still
+winning in both branches.)
+
+**B) Remotion-side only** (visual changes that don't touch
+`functions/index.js`):
+
+These are AUTO-isolated by the dual Lambda site. v7 site bundles the
+new Remotion code; v6 site keeps the previous bundle. No gating code
+needed — the site selection at render time is the gate. Example:
+day-11 captions revert affected `Captions.jsx` only, so v7 rendered
+with full-sentence captions while v6 stayed on sliding window —
+zero functions/index.js change.
+
+**Promotion workflow** when staging looks good:
+1. Merge `develop` → `main` in `ytauto-proxy`
+2. Remove the gate inside the function (or invert it so the new
+   behavior becomes the default for both)
+3. Run predeploy-check
+4. Deploy Cloud Functions from `main`
+5. Bundle Remotion to v6 (production site) — `npx remotion lambda
+   sites create src/index.js --site-name=rem-report-v6`
+
 ## Pre-deploy check
 
 `ytauto-proxy/scripts/predeploy-check.mjs` runs:
@@ -156,3 +210,11 @@ Run it before EVERY deploy. Exits non-zero on failure → don't deploy.
   $5 per failed Lambda render and we hit two such failures on day 10.
 - Don't `git init` at the project root — three separate repos is the
   current architecture; merging them is a separate decision.
+- **Don't add Cloud Functions code that changes prod behavior without
+  a `useStagingRender` gate.** Day-11 example: a music-volume bump
+  was deployed from `develop` and silently changed production
+  behavior. (The gate has since been reverted because 0.06 turned
+  out to be the correct value — but the rule still stands; the next
+  prod-behavior change must be gated.) The dual Lambda site only
+  isolates Remotion code; Cloud Functions is shared. See the
+  "Gating rule" section above.
