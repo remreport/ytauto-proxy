@@ -63,8 +63,19 @@ const LOGO_DEV_API_KEY = defineSecret('LOGO_DEV_API_KEY');
 const AWS_REGION = 'us-east-1';
 const REMOTION_LAMBDA_FUNCTION_NAME =
   'remotion-render-4-0-456-mem3008mb-disk10240mb-900sec';
-const REMOTION_LAMBDA_SERVE_URL =
+// Dual Lambda sites — production stays stable on v6; staging
+// (rem-report-v7) is where new features get tested before promotion.
+// Selection is per-render via the job document's `useStagingRender`
+// boolean (default false → v6). See CONTRIBUTING.md for the workflow.
+const REMOTION_LAMBDA_SERVE_URL_PROD =
   'https://remotionlambda-useast1-1zsfacnzw9.s3.us-east-1.amazonaws.com/sites/rem-report-v6/index.html';
+const REMOTION_LAMBDA_SERVE_URL_STAGING =
+  'https://remotionlambda-useast1-1zsfacnzw9.s3.us-east-1.amazonaws.com/sites/rem-report-v7/index.html';
+function getRemotionServeUrl(useStagingRender) {
+  return useStagingRender === true ? REMOTION_LAMBDA_SERVE_URL_STAGING : REMOTION_LAMBDA_SERVE_URL_PROD;
+}
+// Back-compat alias for any code still referencing the old name.
+const REMOTION_LAMBDA_SERVE_URL = REMOTION_LAMBDA_SERVE_URL_PROD;
 // Render-hosted proxy — used by the auto-forensic scheduler to call
 // /youtube/analytics/refresh and /youtube/analytics/forensic on a cron.
 // Same URL the frontend uses; the proxy validates per-channel auth
@@ -4017,13 +4028,128 @@ function extractFailedUrlsFromError(message) {
   return Array.from(urls);
 }
 
-async function renderOnLambda(inputProps, jobRef, {progressLabel = 'Rendering on Lambda'} = {}) {
+// Hard-timeout wrapper. Races a promise against setTimeout; rejects
+// with a TIMEOUT error if the deadline passes. The wrapped promise
+// keeps running in the background after timeout (we can't cancel an
+// arbitrary in-flight Promise) — but the caller stops waiting and can
+// mark the job failed. For Lambda renders, the inflight render
+// continues consuming budget; future enhancement: actively cancel via
+// AWS Step Functions API. For now, "stop waiting" is the floor.
+const PIPELINE_STEP_TIMEOUT_MS = 5 * 60 * 1000;   // 5 min per pipeline step
+const LAMBDA_RENDER_TIMEOUT_MS = 25 * 60 * 1000;  // 25 min for Lambda render
+function withHardTimeout(promise, timeoutMs, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`TIMEOUT: ${label} exceeded ${(timeoutMs / 1000).toFixed(0)}s`);
+      err.code = 'PIPELINE_TIMEOUT';
+      err.timeoutLabel = label;
+      reject(err);
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Pre-flight validation. Probes every URL the renderer will fetch
+// (overlay imageUrls, footage URLs, voiceover) and structural
+// invariants on the data shape. Catches "bad data → $5 wasted Lambda
+// render" failures before invoking. Returns {ok, errors, warnings}.
+//
+// Each URL probe: HEAD with 3s timeout, accepts 2xx with image/* (for
+// images) or any 2xx (for audio/video — content-type may vary).
+// HEAD failures fall back to a 1-byte ranged GET (some CDNs misbehave
+// on HEAD, e.g. img.logo.dev returns 404 — but we already forced GET
+// for that one upstream, here we trust HEAD where it works and ranged
+// GET as fallback).
+const PROBE_TIMEOUT_MS = 3000;
+async function probeUrl(url, {expectImage = false} = {}) {
+  if (!url || typeof url !== 'string') return {ok: false, reason: 'empty url'};
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+  try {
+    let resp = await fetch(url, {method: 'HEAD', signal: ctrl.signal}).catch(() => null);
+    // Some CDNs 404/405 on HEAD even when GET works — fall back to a
+    // tiny ranged GET to test reachability without downloading the body.
+    if (!resp || !resp.ok) {
+      resp = await fetch(url, {method: 'GET', headers: {Range: 'bytes=0-1'}, signal: ctrl.signal}).catch(() => null);
+    }
+    if (!resp) return {ok: false, reason: 'fetch failed (timeout or network)'};
+    if (!resp.ok) return {ok: false, reason: `HTTP ${resp.status}`};
+    if (expectImage) {
+      const ct = (resp.headers.get('content-type') || '').toLowerCase();
+      if (!ct.startsWith('image/')) return {ok: false, reason: `content-type=${ct || '<missing>'} (expected image/*)`};
+    }
+    return {ok: true};
+  } finally {
+    clearTimeout(timer);
+  }
+}
+async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'}) {
+  const errors = [];
+  const warnings = [];
+  const {voiceoverUrl, footage, overlayLayer, captions} = inputProps || {};
+
+  // ─ Structural checks ─
+  if (!voiceoverUrl) errors.push('voiceoverUrl is missing');
+  if (!Array.isArray(footage) || footage.length === 0) errors.push('footage array is empty');
+  const seenStarts = new Map();
+  for (let i = 0; i < (footage || []).length; i++) {
+    const b = footage[i];
+    if (!b) { errors.push(`footage[${i}] is null`); continue; }
+    if (typeof b.start !== 'number') errors.push(`footage[${i}].start is not a number`);
+    if (typeof b.end !== 'number') errors.push(`footage[${i}].end is not a number`);
+    if (b.start != null && seenStarts.has(b.start)) {
+      errors.push(`footage[${i}].start=${b.start} duplicates footage[${seenStarts.get(b.start)}].start`);
+    } else if (b.start != null) {
+      seenStarts.set(b.start, i);
+    }
+  }
+  const lastCaption = (captions || []).at(-1);
+  const voiceoverDurEstSec = lastCaption?.end || 0;
+  for (let i = 0; i < (overlayLayer || []).length; i++) {
+    const ov = overlayLayer[i];
+    if (!ov) { errors.push(`overlayLayer[${i}] is null`); continue; }
+    if (typeof ov.timestamp !== 'number') warnings.push(`overlayLayer[${i}] (${ov.type}) missing timestamp`);
+    if (typeof ov.duration === 'number' && ov.duration < 0.5) {
+      warnings.push(`overlayLayer[${i}] (${ov.type}) duration ${ov.duration}s below 0.5s floor`);
+    }
+    if (typeof ov.timestamp === 'number' && voiceoverDurEstSec > 0 && ov.timestamp > voiceoverDurEstSec + 1) {
+      warnings.push(`overlayLayer[${i}] (${ov.type}) timestamp ${ov.timestamp}s past voiceover end ${voiceoverDurEstSec}s`);
+    }
+  }
+
+  // ─ URL probes (parallel) ─
+  const probeJobs = [];
+  if (voiceoverUrl) probeJobs.push(probeUrl(voiceoverUrl).then((r) => ({label: 'voiceover', url: voiceoverUrl, ...r})));
+  for (const f of footage || []) {
+    if (f?.url) probeJobs.push(probeUrl(f.url).then((r) => ({label: `footage[${f.beatIndex ?? '?'}]`, url: f.url, ...r})));
+  }
+  for (let i = 0; i < (overlayLayer || []).length; i++) {
+    const ov = overlayLayer[i];
+    if (ov?.imageUrl) probeJobs.push(probeUrl(ov.imageUrl, {expectImage: true}).then((r) => ({label: `overlay[${i}].imageUrl (${ov.type})`, url: ov.imageUrl, ...r})));
+  }
+  const probeResults = await Promise.all(probeJobs);
+  for (const r of probeResults) {
+    if (!r.ok) errors.push(`URL probe failed — ${r.label}: ${r.reason} (${r.url.slice(0, 100)})`);
+  }
+
+  const ok = errors.length === 0;
+  console.log(`[preflight] ${jobId}: ok=${ok} probes=${probeResults.length} errors=${errors.length} warnings=${warnings.length}`);
+  if (warnings.length) console.warn(`[preflight] ${jobId} warnings:\n  - ${warnings.join('\n  - ')}`);
+  if (errors.length) console.warn(`[preflight] ${jobId} errors:\n  - ${errors.join('\n  - ')}`);
+  return {ok, errors, warnings, probesRun: probeResults.length};
+}
+
+async function renderOnLambda(inputProps, jobRef, {progressLabel = 'Rendering on Lambda', useStagingRender = false} = {}) {
   const {renderMediaOnLambda, getRenderProgress} = require('@remotion/lambda-client');
+  const serveUrl = getRemotionServeUrl(useStagingRender);
+  const siteName = useStagingRender ? 'rem-report-v7 (STAGING)' : 'rem-report-v6 (PROD)';
+  console.log(`[lambda] rendering to site=${siteName} (useStagingRender=${useStagingRender})`);
 
   const renderArgs = {
     region: AWS_REGION,
     functionName: REMOTION_LAMBDA_FUNCTION_NAME,
-    serveUrl: REMOTION_LAMBDA_SERVE_URL,
+    serveUrl,
     composition: 'MainComp',
     inputProps,
     codec: 'h264',
@@ -4066,7 +4192,11 @@ async function renderOnLambda(inputProps, jobRef, {progressLabel = 'Rendering on
   while (attempt < maxAttempts) {
     attempt++;
     try {
-      const result = await renderMediaOnLambda(renderArgs);
+      const result = await withHardTimeout(
+        renderMediaOnLambda(renderArgs),
+        LAMBDA_RENDER_TIMEOUT_MS,
+        `renderMediaOnLambda (attempt ${attempt})`,
+      );
       renderId = result.renderId;
       bucketName = result.bucketName;
       break;
@@ -4086,7 +4216,23 @@ async function renderOnLambda(inputProps, jobRef, {progressLabel = 'Rendering on
   console.log(`Lambda renderId: ${renderId}`);
 
   let lastPct = -1;
+  const pollStart = Date.now();
   while (true) {
+    // Wall-clock watchdog. Replaces "while (true) await sleep" → could
+    // hang forever (saw a 38-min stuck render bleed $5+ before this
+    // was added). At LAMBDA_RENDER_TIMEOUT_MS, throw a timeout error.
+    // The in-flight Lambda render keeps running in AWS — future work
+    // is to call AWS Step Functions cancel API to stop the spend.
+    if (Date.now() - pollStart > LAMBDA_RENDER_TIMEOUT_MS) {
+      const elapsedMin = ((Date.now() - pollStart) / 60000).toFixed(1);
+      const err = new Error(
+        `Lambda render exceeded ${(LAMBDA_RENDER_TIMEOUT_MS / 60000).toFixed(0)}min wall clock (renderId=${renderId}, ${elapsedMin}min elapsed) — stopping wait. ` +
+        `In-flight render in AWS continues until completion (TODO: actively cancel via Step Functions API).`,
+      );
+      err.code = 'LAMBDA_RENDER_TIMEOUT';
+      err.renderId = renderId;
+      throw err;
+    }
     await sleep(3000);
     const progress = await getRenderProgress({
       renderId,
@@ -4228,7 +4374,7 @@ function sliceSfxForSegment(sfxLayer, segStart, segEnd) {
 // AI fallback respects the channel's render + monthly budget. If
 // adding one more AI clip would exceed either cap, AI is skipped
 // for this beat (proceeds to drop).
-async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = null, label = 'render', maxAttempts = 5} = {}) {
+async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = null, label = 'render', maxAttempts = 5, useStagingRender = false} = {}) {
   const FOOTAGE_SEARCH_FNS = {
     pexels: pexelsSearchTop,
     pixabay: pixabaySearchTop,
@@ -4246,7 +4392,7 @@ async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = 
   while (true) {
     attempt++;
     try {
-      return await renderOnLambda(renderInput, jobRef, {progressLabel: label});
+      return await renderOnLambda(renderInput, jobRef, {progressLabel: label, useStagingRender});
     } catch (e) {
       if (e.code !== 'CORRUPT_SOURCE') throw e;
 
@@ -4856,15 +5002,48 @@ async function processJob(job) {
   console.log(`[${job.id}] render mode: ${isSplit ? `${segments.length} segments` : 'single'} (voiceover ${voiceoverDurationSec.toFixed(1)}s)`);
 
   const renderStart = Date.now();
+  // Pre-flight runs ONCE on the full unsplit input — even in split
+  // mode, every URL is shared across segments, so probing once is
+  // sufficient and faster. Single-render path also runs this check
+  // (kept inline below for telemetry isolation), but the split path
+  // checks here BEFORE the segment fan-out begins.
+  if (isSplit) {
+    const fullInput = {voiceoverUrl, footage, captions, musicUrl, musicVolume, sfxLayer, overlayLayer};
+    const preflight = await validatePipelineOutputBeforeLambda({inputProps: fullInput, jobId: job.id});
+    if (!preflight.ok) {
+      await jobRef.update({
+        status: 'failed',
+        error: `Pre-flight validation failed (Lambda not invoked, $0 spent):\n - ${preflight.errors.join('\n - ')}`,
+        'timings.preflightMs': Date.now() - renderStart,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      throw new Error(`[${job.id}] preflight failed: ${preflight.errors.length} error(s) — Lambda not invoked`);
+    }
+  }
   let finalFile;
 
   if (!isSplit) {
     // Single-render path with mid-render swap loop.
     const renderInput = {voiceoverUrl, footage, captions, musicUrl, musicVolume, sfxLayer, overlayLayer};
+    // Pre-flight validation — probes every URL + structural invariants
+    // BEFORE invoking Lambda. Saves $5+ per bad render. Failure stops
+    // the pipeline cleanly with the job marked failed and the errors
+    // list captured on the doc.
+    const preflight = await validatePipelineOutputBeforeLambda({inputProps: renderInput, jobId: job.id});
+    if (!preflight.ok) {
+      await jobRef.update({
+        status: 'failed',
+        error: `Pre-flight validation failed (Lambda not invoked, $0 spent):\n - ${preflight.errors.join('\n - ')}`,
+        'timings.preflightMs': Date.now() - renderStart,
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      throw new Error(`[${job.id}] preflight failed: ${preflight.errors.length} error(s) — Lambda not invoked`);
+    }
     const s3OutputUrl = await renderWithSwapLoop(renderInput, jobRef, {
       jobId: job.id,
       channelId: job.channelId,
       label: 'Rendering on Lambda',
+      useStagingRender: !!job.useStagingRender,
     });
     const renderMs = Date.now() - renderStart;
     await jobRef.update({
@@ -4991,6 +5170,7 @@ async function processJob(job) {
           jobId: job.id,
           channelId: job.channelId,
           label,
+          useStagingRender: !!job.useStagingRender,
         });
       }));
       const segRenderMs = Date.now() - segRenderT0;
