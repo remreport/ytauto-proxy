@@ -4875,7 +4875,11 @@ async function processJob(job) {
   let musicUrl = null;
   let pickedMood = null;
   let sfxLayer = [];
-  let musicVolume = 0.08;
+  // Default music volume bumped 0.08 → 0.15 (day-11) — first prod render
+  // had musically-inaudible mix at 0.06. Test-render audio probe showed
+  // music at −45.5 dB during voiceover gaps (silencedetect@−50dB flagged
+  // as silent). Per-channel UI override still wins via channelMusicSettings.
+  let musicVolume = 0.15;
   let musicSelection = null;
   const musicT0 = Date.now();
   const channelMusicSettings = await getChannelMusicSettings(job.channelId);
@@ -4902,9 +4906,10 @@ async function processJob(job) {
       });
       musicUrl = sel.url;
       musicSelection = sel;
-      // Constant volume — channel default (0.06) unless overridden.
-      // No per-track / per-frame dynamic mixing.
-      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : 0.06;
+      // Constant volume — channel default (0.15) unless overridden.
+      // No per-track / per-frame dynamic mixing. See comment at the
+      // initial `let musicVolume` declaration for why 0.15 (was 0.06).
+      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : 0.15;
       console.log(`music: "${sel.trackName}" id=${sel.trackId} mood=${sel.trackMood} dur=${Math.round(sel.trackDuration)}s vol=${musicVolume.toFixed(3)} — ${sel.reasoning}`);
       // Save the pick on the project doc so the user can trace which
       // track was used if a YouTube Content ID claim shows up later.
@@ -4925,7 +4930,7 @@ async function processJob(job) {
     } catch (selErr) {
       console.warn(`Claude music selection failed (${selErr.message}) — falling back to mood-random`);
       musicUrl = await pickMusicTrack(job.channelId, pickedMood);
-      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : 0.06;
+      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : 0.15;
     }
   } catch (e) {
     console.warn(`Music pick failed entirely: ${e.message} — proceeding without`);
