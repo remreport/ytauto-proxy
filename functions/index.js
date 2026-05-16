@@ -64,6 +64,10 @@ const LOGO_DEV_API_KEY = defineSecret('LOGO_DEV_API_KEY');
 // branch will fall through to stock_footage so a missing key never breaks
 // the render. Per-video budget cap enforced inside the helper.
 const FAL_AI_API_KEY = defineSecret('FAL_AI_API_KEY');
+// Day-14 Phase 5: Mapbox Static Images for `map` scene assets. Free up
+// to 50K requests/month — no per-image cost concern at our render volume.
+// Bound on processEditingJobHttp. Falls back to stock if unset.
+const MAPBOX_ACCESS_TOKEN = defineSecret('MAPBOX_ACCESS_TOKEN');
 
 // ─── Non-secret config ──────────────────────────────────────────────
 const AWS_REGION = 'us-east-1';
@@ -2750,6 +2754,96 @@ async function generateAiImage({prompt, falApiKey, budgetTracker}) {
   }
 }
 
+// Day-14 Phase 5: Mapbox Static Images for map scenes. Free up to 50K
+// requests/month — no budget concern. URL-composed (no async wait).
+// Caches to Firebase Storage like AI images so re-renders skip the API
+// call. Dark style + brand-orange markers to match the rest of the app.
+// Fall back to stock_footage if mapContext missing / Mapbox errors out.
+async function generateMapImage({mapContext, mapboxToken}) {
+  if (!mapboxToken) {
+    console.warn('[map] MAPBOX_ACCESS_TOKEN not set — skipping (will fall back to stock_footage)');
+    return null;
+  }
+  if (!mapContext || !Array.isArray(mapContext.locations) || mapContext.locations.length === 0) {
+    console.warn('[map] mapContext.locations missing/empty — skipping');
+    return null;
+  }
+  // Pull + clamp inputs.
+  const style = mapContext.mapStyle === 'satellite' ? 'mapbox/satellite-streets-v12'
+    : mapContext.mapStyle === 'streets' ? 'mapbox/streets-v12'
+    : 'mapbox/dark-v11'; // dark default — matches finance/news brand
+  const markers = mapContext.locations
+    .filter((l) => typeof l.longitude === 'number' && typeof l.latitude === 'number')
+    .slice(0, 8)
+    .map((l) => `pin-l-circle+ED6F32(${l.longitude.toFixed(4)},${l.latitude.toFixed(4)})`)
+    .join(',');
+  if (!markers) {
+    console.warn('[map] no locations with valid lon/lat — skipping');
+    return null;
+  }
+  // 1280x720 @2x = 2560x1440 effective (covers 16:9 1080p with room).
+  const size = '1280x720@2x';
+  // Mapbox auto-fits when we use 'auto' position; or explicit center+zoom if Claude gave one.
+  let position = 'auto';
+  if (typeof mapContext.zoom === 'number' && mapContext.locations.length === 1) {
+    const l = mapContext.locations[0];
+    position = `${l.longitude.toFixed(4)},${l.latitude.toFixed(4)},${Math.max(0, Math.min(18, mapContext.zoom))}`;
+  }
+  const url = `https://api.mapbox.com/styles/v1/${style}/static/${markers}/${position}/${size}?access_token=${mapboxToken}&padding=80&logo=false&attribution=false`;
+  // Cache via SHA256 of the URL (sans token) so token rotations don't
+  // invalidate. We bake style+markers+position into the key.
+  const cacheKey = `${style}|${markers}|${position}|${size}`;
+  const hash = crypto.createHash('sha256').update(cacheKey).digest('hex');
+  const cachePath = `mapImages/${hash}.png`;
+  const bucket = admin.storage().bucket();
+  const cacheFile = bucket.file(cachePath);
+  try {
+    const [cacheExists] = await cacheFile.exists();
+    if (cacheExists) {
+      const cachedUrl = `https://storage.googleapis.com/${bucket.name}/${cachePath}`;
+      console.log(`[map] CACHE HIT for ${hash.slice(0, 8)} — ${cachedUrl.split('/').pop()}`);
+      return cachedUrl;
+    }
+  } catch (e) {
+    console.warn(`[map] cache check failed: ${e.message} — proceeding`);
+  }
+  console.log(`[map] generating for ${mapContext.locations.length} location(s) [${mapContext.locations.slice(0, 3).map((l) => l.name).join(', ')}] style=${style}`);
+  const t0 = Date.now();
+  let imgResp;
+  try {
+    imgResp = await fetch(url);
+  } catch (e) {
+    console.warn(`[map] Mapbox fetch threw: ${e.message}`);
+    return null;
+  }
+  if (!imgResp.ok) {
+    const errText = await imgResp.text().catch(() => '');
+    console.warn(`[map] Mapbox ${imgResp.status}: ${errText.slice(0, 200)}`);
+    return null;
+  }
+  const ct = imgResp.headers.get('content-type') || '';
+  if (!/^image\//i.test(ct)) {
+    console.warn(`[map] Mapbox returned non-image content-type: ${ct}`);
+    return null;
+  }
+  // Cache to Firebase Storage so Lambda has a stable, no-token URL.
+  try {
+    const {pipeline} = require('node:stream/promises');
+    const {Readable} = require('node:stream');
+    await pipeline(
+      Readable.fromWeb(imgResp.body),
+      cacheFile.createWriteStream({metadata: {contentType: ct}, resumable: false}),
+    );
+    await cacheFile.makePublic();
+    const cachedUrl = `https://storage.googleapis.com/${bucket.name}/${cachePath}`;
+    console.log(`[map] generated in ${((Date.now() - t0) / 1000).toFixed(1)}s → ${cachedUrl.split('/').pop()}`);
+    return cachedUrl;
+  } catch (e) {
+    console.warn(`[map] cache upload failed: ${e.message} — returning Mapbox URL directly (token-bearing, OK for short-lived)`);
+    return url;
+  }
+}
+
 // Validate that a URL is reachable + returns image/* content-type. Parallel
 // to validatePexelsVideo but image-shaped. Used by the per-beat sourcing
 // loop when a wikimedia-image candidate is being committed.
@@ -4274,6 +4368,10 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey) {
 - assetType: one of "stock_footage" | "archival_photo" | "ai_generated" | "map"
 - searchKeywords: array of 1-3 specific search terms (refined from the beat-level hints)
 - aiPrompt: vivid photorealistic prompt for AI image generation (ONLY when assetType="ai_generated"; else null)
+- mapContext: object (ONLY when assetType="map"; else null) with:
+    - locations: array of {name: string, longitude: number, latitude: number} for the places mentioned (use real-world coords — Shanghai is 121.47/31.23, Berlin is 13.41/52.52, etc.)
+    - mapStyle: "dark" (default — fits finance/news brand) | "satellite" | "streets"
+    - zoom: 1-18 integer (continental=3, country=5, region=7, city=10) — only used when locations.length === 1, else auto-fit
 - fallbackChain: array of 1-3 assetTypes in fallback order (e.g., ["ai_generated", "stock_footage"])
 
 Rules:
@@ -4321,6 +4419,20 @@ Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the
         ? e.searchKeywords.slice(0, 3).map((k) => String(k).slice(0, 60))
         : sceneInputs[idx].beatKeywordHints.slice(0, 3),
       aiPrompt: at === 'ai_generated' && typeof e.aiPrompt === 'string' ? e.aiPrompt.slice(0, 500) : null,
+      mapContext: at === 'map' && e.mapContext && Array.isArray(e.mapContext.locations) && e.mapContext.locations.length
+        ? {
+            locations: e.mapContext.locations
+              .filter((l) => l && typeof l.longitude === 'number' && typeof l.latitude === 'number')
+              .slice(0, 8)
+              .map((l) => ({
+                name: String(l.name || '').slice(0, 60),
+                longitude: Math.max(-180, Math.min(180, l.longitude)),
+                latitude: Math.max(-90, Math.min(90, l.latitude)),
+              })),
+            mapStyle: ['dark', 'satellite', 'streets'].includes(e.mapContext.mapStyle) ? e.mapContext.mapStyle : 'dark',
+            zoom: typeof e.mapContext.zoom === 'number' ? Math.max(0, Math.min(18, e.mapContext.zoom)) : null,
+          }
+        : null,
       fallbackChain: Array.isArray(e.fallbackChain)
         ? e.fallbackChain.filter((t) => validTypes.has(t)).slice(0, 3)
         : ['stock_footage'],
@@ -4353,6 +4465,7 @@ function applyScenesToBeats(rawBeats, scenes) {
         assetType: scene.assetType,
         visualConcept: scene.visualConcept,
         aiPrompt: scene.aiPrompt || null,
+        mapContext: scene.mapContext || null,
       };
       touched++;
     }
@@ -4565,6 +4678,18 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
         usedStockUrls.add(aiUrl);
       }
     }
+    // Day-14 Phase 5: map scenes try Mapbox Static Images first.
+    if (!url && beat.scenePlanContext?.assetType === 'map' && beat.scenePlanContext?.mapContext) {
+      const mapUrl = await generateMapImage({
+        mapContext: beat.scenePlanContext.mapContext,
+        mapboxToken: process.env.MAPBOX_ACCESS_TOKEN,
+      });
+      if (mapUrl) {
+        url = mapUrl;
+        source = 'mapbox-image';
+        usedStockUrls.add(mapUrl);
+      }
+    }
     if (!url && query) {
       // Multi-source chain: Pexels → Pixabay → Wikimedia → Internet
       // Archive (channel-toggleable). First source returning candidates
@@ -4655,7 +4780,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
 
   const perBeatSourcingMs = Date.now() - perBeatT0;
   // Tally where each beat's footage came from for transparency.
-  const footageBySource = {pexels: 0, pixabay: 0, wikimedia: 0, 'wikimedia-image': 0, archive: 0, 'ai-video': 0, 'fal-ai-image': 0, none: 0};
+  const footageBySource = {pexels: 0, pixabay: 0, wikimedia: 0, 'wikimedia-image': 0, archive: 0, 'ai-video': 0, 'fal-ai-image': 0, 'mapbox-image': 0, none: 0};
   for (const b of footage) {
     if (!b) continue;
     const k = b.url ? (b.source || 'none') : 'none';
@@ -9639,6 +9764,7 @@ exports.processEditingJobHttp = onRequest(
       GEMINI_API_KEY,
       LOGO_DEV_API_KEY,
       FAL_AI_API_KEY,
+      MAPBOX_ACCESS_TOKEN,
     ],
   },
   async (req, res) => {
