@@ -139,13 +139,19 @@ if (useStaging) {
 }
 ```
 
-(Example placeholder — no live gated default exists right now. Earlier
-day-12 Gemini chunking gate was removed after the v6 "entity timing
-off on long voiceovers" issue was confirmed to need the same fix.
-Chunking is now the default for any voiceover >300s, both v6 and v7.
-When a new gated default is added, it should follow the same shape:
-a helper that branches on `useStagingRender`, with per-channel UI
-override still winning in both branches.)
+**Live example (day-14 Phase 2):** `sourceBeatAwareFootage(...)` accepts
+`useStagingRender` in its opts. When true, it runs `buildScenePlan()` after
+`breakIntoBeats()` to aggregate beats into 5-10s scenes, ask Claude for
+visual concept + assetType + refined keywords per scene, then applies the
+scene-level keywords back onto each beat via `applyScenesToBeats()`. v6
+production skips the entire block — beat.keywords remain Claude's
+per-beat output as they were pre-day-14. Promote by removing the
+`if (useStagingRender)` wrap (scene plan becomes the default for all
+renders) once a v7 staging render validates that the scene-aware
+keywords produce better footage cohesion than the per-beat keywords.
+assetType is captured on `beat.scenePlanContext` for Phase 3+ asset
+routing (Wikimedia / fal.ai / Mapbox), but Phase 2 itself does NOT
+route by assetType.
 
 **B) Remotion-side only** (visual changes that don't touch
 `functions/index.js`):

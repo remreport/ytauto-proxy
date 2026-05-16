@@ -3995,7 +3995,145 @@ async function runAiVideoGenerationPass(footage, beatIndices, channelId, cfg, jo
 }
 
 // ─── Beat-aware sourcing ────────────────────────────────────────────
-async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgress, span, {channelId, aiVideoOverride, timingTags} = {}) {
+// Day-14 Phase 2: aggregates beats into 5-10s scenes, asks Claude to
+// classify each scene with a visual concept + assetType (stock_footage |
+// archival_photo | ai_generated | map) + refined searchKeywords. Output
+// is AUGMENTATIVE — beats stay the atomic unit, scenes are a thematic
+// view layered on top. The current per-beat sourcing loop reads
+// beat.keywords; applyScenesToBeats() overrides those with scene-level
+// keywords for cohesion. Phase 2 does NOT yet route by assetType —
+// that's Phases 3-5. Gated behind useStagingRender per CONTRIBUTING.md.
+async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey) {
+  if (!Array.isArray(rawBeats) || rawBeats.length === 0) return [];
+  // Group beats into scenes. Hard rule: close scene at sentence boundary
+  // once accumulated duration is 5-10s, or unconditionally at 12s.
+  // AssemblyAI sentence-level captions inform boundaries via beat.sentence
+  // (each beat carries the sentence text it was carved from).
+  const scenes = [];
+  let cur = {start: rawBeats[0].start || 0, beats: [0]};
+  for (let i = 1; i < rawBeats.length; i++) {
+    const b = rawBeats[i];
+    const prevBeat = rawBeats[cur.beats[cur.beats.length - 1]];
+    const prevEnd = prevBeat.end || cur.start;
+    const wouldDur = (b.end || prevEnd) - cur.start;
+    const accumDur = prevEnd - cur.start;
+    const sentenceChanged = (b.sentence || '') !== (prevBeat.sentence || '');
+    if (wouldDur > 12 || (wouldDur > 10 && sentenceChanged) || (accumDur >= 7.5 && sentenceChanged)) {
+      scenes.push(cur);
+      cur = {start: b.start || prevEnd, beats: [i]};
+    } else {
+      cur.beats.push(i);
+    }
+  }
+  scenes.push(cur);
+
+  const sceneInputs = scenes.map((s, idx) => {
+    const sceneBeats = s.beats.map((bi) => rawBeats[bi]);
+    const endSec = sceneBeats[sceneBeats.length - 1].end || s.start;
+    const sentenceTexts = Array.from(new Set(sceneBeats.map((b) => b.sentence).filter(Boolean)));
+    const keywordHints = Array.from(new Set(sceneBeats.flatMap((b) => b.keywords || [])));
+    return {
+      index: idx,
+      start: +s.start.toFixed(2),
+      end: +endSec.toFixed(2),
+      durationSec: +(endSec - s.start).toFixed(2),
+      voiceoverText: sentenceTexts.join(' ').slice(0, 400),
+      beatKeywordHints: keywordHints.slice(0, 6),
+      heroMoment: sceneBeats.some((b) => b.heroMoment === true),
+    };
+  });
+
+  const prompt = `You are planning visuals for ${sceneInputs.length} scenes of a YouTube finance/news short video. For EACH scene, output a JSON object with:
+- visualConcept: string, 5-15 words describing what should appear on screen
+- assetType: one of "stock_footage" | "archival_photo" | "ai_generated" | "map"
+- searchKeywords: array of 1-3 specific search terms (refined from the beat-level hints)
+- aiPrompt: vivid photorealistic prompt for AI image generation (ONLY when assetType="ai_generated"; else null)
+- fallbackChain: array of 1-3 assetTypes in fallback order (e.g., ["ai_generated", "stock_footage"])
+
+Rules:
+- Prefer stock_footage for actions/places with available real footage (trading floors, city skylines, people walking, hands on keyboards)
+- Prefer archival_photo for historic events, famous figures in known moments, vintage settings (only when truly historic)
+- Prefer ai_generated for ABSTRACT concepts that lack stock footage (recession metaphors, market collapse, supply chain, policy abstractions, "the system", "the cycle")
+- Prefer map ONLY when scene describes specific geographic information (where deals happened, country comparisons, supply routes)
+- Cap maps at 1-2 per video. If unsure, never use map.
+- searchKeywords must refine the beat hints with full scene context — better than the beat hints in isolation
+- fallbackChain MUST start with the primary assetType and list cheaper/safer fallbacks (never list map as a fallback)
+
+Input scenes (JSON):
+${JSON.stringify(sceneInputs, null, 2)}
+
+Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the same order. No prose, no markdown fences.`;
+
+  const t0 = Date.now();
+  let enriched = [];
+  try {
+    const raw = await callAnthropicForJSON(anthropicKey, prompt, 6000);
+    if (Array.isArray(raw)) enriched = raw;
+    else console.warn(`[scene-plan] Claude returned non-array (${typeof raw}) — keeping per-beat keywords`);
+  } catch (e) {
+    console.warn(`[scene-plan] Claude call failed: ${e.message} — keeping per-beat keywords`);
+    return [];
+  }
+
+  const validTypes = new Set(['stock_footage', 'archival_photo', 'ai_generated', 'map']);
+  const breakdown = {stock_footage: 0, archival_photo: 0, ai_generated: 0, map: 0};
+  const out = scenes.map((s, idx) => {
+    const e = enriched[idx] || {};
+    const at = validTypes.has(e.assetType) ? e.assetType : 'stock_footage';
+    breakdown[at]++;
+    const endSec = rawBeats[s.beats[s.beats.length - 1]].end || s.start;
+    return {
+      index: idx,
+      beats: s.beats.slice(),
+      start: s.start,
+      end: endSec,
+      durationSec: +(endSec - s.start).toFixed(2),
+      voiceoverText: sceneInputs[idx].voiceoverText,
+      visualConcept: typeof e.visualConcept === 'string' ? e.visualConcept.slice(0, 200) : '',
+      assetType: at,
+      searchKeywords: Array.isArray(e.searchKeywords) && e.searchKeywords.length
+        ? e.searchKeywords.slice(0, 3).map((k) => String(k).slice(0, 60))
+        : sceneInputs[idx].beatKeywordHints.slice(0, 3),
+      aiPrompt: at === 'ai_generated' && typeof e.aiPrompt === 'string' ? e.aiPrompt.slice(0, 500) : null,
+      fallbackChain: Array.isArray(e.fallbackChain)
+        ? e.fallbackChain.filter((t) => validTypes.has(t)).slice(0, 3)
+        : ['stock_footage'],
+      resolvedSource: null,
+      resolvedUrl: null,
+    };
+  });
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[scene-plan] generated ${out.length} scenes for ${rawBeats.length} beats in ${elapsed}s — types: ${JSON.stringify(breakdown)}`);
+  return out;
+}
+
+// Maps scenes back onto beats. Each beat in a scene inherits the scene's
+// refined searchKeywords (so the existing per-beat sourcing loop benefits
+// from scene-level cohesion) and gets a scenePlanContext stamp for
+// downstream visibility (logs, videoPerformance snapshot, future phases).
+function applyScenesToBeats(rawBeats, scenes) {
+  if (!Array.isArray(rawBeats) || !Array.isArray(scenes) || scenes.length === 0) return 0;
+  let touched = 0;
+  for (const scene of scenes) {
+    if (!Array.isArray(scene.beats)) continue;
+    for (const beatIdx of scene.beats) {
+      const beat = rawBeats[beatIdx];
+      if (!beat) continue;
+      if (Array.isArray(scene.searchKeywords) && scene.searchKeywords.length) {
+        beat.keywords = scene.searchKeywords.slice();
+      }
+      beat.scenePlanContext = {
+        sceneIndex: scene.index,
+        assetType: scene.assetType,
+        visualConcept: scene.visualConcept,
+      };
+      touched++;
+    }
+  }
+  return touched;
+}
+
+async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgress, span, {channelId, aiVideoOverride, timingTags, useStagingRender = false} = {}) {
   await jobRef.update({
     currentStep: 'Breaking script into beats with Claude',
     progress: baseProgress,
@@ -4114,6 +4252,30 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     }
     const finalHeroCount = rawBeats.filter((b) => b && b.heroMoment).length;
     console.warn(`[hero-fallback] now ${finalHeroCount} hero beats: indices ${rawBeats.map((b, i) => b.heroMoment ? i : -1).filter((i) => i >= 0).join(', ')}`);
+  }
+
+  // Day-14 Phase 2: scene plan generation (staging-only). Aggregates
+  // beats into 5-10s scenes, asks Claude for visual concept + assetType
+  // + refined keywords per scene, then overrides beat.keywords with the
+  // scene-level keywords so the existing per-beat sourcing loop benefits
+  // from scene cohesion. assetType is captured on beat.scenePlanContext
+  // but NOT yet routed to different sources — Phase 3+ will read it.
+  // v6 production skips this entire block: keywords stay per-beat as
+  // they were before day-14.
+  if (useStagingRender) {
+    try {
+      const sceneT0 = Date.now();
+      const scenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey);
+      const touched = applyScenesToBeats(rawBeats, scenes);
+      const sceneMs = Date.now() - sceneT0;
+      await jobRef.update({
+        'timings.scenePlanMs': sceneMs,
+        'timings.sceneCount': scenes.length,
+        'timings.sceneBeatsTouched': touched,
+      }).catch(() => {});
+    } catch (e) {
+      console.warn(`[scene-plan] EXCEPTION: ${e.message} — falling back to per-beat keywords`);
+    }
   }
 
   // No SFX heuristic fallback. We trust Claude's strict-trigger
@@ -5323,6 +5485,7 @@ async function processJob(job) {
     channelId: job.channelId,
     aiVideoOverride: job.aiVideoOverride,
     timingTags,
+    useStagingRender: !!job.useStagingRender,
   });
   const sourcingMs = Date.now() - sourcingT0;
   console.log(`[${job.id}] ⏱ sourcing: ${(sourcingMs / 1000).toFixed(1)}s`);
