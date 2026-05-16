@@ -2620,17 +2620,18 @@ async function wikimediaImageSearchTop(query, n = 3) {
   return out;
 }
 
-// Day-14 Phase 4: fal.ai Nano Banana for ai_generated scenes.
-// Original Nano Banana model — $0.039/image @ 1024x1024, 5-10s latency.
-// Per-video budget cap so a runaway script can't drain monthly budget.
-// SHA256-keyed Firebase Storage cache so re-renders of the same prompt
-// hit cache instead of paying again. Falls back silently on any failure
-// (key missing, API down, budget exceeded) — the caller's existing
-// per-beat sourcing loop catches the null and tries Pexels.
+// Day-14 Phase 4 (tweak): fal.ai Nano Banana 2 for ai_generated scenes.
+// Upgraded from original Nano Banana ($0.039) → Nano Banana 2 ($0.08) for
+// higher quality + native 16:9 aspect ratio (matches YouTube widescreen
+// without crop). Tighter style prefix to enforce editorial-photography
+// look + block common AI artifacts (fake text/numbers/watermarks).
+// Per-video budget cap stays $1.00 (room for ~12 images at $0.08).
+// SHA256-keyed Firebase Storage cache so re-renders hit cache for free.
+// Falls back to stock_footage on any failure.
 const AI_IMAGE_BUDGET_PER_VIDEO = 1.00; // USD
-const AI_IMAGE_COST_PER_GENERATION = 0.039; // USD per 1024x1024 fal.ai Nano Banana
-const FAL_AI_NANO_BANANA_URL = 'https://fal.run/fal-ai/nano-banana';
-const AI_IMAGE_STYLE_PREFIX = 'Photorealistic, cinematic lighting, news-documentary style, professional finance/business content. ';
+const AI_IMAGE_COST_PER_GENERATION = 0.08; // USD per 1K image, fal.ai Nano Banana 2
+const FAL_AI_NANO_BANANA_URL = 'https://fal.run/fal-ai/nano-banana-2';
+const AI_IMAGE_STYLE_PREFIX = 'Award-winning editorial photography for financial news. Photorealistic. Cinematic lighting with dramatic side-light and subtle teal/orange color grading. Shallow depth of field. 16:9 widescreen composition. NO text, NO logos, NO watermarks, NO charts with fake numbers. Documentary realism, professional finance/business setting. Style of high-end financial news publications. ';
 
 function createAiImageBudgetTracker() {
   return {spent: 0, generated: 0, cacheHits: 0, skipped: 0, capUsd: AI_IMAGE_BUDGET_PER_VIDEO};
@@ -2685,11 +2686,12 @@ async function generateAiImage({prompt, falApiKey, budgetTracker}) {
         },
         body: JSON.stringify({
           prompt: fullPrompt,
-          image_size: 'square_hd',
+          aspect_ratio: '16:9',
+          resolution: '1K',
           num_images: 1,
           output_format: 'png',
         }),
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.timeout(60000),
       });
       if (!resp.ok) {
         const errText = await resp.text();
