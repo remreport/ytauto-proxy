@@ -2560,6 +2560,77 @@ async function pixabaySearchTop(query, n = 3) {
 // video files matching the query. Quality varies wildly — most
 // hits are stills/animations/educational clips, not stock-footage
 // quality. Useful as a tail-end source when other libraries miss.
+// Day-14 Phase 3: Wikimedia Commons IMAGE search for archival_photo
+// scenes. License-filtered to public-domain + CC0 + CC-BY (skips any
+// file with non-free or restrictive licenses). Returns absolute image
+// URLs. Used by searchAllFootageSources when the scene plan emits
+// assetType="archival_photo".
+async function wikimediaImageSearchTop(query, n = 3) {
+  const url = new URL('https://commons.wikimedia.org/w/api.php');
+  url.searchParams.set('action', 'query');
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('generator', 'search');
+  // filemime:image keeps results to image MIMEs (jpg/png/webp).
+  // gsrsort=relevance is the default; explicit for clarity.
+  url.searchParams.set('gsrsearch', query + ' filemime:image');
+  url.searchParams.set('gsrnamespace', '6');
+  url.searchParams.set('gsrlimit', '20');
+  url.searchParams.set('prop', 'imageinfo');
+  // extmetadata gives us LicenseShortName + Restrictions for filtering.
+  url.searchParams.set('iiprop', 'url|mime|size|extmetadata');
+  url.searchParams.set('iiextmetadatafilter', 'LicenseShortName|Restrictions');
+  url.searchParams.set('origin', '*');
+  let resp;
+  try { resp = await fetch(url); }
+  catch (e) { console.warn(`Wikimedia image search threw for "${query}": ${e.message}`); return []; }
+  if (!resp.ok) {
+    console.warn(`Wikimedia image ${resp.status} for "${query}"`);
+    return [];
+  }
+  const data = await resp.json();
+  const pages = Object.values(data.query?.pages || {});
+  // Whitelist licenses (lowercased substrings). CC-BY 3.0/4.0, CC0, PD,
+  // PD-old, "Public domain", GFDL is acceptable, CC-BY-SA is acceptable.
+  const allowedLicenseRe = /\b(cc0|public domain|pd|cc[\-\s]?by(?:[\-\s]?sa)?|gfdl)\b/i;
+  const out = [];
+  for (const p of pages) {
+    const info = (p.imageinfo || [])[0];
+    if (!info || !info.mime || !info.url) continue;
+    if (!/^image\//i.test(info.mime)) continue;
+    // Restrictions check — Commons sometimes flags trademarks / personality
+    // rights even on PD files. Skip anything with a non-empty restriction.
+    const restrictions = info.extmetadata?.Restrictions?.value;
+    if (restrictions && String(restrictions).trim().length > 0 && !/^false$/i.test(String(restrictions))) {
+      continue;
+    }
+    const license = info.extmetadata?.LicenseShortName?.value || '';
+    if (license && !allowedLicenseRe.test(String(license))) continue;
+    // Some images are huge SVG/large bitmaps. Skip >25MB to keep Lambda
+    // download budget reasonable.
+    if (info.size && info.size > 25 * 1024 * 1024) continue;
+    out.push(info.url);
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
+// Validate that a URL is reachable + returns image/* content-type. Parallel
+// to validatePexelsVideo but image-shaped. Used by the per-beat sourcing
+// loop when a wikimedia-image candidate is being committed.
+async function validateImageUrl(url) {
+  try {
+    const head = await fetch(url, {method: 'HEAD'});
+    if (!head.ok) return {ok: false, reason: `HEAD ${head.status}`};
+    const ct = head.headers.get('content-type') || '';
+    if (!/^image\//i.test(ct)) return {ok: false, reason: `bad content-type: ${ct}`};
+    const len = parseInt(head.headers.get('content-length') || '0', 10);
+    if (len && (len < 2_000 || len > 25_000_000)) return {ok: false, reason: `bad content-length: ${len}`};
+    return {ok: true};
+  } catch (e) {
+    return {ok: false, reason: e.message};
+  }
+}
+
 async function wikimediaSearchTop(query, n = 3) {
   // Two-step: search for matching files in namespace 6 (File:) →
   // pull imageinfo (url + mime) for each → keep video MIME types.
@@ -2642,7 +2713,7 @@ async function archiveSearchTop(query, n = 3) {
 // ftyp check works on any mp4 regardless of CDN). First-N-validated
 // wins; sources later in the chain only run when earlier ones return
 // empty for this query.
-async function searchAllFootageSources(channelId, query, n = 3) {
+async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = null) {
   // Read channel's footageSources toggles from settings doc, default
   // to the broad set if missing. Same pattern as musicSettings.
   const fallback = {pexels: true, pixabay: true, wikimedia: true, archive: false};
@@ -2652,6 +2723,25 @@ async function searchAllFootageSources(channelId, query, n = 3) {
       const ch = await db.collection('channels').doc(channelId).get();
       cfg = {...fallback, ...(ch.data()?.footageSources || {})};
     } catch {/* keep fallback */}
+  }
+
+  // Day-14 Phase 3: archival_photo scenes try Wikimedia Commons IMAGES
+  // FIRST (free, public-domain-filtered). On no-hit, fall through to the
+  // usual Pexels-first video ladder. Source name is reported as
+  // 'wikimedia-image' so the downstream renderer routes it to <Img>
+  // (MainComp.jsx falls back to <Img> for any non-video source).
+  // Gated implicitly by scenePlanContext.assetType — only set on staging
+  // renders that ran buildScenePlan; v6 prod never reaches this branch.
+  if (assetTypeHint === 'archival_photo' && cfg.wikimedia) {
+    let imageUrls;
+    try { imageUrls = await wikimediaImageSearchTop(query, n); }
+    catch (e) { console.warn(`[footage] wikimedia-image threw for "${query}": ${e.message}`); imageUrls = []; }
+    if (imageUrls && imageUrls.length) {
+      const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'wikimedia-image': imageUrls.length};
+      console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image (${imageUrls.length} candidates)`);
+      return {urls: imageUrls, source: 'wikimedia-image', sourceCounts};
+    }
+    console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image empty, falling through to stock ladder`);
   }
 
   const order = [
@@ -4324,11 +4414,17 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       // Archive (channel-toggleable). First source returning candidates
       // becomes the source for the beat. Validation pattern unchanged
       // — first candidate that passes HEAD+ftyp wins.
-      const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(channelId, query, 3);
+      // Day-14 Phase 3: pass scene-plan assetType so archival_photo
+      // scenes try Wikimedia Commons images FIRST (free, public domain).
+      const assetTypeHint = beat.scenePlanContext?.assetType || null;
+      const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(channelId, query, 3, assetTypeHint);
       const candidates = rawCandidates.filter((c) => !blocklist.has(c));
       if (candidates.length < rawCandidates.length) {
         console.log(`beat ${i + 1}: skipped ${rawCandidates.length - candidates.length} blocklisted candidate(s)`);
       }
+      // wikimedia-image candidates need image-shaped validation; everything
+      // else goes through the video-shaped validator.
+      const validator = pickedSource === 'wikimedia-image' ? validateImageUrl : validatePexelsVideo;
       let dedupSkipsThisBeat = 0;
       for (let ci = 0; ci < candidates.length; ci++) {
         const cand = candidates[ci];
@@ -4337,7 +4433,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
           stockDedupSkips++;
           continue;
         }
-        const v = await validatePexelsVideo(cand);
+        const v = await validator(cand);
         if (v.ok) {
           url = cand;
           source = pickedSource;
@@ -4348,6 +4444,9 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
           // Filter out URLs already used so later swaps don't reintroduce
           // a duplicate.
           pexelsAlternates = candidates.slice(ci + 1).filter((c) => !usedStockUrls.has(c));
+          if (pickedSource === 'wikimedia-image') {
+            console.log(`[wikimedia-image] picked for beat ${i + 1} (archival_photo): ${cand.split('/').pop().slice(0, 80)}`);
+          }
           break;
         }
         validationFailures.push({url: cand, reason: v.reason});
