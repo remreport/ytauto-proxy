@@ -4391,7 +4391,7 @@ Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the
   const t0 = Date.now();
   let enriched = [];
   try {
-    const raw = await callAnthropicForJSON(anthropicKey, prompt, 6000);
+    const raw = await callAnthropicForJSON(anthropicKey, prompt, 32000);
     if (Array.isArray(raw)) enriched = raw;
     else console.warn(`[scene-plan] Claude returned non-array (${typeof raw}) — keeping per-beat keywords`);
   } catch (e) {
