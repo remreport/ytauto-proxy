@@ -4473,6 +4473,138 @@ function applyScenesToBeats(rawBeats, scenes) {
   return touched;
 }
 
+// Day-14 Phase 6a: per-scene asset routing. Returns ONE footage entry
+// per scene (covers ~7-10s) instead of one per beat (~3-5s). Aggregates
+// overlays + sfx from the constituent beats into the scene entry with
+// timestamps remapped scene-relative so the downstream
+// buildOverlayLayer / resolveSfxLayer math still produces correct
+// absolute timestamps. Skips the AI hero video (Kling) pass entirely
+// — abstract/ai_generated scenes use fal.ai Nano Banana 2 images
+// instead. Gated on useStagingRender + a successful scene plan; on
+// any failure the caller falls through to the existing per-beat path.
+async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blocklist, aiImageBudget, usedStockUrls, jobRef, baseProgress, span}) {
+  const footage = [];
+  for (let si = 0; si < scenes.length; si++) {
+    const scene = scenes[si];
+    const sceneStart = scene.start || 0;
+    const sceneEnd = scene.end || sceneStart;
+    const sceneBeats = (scene.beats || []).map((bi) => rawBeats[bi]).filter(Boolean);
+    const heroMoment = sceneBeats.some((b) => b && b.heroMoment === true);
+    const keywords = Array.isArray(scene.searchKeywords) && scene.searchKeywords.length
+      ? scene.searchKeywords
+      : (sceneBeats[0]?.keywords || []);
+    const query = keywords.join(' ');
+
+    await jobRef.update({
+      currentStep: `Sourcing scene ${si + 1}/${scenes.length} (${scene.assetType}): ${(scene.visualConcept || '').slice(0, 60)}`,
+      progress: baseProgress + Math.round(((si + 1) / scenes.length) * span),
+      updatedAt: FieldValue.serverTimestamp(),
+    }).catch(() => {});
+
+    let url = null;
+    let source = null;
+    let pexelsAlternates = [];
+    const validationFailures = [];
+
+    // ai_generated → fal.ai Nano Banana 2 (budget-capped).
+    if (scene.assetType === 'ai_generated' && scene.aiPrompt) {
+      const aiUrl = await generateAiImage({
+        prompt: scene.aiPrompt,
+        falApiKey: process.env.FAL_AI_API_KEY,
+        budgetTracker: aiImageBudget,
+      });
+      if (aiUrl) { url = aiUrl; source = 'fal-ai-image'; usedStockUrls.add(aiUrl); }
+    }
+    // map → Mapbox Static Images (free <50K/mo).
+    if (!url && scene.assetType === 'map' && scene.mapContext) {
+      const mapUrl = await generateMapImage({
+        mapContext: scene.mapContext,
+        mapboxToken: process.env.MAPBOX_ACCESS_TOKEN,
+      });
+      if (mapUrl) { url = mapUrl; source = 'mapbox-image'; usedStockUrls.add(mapUrl); }
+    }
+    // Everything else → existing stock chain with assetTypeHint
+    // (archival_photo prefers Wikimedia images; default Pexels-first).
+    if (!url && query) {
+      const assetTypeHint = scene.assetType || null;
+      const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(channelId, query, 3, assetTypeHint);
+      const candidates = rawCandidates.filter((c) => !blocklist.has(c));
+      const validator = pickedSource === 'wikimedia-image' ? validateImageUrl : validatePexelsVideo;
+      for (let ci = 0; ci < candidates.length; ci++) {
+        const cand = candidates[ci];
+        if (usedStockUrls.has(cand)) continue;
+        const v = await validator(cand);
+        if (v.ok) {
+          url = cand;
+          source = pickedSource;
+          usedStockUrls.add(cand);
+          pexelsAlternates = candidates.slice(ci + 1).filter((c) => !usedStockUrls.has(c));
+          if (pickedSource === 'wikimedia-image') {
+            console.log(`[wikimedia-image] picked for scene ${si + 1} (${scene.assetType}): ${cand.split('/').pop().slice(0, 80)}`);
+          }
+          break;
+        }
+        validationFailures.push({url: cand, reason: v.reason});
+      }
+    }
+    if (!url) {
+      console.log(`scene ${si + 1}: no validated match for "${query.slice(0, 60)}" — gap-fill or swap loop will cover`);
+    }
+
+    // Aggregate overlays + sfx from constituent beats. Remap timestamps
+    // so they're scene-relative — preserves absolute timestamps after
+    // buildOverlayLayer / resolveSfxLayer add scene.start back.
+    const aggregatedOverlays = [];
+    const aggregatedSfx = [];
+    for (const beat of sceneBeats) {
+      const beatStart = beat.start || 0;
+      if (Array.isArray(beat.overlays) && beat.overlays.length) {
+        for (const ov of beat.overlays) {
+          aggregatedOverlays.push({
+            ...ov,
+            startOffset: (beatStart + (ov.startOffset || 0)) - sceneStart,
+          });
+        }
+      }
+      if (Array.isArray(beat.sfx) && beat.sfx.length) {
+        for (const req of beat.sfx) {
+          aggregatedSfx.push({
+            ...req,
+            offset: (beatStart + (req.offset || 0)) - sceneStart,
+          });
+        }
+      }
+    }
+
+    const sentence = Array.from(new Set(sceneBeats.map((b) => b.sentence).filter(Boolean))).join(' ').slice(0, 240);
+    const musicMood = si === 0 ? sceneBeats[0]?.musicMood : null;
+
+    footage.push({
+      beatIndex: si, // kept as beatIndex for MainComp render-loop compat
+      sceneIndex: si,
+      start: sceneStart,
+      end: sceneEnd,
+      sentence,
+      keywords,
+      fluxPrompt: scene.aiPrompt || sceneBeats[0]?.fluxPrompt || null,
+      heroMoment,
+      kenBurnsIntensity: heroMoment ? 'aggressive' : 'medium',
+      source,
+      url,
+      pexelsAlternates,
+      ...(aggregatedSfx.length ? {sfxRequested: aggregatedSfx} : {}),
+      ...(aggregatedOverlays.length ? {overlays: aggregatedOverlays} : {}),
+      ...(musicMood ? {musicMoodFromClaude: musicMood} : {}),
+      ...(validationFailures.length ? {pexelsValidationFailures: validationFailures} : {}),
+      // Scene metadata for diagnostics / future analysis
+      assetType: scene.assetType,
+      visualConcept: scene.visualConcept,
+    });
+    console.log(`scene ${si + 1}: ${source || 'NO MATCH'} (${scene.assetType}, ${(sceneEnd - sceneStart).toFixed(1)}s)${heroMoment ? ' [HERO]' : ''}${aggregatedOverlays.length ? ` [+${aggregatedOverlays.length} ovl]` : ''}${aggregatedSfx.length ? ` [+${aggregatedSfx.length} sfx]` : ''}`);
+  }
+  return footage;
+}
+
 async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgress, span, {channelId, aiVideoOverride, timingTags, useStagingRender = false} = {}) {
   await jobRef.update({
     currentStep: 'Breaking script into beats with Claude',
@@ -4602,10 +4734,14 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   // but NOT yet routed to different sources — Phase 3+ will read it.
   // v6 production skips this entire block: keywords stay per-beat as
   // they were before day-14.
+  // Day-14: scenes are populated when scene plan succeeds and stays
+  // empty otherwise (graceful fall-through). Hoisted out of the try
+  // block so the Phase-6a scene-driven sourcing branch below can read it.
+  let scenes = [];
   if (useStagingRender) {
     try {
       const sceneT0 = Date.now();
-      const scenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey);
+      scenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey);
       const touched = applyScenesToBeats(rawBeats, scenes);
       const sceneMs = Date.now() - sceneT0;
       await jobRef.update({
@@ -4615,8 +4751,13 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       }).catch(() => {});
     } catch (e) {
       console.warn(`[scene-plan] EXCEPTION: ${e.message} — falling back to per-beat keywords`);
+      scenes = [];
     }
   }
+  // Phase 6a gate: when ON, the per-beat sourcing loop + Kling AI hero
+  // video pass are both SKIPPED in favor of one-asset-per-scene routing.
+  // v6 production never reaches this branch (useStagingRender=false).
+  const sceneDrivenActive = useStagingRender && scenes.length > 0;
 
   // No SFX heuristic fallback. We trust Claude's strict-trigger
   // placement per the rewritten STEP 3 prompt — fewer well-placed SFX
@@ -4631,7 +4772,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   if (blocklist.size) console.log(`channel ${channelId}: ${blocklist.size} blocklisted upstream URLs`);
 
   const perBeatT0 = Date.now();
-  const footage = [];
+  let footage = [];
   // Day-14 Phase 4: per-video AI image budget tracker. Caps spend even
   // when a script has 20+ ai_generated scenes — extras fall back to
   // stock_footage automatically.
@@ -4648,6 +4789,15 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   const usedStockUrls = new Set();
   let stockDedupSkips = 0;
   let stockDedupForcedRepeats = 0;
+
+  // ─── Phase 6a: scene-driven sourcing branch ────────────────────────
+  if (sceneDrivenActive) {
+    console.log(`[scene-driven] sourcing one asset per scene (${scenes.length} scenes vs ${rawBeats.length} beats) — Kling AI hero video pass SKIPPED`);
+    footage = await sourceScenesAndBuildFootage({
+      scenes, rawBeats, channelId, blocklist, aiImageBudget, usedStockUrls, jobRef, baseProgress, span,
+    });
+  } else {
+  // ─── Existing per-beat sourcing loop (v6 production path) ─────────
   for (let i = 0; i < rawBeats.length; i++) {
     const beat = rawBeats[i];
     const keywords = beat.keywords || [];
@@ -4777,6 +4927,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     });
     console.log(`beat ${i + 1}: ${source || 'NO MATCH'}${beat.heroMoment ? ' [HERO]' : ''}${beat.sfx?.length ? ` [+${beat.sfx.length} sfx]` : ''}`);
   }
+  } // end else (per-beat path)
 
   const perBeatSourcingMs = Date.now() - perBeatT0;
   // Tally where each beat's footage came from for transparency.
@@ -4803,7 +4954,12 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   const aiVideoT0 = Date.now();
   // aiCfg already loaded at top of function (with aiVideoOverride applied).
   let aiVideoStats = {clipsGenerated: 0, costUsd: 0, skippedDueBudget: 0};
-  if (aiCfg.enabled && aiCfg.mode !== 'disabled') {
+  // Phase 6a: scene-driven path skips Kling AI video — abstract/hero
+  // scenes use fal.ai Nano Banana 2 images instead (cheaper, no 5s
+  // clip-looping problem on longer scenes).
+  if (sceneDrivenActive) {
+    console.log(`[ai-video] scene-driven path active — Kling pass skipped (fal.ai NB2 handles ai_generated scenes)`);
+  } else if (aiCfg.enabled && aiCfg.mode !== 'disabled') {
     let candidates = [];
     if (aiCfg.mode === 'fallback-only') {
       // Beats where every Pexels candidate failed validation.
