@@ -317,16 +317,16 @@ const BEATS_TOOL = {
                   type: {
                     type: 'string',
                     enum: [
-                      'stat', 'lowerThird', 'quote',                                             // legacy types still in active use
+                      'lowerThird', 'quote',                                                     // legacy types still in active use
                       'bigStat',                                                                 // headline number; auto-animates count-up when text is parseable
                       'lottie',                                                                  // Lottie animation (scaffold — needs assets registered)
                       'entityPortrait',                                                          // server-injected, do not place manually
                     ],
-                    description: 'Overlay type. Pick: bigStat for headline numbers (the renderer auto-animates a 0→target count-up when the text parses as ≥$1B currency or ≥20% percent — no separate countUp type, just supply the final number string), lowerThird for source attribution, quote for cited statements, stat for small corner badges. entityPortrait is server-injected from beat.entities — do NOT place manually. lottie is scaffolded but no asset library yet — do NOT place manually until told otherwise.',
+                    description: 'Overlay type. Pick: bigStat for headline numbers (the renderer auto-animates a 0→target count-up when the text parses as ≥$1B currency or ≥20% percent — no separate countUp type, just supply the final number string), lowerThird for source attribution, quote for cited statements. entityPortrait is server-injected from beat.entities — do NOT place manually. lottie is scaffolded but no asset library yet — do NOT place manually until told otherwise.',
                   },
                   name: {type: 'string', maxLength: 80, description: 'entityPortrait only (server-injected): entity name label.'},
                   entityType: {type: 'string', enum: ['person', 'company', 'place', 'event'], description: 'entityPortrait only (server-injected): drives layout treatment.'},
-                  text: {type: 'string', maxLength: 80, description: 'Used by: stat, lowerThird, quote, bigStat (the headline number). For bigStat use symbols ($2.4T not $2,400,000,000,000). Max 80 chars.'},
+                  text: {type: 'string', maxLength: 80, description: 'Used by: lowerThird, quote, bigStat (the headline number). For bigStat use symbols ($2.4T not $2,400,000,000,000). Max 80 chars.'},
                   position: {type: 'string', enum: ['topLeft', 'topRight', 'bottomLeft', 'bottomRight', 'center', 'top', 'bottom'], description: 'For legacy types: corner anchor. For bigStat: center | top | bottom. For tickerSymbol: typically topRight. Avoid bottom-* on legacy types when captions occupy the lower-third.'},
                   startOffset: {type: 'number', description: 'Seconds from beat.start.'},
                   duration: {type: 'number', description: 'Seconds the overlay stays visible. 2-5s for bigStat, 1.5-3s for others.'},
@@ -1239,7 +1239,236 @@ const TIMING_TAG_TYPES = ['entity-mention', 'stat-emphasis', 'emotional-peak', '
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_AUDIO_MAX_BYTES = 10 * 1024 * 1024; // 10 MB hard cap per ops spec
 const GEMINI_AUDIO_MAX_SEC = 300;                // 5-minute hard cap per ops spec
-async function getGeminiTimingTags(voiceoverUrl, captions, geminiKey) {
+// Inner helper: ONE Gemini call against an in-memory audio buffer + the
+// captions covering that buffer. Caller (single-call OR chunked path)
+// is responsible for: fetching/decoding the audio, applying any time
+// offset to returned tags, and the GEMINI_API_KEY / voiceoverUrl gating
+// upstream. Captions passed here may be the FULL caption list (transcript
+// is sliced to first 60 internally regardless).
+async function callGeminiOnce({audioBuf, mimeType, captions, geminiKey, label = 'gemini'}) {
+  const audioMB = audioBuf.length / 1024 / 1024;
+  if (audioBuf.length > GEMINI_AUDIO_MAX_BYTES) {
+    console.warn(`[${label}] audio ${audioMB.toFixed(2)}MB exceeds ${GEMINI_AUDIO_MAX_BYTES / 1024 / 1024}MB per-call cap — returning []`);
+    return [];
+  }
+  const t0 = Date.now();
+  // Compact transcript — first 30 captions or so is plenty for the
+  // model to align timestamps; full caption array would balloon
+  // input tokens for long voiceovers.
+  const transcriptLines = (captions || []).slice(0, 60).map((c) => {
+    const t = (c.start || 0).toFixed(1);
+    const txt = (c.text || c.sentence || '').slice(0, 200);
+    return `[${t}s] ${txt}`;
+  }).join('\n');
+  const prompt = `You are analyzing a voiceover for a finance/news YouTube short. Identify timestamped moments that should drive on-screen overlay placement.
+
+Return a JSON array. Each entry is exactly:
+  {"timestamp": <seconds, float>, "tag": <one of: ${TIMING_TAG_TYPES.join(', ')}>, "snippet": <≤80 chars of the spoken phrase at that moment>}
+
+Tag definitions:
+- entity-mention: a named person, company, or organization is spoken (e.g., "Jerome Powell", "Goldman Sachs"). Tag the moment the name STARTS.
+- stat-emphasis: a specific number, dollar amount, or percentage is delivered with vocal emphasis (e.g., "$1.5 trillion", "47 percent"). Tag the moment the number STARTS.
+- emotional-peak: a vocal energy spike, dramatic pause-then-reveal, or rhetorically loaded line. Tag the peak instant.
+- natural-pause: a clear breath / sentence-boundary gap ≥0.4s where an overlay can enter or exit cleanly. Tag the start of the pause.
+
+Aim for 8-25 tags total for a 3-7 minute voiceover. Skip filler words. Prefer high-signal moments over coverage.
+
+Output ONLY the JSON array — no prose, no markdown fences. If no tags found, return [].
+
+Transcript with start timestamps:
+${transcriptLines}`;
+
+  const body = {
+    contents: [{
+      role: 'user',
+      parts: [
+        {text: prompt},
+        {inlineData: {mimeType, data: audioBuf.toString('base64')}},
+      ],
+    }],
+    generationConfig: {
+      temperature: 0.2,
+      responseMimeType: 'application/json',
+    },
+  };
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`;
+  const apiT0 = Date.now();
+  console.log(`[${label}] POST → ${GEMINI_MODEL} (audio=${audioMB.toFixed(2)}MB, mimeType=${mimeType}, transcriptChars=${transcriptLines.length})`);
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const apiMs = Date.now() - apiT0;
+  if (!resp.ok) {
+    const text = await resp.text();
+    console.warn(`[${label}] HTTP ${resp.status} ${resp.statusText} after ${apiMs}ms — body: ${text.slice(0, 500)}`);
+    return [];
+  }
+  const data = await resp.json();
+  const usage = data?.usageMetadata;
+  if (usage) console.log(`[${label}] response in ${apiMs}ms — usage: prompt=${usage.promptTokenCount} response=${usage.candidatesTokenCount} total=${usage.totalTokenCount}`);
+  const finishReason = data?.candidates?.[0]?.finishReason;
+  if (finishReason && finishReason !== 'STOP') {
+    console.warn(`[${label}] non-STOP finishReason="${finishReason}" — model may have refused or truncated. Returns [].`);
+    return [];
+  }
+  const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!raw) {
+    console.warn(`[${label}] empty response body — full response: ${JSON.stringify(data).slice(0, 500)}. Returns [].`);
+    return [];
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    console.warn(`[${label}] JSON parse failed: ${e.message} — body: ${raw.slice(0, 300)}. Returns [].`);
+    return [];
+  }
+  if (!Array.isArray(parsed)) {
+    console.warn(`[${label}] response is not an array (got ${typeof parsed}) — body: ${raw.slice(0, 300)}. Returns [].`);
+    return [];
+  }
+  // Validate + clamp to known tag types. Drop entries with bad shape.
+  const validTagSet = new Set(TIMING_TAG_TYPES);
+  const tags = parsed.filter((t) =>
+    t && typeof t.timestamp === 'number' && t.timestamp >= 0
+    && typeof t.tag === 'string' && validTagSet.has(t.tag),
+  ).map((t) => ({
+    timestamp: t.timestamp,
+    tag: t.tag,
+    snippet: typeof t.snippet === 'string' ? t.snippet.slice(0, 80) : '',
+  }));
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  if (tags.length === 0) {
+    console.warn(`[${label}] returned 0 tags after parse (parsed array length=${parsed.length}) — model returned a JSON array but every entry failed shape validation. Raw first item: ${JSON.stringify(parsed[0] || null).slice(0, 200)}`);
+  }
+  console.log(`[${label}] ${tags.length} tags in ${elapsed}s`);
+  return tags;
+}
+
+// Caption-boundary chunking. Produces chunks ≤ maxChunkSec long, splitting
+// at the LAST caption that fits. Each returned chunk has a sliced caption
+// list whose timestamps are still on the original (absolute) timeline —
+// callers offset returned tags by chunk.startSec when merging.
+function buildGeminiChunkBoundaries(captions, maxChunkSec) {
+  if (!Array.isArray(captions) || captions.length === 0) return [];
+  const chunks = [];
+  let chunkStartSec = 0;
+  let chunkStartIdx = 0;
+  for (let i = 0; i < captions.length; i++) {
+    const cEnd = captions[i].end || 0;
+    if (cEnd - chunkStartSec > maxChunkSec) {
+      // captions[i] doesn't fit. Close chunk at i-1 (or i if i is the
+      // first caption of this chunk — caption itself longer than the
+      // budget; ship it as a single-item chunk and let Gemini deal).
+      const lastIdx = i > chunkStartIdx ? i - 1 : i;
+      const endSec = captions[lastIdx].end || 0;
+      chunks.push({
+        startSec: chunkStartSec,
+        endSec,
+        captions: captions.slice(chunkStartIdx, lastIdx + 1),
+      });
+      chunkStartSec = endSec;
+      chunkStartIdx = lastIdx + 1;
+      if (lastIdx === i) continue; // already placed; advance
+      i--; // re-process captions[i] in the new chunk
+    }
+  }
+  if (chunkStartIdx < captions.length) {
+    chunks.push({
+      startSec: chunkStartSec,
+      endSec: captions[captions.length - 1].end || 0,
+      captions: captions.slice(chunkStartIdx),
+    });
+  }
+  return chunks;
+}
+
+// Chunked path: split the voiceover at sentence boundaries, send each
+// chunk to Gemini in parallel, offset returned timestamps back onto the
+// global timeline. Used for voiceovers > GEMINI_AUDIO_MAX_SEC. Gated
+// behind useStagingRender (day-12) until staging verifies long-video
+// behavior end-to-end.
+async function getGeminiTimingTagsChunked(voiceoverUrl, captions, geminiKey, audioDurSec) {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const os = require('node:os');
+  const t0 = Date.now();
+  const chunks = buildGeminiChunkBoundaries(captions, GEMINI_AUDIO_MAX_SEC - 20);
+  if (chunks.length === 0) {
+    console.warn('[gemini-chunked] zero chunks built — returning []');
+    return [];
+  }
+  console.log(`[gemini-chunked] splitting ${audioDurSec.toFixed(0)}s voiceover into ${chunks.length} chunk(s): ${chunks.map((c, i) => `${i + 1}:${c.startSec.toFixed(0)}-${c.endSec.toFixed(0)}s`).join(', ')}`);
+  // Fetch full audio once
+  const audioResp = await fetch(voiceoverUrl);
+  if (!audioResp.ok) {
+    console.warn(`[gemini-chunked] voiceover fetch failed: ${audioResp.status} ${audioResp.statusText} — returning []`);
+    return [];
+  }
+  const fullBytes = Buffer.from(await audioResp.arrayBuffer());
+  console.log(`[gemini-chunked] fetched ${(fullBytes.length / 1024 / 1024).toFixed(2)}MB`);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-chunked-'));
+  try {
+    const fullPath = path.join(tmpDir, 'full.audio');
+    fs.writeFileSync(fullPath, fullBytes);
+    // For each chunk: ffmpeg-cut to a small mono 64kbps mp3 (keeps each
+    // chunk well under GEMINI_AUDIO_MAX_BYTES; quality drop is fine, the
+    // model needs timing not fidelity), then call Gemini in parallel.
+    const chunkPromises = chunks.map(async (chunk, i) => {
+      const label = `gemini-chunk ${i + 1}/${chunks.length}`;
+      const chunkPath = path.join(tmpDir, `chunk-${i}.mp3`);
+      const segDur = chunk.endSec - chunk.startSec;
+      try {
+        await runFfmpeg([
+          '-y',
+          '-i', fullPath,
+          '-ss', String(chunk.startSec),
+          '-t', String(segDur),
+          '-c:a', 'libmp3lame',
+          '-b:a', '64k',
+          '-ac', '1',
+          chunkPath,
+        ], {label, timeoutMs: 60000});
+      } catch (e) {
+        console.warn(`[${label}] ffmpeg cut failed: ${e.message} — skipping chunk`);
+        return [];
+      }
+      const chunkBuf = fs.readFileSync(chunkPath);
+      // Rebase chunk captions to local time (Gemini sees [0..segDur]
+      // not [chunk.startSec..chunk.endSec]); we add chunk.startSec back
+      // to returned tag timestamps.
+      const localCaptions = chunk.captions.map((c) => ({
+        ...c,
+        start: Math.max(0, (c.start || 0) - chunk.startSec),
+        end: Math.max(0, (c.end || 0) - chunk.startSec),
+      }));
+      const tags = await callGeminiOnce({
+        audioBuf: chunkBuf,
+        mimeType: 'audio/mpeg',
+        captions: localCaptions,
+        geminiKey,
+        label,
+      });
+      return tags.map((t) => ({...t, timestamp: t.timestamp + chunk.startSec}));
+    });
+    const tagsByChunk = await Promise.all(chunkPromises);
+    const merged = tagsByChunk.flat().sort((a, b) => a.timestamp - b.timestamp);
+    const breakdown = {};
+    for (const t of merged) breakdown[t.tag] = (breakdown[t.tag] || 0) + 1;
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`[gemini] FINAL: ${merged.length} timing tags in ${elapsed}s (chunked, ${chunks.length} chunks) — ${JSON.stringify(breakdown)}`);
+    return merged;
+  } finally {
+    try { fs.rmSync(tmpDir, {recursive: true, force: true}); } catch { /* ignore */ }
+  }
+}
+
+async function getGeminiTimingTags(voiceoverUrl, captions, geminiKey, opts = {}) {
+  // opts.useStagingRender is no longer read — chunking is now the default
+  // for any voiceover > GEMINI_AUDIO_MAX_SEC. Kept on the signature for
+  // back-compat with the caller that still passes it.
   // Production failure mode (2026-05-15): geminiTagCount: 0 in prod
   // logs with no explanation. Every code path now logs entry + exit so
   // we can audit why a 0-tag result happened.
@@ -1257,8 +1486,15 @@ async function getGeminiTimingTags(voiceoverUrl, captions, geminiKey) {
     return [];
   }
   if (audioDurSec > GEMINI_AUDIO_MAX_SEC) {
-    console.warn(`[gemini] voiceover ${audioDurSec.toFixed(0)}s exceeds ${GEMINI_AUDIO_MAX_SEC}s cap — skipping (chunking not yet wired). Returns [].`);
-    return [];
+    // Chunking is now the default (day-12 promoted from staging-only).
+    // Splits long voiceovers at sentence boundaries, parallel-calls
+    // Gemini per chunk, merges results. Both v6 prod and v7 staging use this.
+    try {
+      return await getGeminiTimingTagsChunked(voiceoverUrl, captions, geminiKey, audioDurSec);
+    } catch (e) {
+      console.warn(`[gemini-chunked] EXCEPTION: ${e.message} — falling through to []`);
+      return [];
+    }
   }
   const t0 = Date.now();
   try {
@@ -1280,99 +1516,10 @@ async function getGeminiTimingTags(voiceoverUrl, captions, geminiKey) {
       : ct.includes('ogg') ? 'audio/ogg'
       : ct.includes('flac') ? 'audio/flac'
       : 'audio/wav';
-    // Compact transcript — first 30 captions or so is plenty for the
-    // model to align timestamps; full caption array would balloon
-    // input tokens for long voiceovers.
-    const transcriptLines = (captions || []).slice(0, 60).map((c) => {
-      const t = (c.start || 0).toFixed(1);
-      const txt = (c.text || c.sentence || '').slice(0, 200);
-      return `[${t}s] ${txt}`;
-    }).join('\n');
-    const prompt = `You are analyzing a voiceover for a finance/news YouTube short. Identify timestamped moments that should drive on-screen overlay placement.
-
-Return a JSON array. Each entry is exactly:
-  {"timestamp": <seconds, float>, "tag": <one of: ${TIMING_TAG_TYPES.join(', ')}>, "snippet": <≤80 chars of the spoken phrase at that moment>}
-
-Tag definitions:
-- entity-mention: a named person, company, or organization is spoken (e.g., "Jerome Powell", "Goldman Sachs"). Tag the moment the name STARTS.
-- stat-emphasis: a specific number, dollar amount, or percentage is delivered with vocal emphasis (e.g., "$1.5 trillion", "47 percent"). Tag the moment the number STARTS.
-- emotional-peak: a vocal energy spike, dramatic pause-then-reveal, or rhetorically loaded line. Tag the peak instant.
-- natural-pause: a clear breath / sentence-boundary gap ≥0.4s where an overlay can enter or exit cleanly. Tag the start of the pause.
-
-Aim for 8-25 tags total for a 3-7 minute voiceover. Skip filler words. Prefer high-signal moments over coverage.
-
-Output ONLY the JSON array — no prose, no markdown fences. If no tags found, return [].
-
-Transcript with start timestamps:
-${transcriptLines}`;
-
-    const body = {
-      contents: [{
-        role: 'user',
-        parts: [
-          {text: prompt},
-          {inlineData: {mimeType, data: audioBuf.toString('base64')}},
-        ],
-      }],
-      generationConfig: {
-        temperature: 0.2,
-        responseMimeType: 'application/json',
-      },
-    };
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`;
-    const apiT0 = Date.now();
-    console.log(`[gemini] POST → ${GEMINI_MODEL} (audio=${audioMB.toFixed(2)}MB, mimeType=${mimeType}, transcriptChars=${transcriptLines.length})`);
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
-    const apiMs = Date.now() - apiT0;
-    if (!resp.ok) {
-      const text = await resp.text();
-      console.warn(`[gemini] HTTP ${resp.status} ${resp.statusText} after ${apiMs}ms — body: ${text.slice(0, 500)}`);
-      return [];
-    }
-    const data = await resp.json();
-    const usage = data?.usageMetadata;
-    if (usage) console.log(`[gemini] response in ${apiMs}ms — usage: prompt=${usage.promptTokenCount} response=${usage.candidatesTokenCount} total=${usage.totalTokenCount}`);
-    const finishReason = data?.candidates?.[0]?.finishReason;
-    if (finishReason && finishReason !== 'STOP') {
-      console.warn(`[gemini] non-STOP finishReason="${finishReason}" — model may have refused or truncated. Returns [].`);
-      return [];
-    }
-    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!raw) {
-      console.warn(`[gemini] empty response body — full response: ${JSON.stringify(data).slice(0, 500)}. Returns [].`);
-      return [];
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (e) {
-      console.warn(`[gemini] JSON parse failed: ${e.message} — body: ${raw.slice(0, 300)}. Returns [].`);
-      return [];
-    }
-    if (!Array.isArray(parsed)) {
-      console.warn(`[gemini] response is not an array (got ${typeof parsed}) — body: ${raw.slice(0, 300)}. Returns [].`);
-      return [];
-    }
-    // Validate + clamp to known tag types. Drop entries with bad shape.
-    const validTagSet = new Set(TIMING_TAG_TYPES);
-    const tags = parsed.filter((t) =>
-      t && typeof t.timestamp === 'number' && t.timestamp >= 0
-      && typeof t.tag === 'string' && validTagSet.has(t.tag),
-    ).map((t) => ({
-      timestamp: t.timestamp,
-      tag: t.tag,
-      snippet: typeof t.snippet === 'string' ? t.snippet.slice(0, 80) : '',
-    }));
-    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    const tags = await callGeminiOnce({audioBuf, mimeType, captions, geminiKey, label: 'gemini'});
     const breakdown = {};
     for (const t of tags) breakdown[t.tag] = (breakdown[t.tag] || 0) + 1;
-    if (tags.length === 0) {
-      console.warn(`[gemini] returned 0 tags after parse (parsed array length=${parsed.length}) — model returned a JSON array but every entry failed shape validation. Raw first item: ${JSON.stringify(parsed[0] || null).slice(0, 200)}`);
-    }
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
     console.log(`[gemini] FINAL: ${tags.length} timing tags in ${elapsed}s — ${JSON.stringify(breakdown)}`);
     return tags;
   } catch (e) {
@@ -1812,7 +1959,7 @@ sfx schema per beat: {tag, offset}. Tag must be one of "whoosh", "transition", "
 
 STEP 4 — Visual overlays. SCARCITY MODEL — overlays are RARE and PUNCTUAL. AT MOST 1 overlay per beat (the schema enforces this; the prompt enforces the spirit). The vast majority of beats should carry ZERO overlays — voiceover + footage + captions are the baseline; an overlay is an EXCEPTION reserved for moments that genuinely demand visual emphasis. Target: 1 overlay per 3-5 seconds of video. A 5-minute video has 6-10 well-placed overlays, NOT 15-20. Two adjacent beats with overlays read as chaos; the server enforces a 1.5s minimum gap between overlays and DROPS any that fail it.
 
-When TO place an overlay: the beat's hero moment carries a single specific stat ($1.5T, +47%) → bigStat; a beat is built around a clearly-attributed quote → quote (paired to entityPortrait, source REQUIRED); rarely, a beat needs an explicit source label that no entity will visualize → lowerThird. When NOT to place: any beat already with a strong entityPortrait (named person/company in beat.entities), any beat that's transitional narration, any beat where the visual would compete with the spoken word. PREFER bigStat over the legacy 'stat' type for any standalone number that deserves emphasis. Empty overlays array is the right answer for most beats.
+When TO place an overlay: the beat's hero moment carries a single specific stat ($1.5T, +47%) → bigStat; a beat is built around a clearly-attributed quote → quote (paired to entityPortrait, source REQUIRED); rarely, a beat needs an explicit source label that no entity will visualize → lowerThird. When NOT to place: any beat already with a strong entityPortrait (named person/company in beat.entities), any beat that's transitional narration, any beat where the visual would compete with the spoken word. Empty overlays array is the right answer for most beats.
 
 OVERLAY TYPES — pick the type that matches the trigger, then fill the type-specific fields.
 
@@ -1833,9 +1980,6 @@ OVERLAY TYPES — pick the type that matches the trigger, then fill the type-spe
 - 'quote' — CITED QUOTE. Use ONLY when paraphrasing a statement attributable to a named person or organization. Renders as an italic card directly UNDER the entityPortrait of that source — never standalone, never centered. The \`source\` field MUST match a name in beat.entities (so the entityPortrait gets injected and the quote pairs to it). Quotes without a matching same-beat entityPortrait are dropped server-side.
   REQUIRED: text, source (the named entity). DO NOT supply position — the quote always anchors under the portrait. Duration: 3-5s.
 
-- 'stat' — SMALL CORNER BADGE. Use only if bigStat would be too dominant.
-  REQUIRED: text. Position 'topRight'/'topLeft'. Duration: 2-3s.
-
 NOTE on entity portraits: do NOT place 'entityPortrait' overlays manually. Instead, list named people / companies on beat.entities — the pipeline server-injects a Wikipedia portrait overlay in the top-right corner automatically.
 
 OVERLAY PLACEMENT GUIDANCE:
@@ -1846,9 +1990,8 @@ OVERLAY PLACEMENT GUIDANCE:
 
 GENERAL RULES:
 - Max 1 overlay per beat (the maxItems cap). Most beats should have zero.
-- Use symbols ($2.4T, 47%, 100K) not full numbers in bigStat/stat/comparison.
+- Use symbols ($2.4T, 47%, 100K) not full numbers in bigStat/comparison.
 - One concept per overlay. Don't cram.
-- PREFER bigStat over the legacy 'stat' type for any standalone number.
 
 TIMING:
 - startOffset: seconds from beat.start. 0 = at beat start.
@@ -1882,7 +2025,7 @@ ${JSON.stringify(sentences)}${await (async () => {
   }
   if (insights?.retentionDropoffPattern && typeof insights.retentionDropoffPattern.typicalDropoffPercent === 'number') {
     const x = insights.retentionDropoffPattern.typicalDropoffPercent;
-    guidance += `\n- This channel's audience typically drops off around the ${x}% mark of past videos. Counter this: at the beat covering the ${x}% timestamp of THIS video, prefer heroMoment=true; consider an SFX impact + a stat overlay there. Strong hook in the first 30s is critical.`;
+    guidance += `\n- This channel's audience typically drops off around the ${x}% mark of past videos. Counter this: at the beat covering the ${x}% timestamp of THIS video, prefer heroMoment=true; consider an SFX impact + a bigStat overlay there. Strong hook in the first 30s is critical.`;
   }
   if (Array.isArray(insights?.trendingTopics) && insights.trendingTopics.length) {
     guidance += `\n- Trending search terms for this channel: ${insights.trendingTopics.slice(0, 5).join(', ')}. Use related visual keywords in beats where the script naturally touches these.`;
@@ -1908,7 +2051,7 @@ ${JSON.stringify(sentences)}${await (async () => {
       const bits = [];
       if (p.introHookByXSec) bits.push(`hook payoff by ${p.introHookByXSec}s`);
       if (p.sustainedSectionLength) bits.push(`sustained sections: ${p.sustainedSectionLength}`);
-      if (p.statRevealTiming) bits.push(`stat reveals best at ${p.statRevealTiming} mark — drop a stat overlay there`);
+      if (p.statRevealTiming) bits.push(`stat reveals best at ${p.statRevealTiming} mark — drop a bigStat overlay there`);
       if (bits.length) guidance += `\n- Pacing: ${bits.join('; ')}.`;
     }
     if (Array.isArray(fp.spikeWordPatterns) && fp.spikeWordPatterns.length) {
@@ -1938,7 +2081,7 @@ ${JSON.stringify(sentences)}${await (async () => {
     const allCliffs = videos.flatMap(v => (v.cliffDrops || []).map(c => c.x)).filter(x => typeof x === 'number');
     if (allCliffs.length >= 3) {
       const avgCliff = Math.round((allCliffs.reduce((s, x) => s + x, 0) / allCliffs.length) * 100);
-      guidance += `\n- HISTORICAL CLIFF DROPS cluster around the ${avgCliff}% mark across ${videos.length} top videos. Defend this position in THIS video: heroMoment=true at the ~${avgCliff}% beat, SFX impact, stat overlay if any number is spoken there.`;
+      guidance += `\n- HISTORICAL CLIFF DROPS cluster around the ${avgCliff}% mark across ${videos.length} top videos. Defend this position in THIS video: heroMoment=true at the ~${avgCliff}% beat, SFX impact, bigStat overlay if any number is spoken there.`;
     }
   }
 
@@ -3041,12 +3184,16 @@ async function clipAudioToFirebase(localInputPath, segStart, segDur, storagePath
   const path = require('node:path');
   const os = require('node:os');
   const tmpOut = path.join(os.tmpdir(), `seg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp3`);
-  // -ss AFTER -i (output-side seek) is required when -stream_loop is
-  // active — input-side seek doesn't compose cleanly with the loop.
+  // Loop with `aloop` (sample-level) instead of `-stream_loop` (PTS-level).
+  // -stream_loop produces a fresh stream each iteration with reset PTS,
+  // which the muxer fills with audible silence (~2.3s gap per loop
+  // boundary verified by silencedetect). aloop loops AFTER the decode
+  // step so output samples are continuous — no boundary, no gap.
+  // size=2e9 = ~12.5h buffer at 44.1kHz mono, plenty for any video length.
   await runFfmpeg([
     '-y',
-    '-stream_loop', '-1',
     '-i', localInputPath,
+    '-af', 'aloop=loop=-1:size=2e9',
     '-ss', String(segStart),
     '-t', String(segDur),
     '-c:a', 'libmp3lame',
@@ -4097,6 +4244,21 @@ async function probeUrl(url, {expectImage = false} = {}) {
     clearTimeout(timer);
   }
 }
+// Single-retry wrapper around probeUrl. Wikipedia / image CDNs occasionally
+// return HTTP 429 under sporadic load — a 5-second wait usually clears it.
+// Used by the preflight validator so a transient 429 doesn't burn a $5
+// Lambda render or force the user to manually press Resume.
+async function probeUrlWithRetry(url, opts = {}) {
+  const first = await probeUrl(url, opts);
+  if (first.ok) return first;
+  await new Promise((r) => setTimeout(r, 5000));
+  const second = await probeUrl(url, opts);
+  if (second.ok) {
+    return {ok: true, retried: true, firstReason: first.reason};
+  }
+  return {ok: false, reason: `${first.reason} → retry: ${second.reason}`};
+}
+
 // Defensive music URL resolver. The dynamic music pipeline (Claude pick →
 // mood-random → channel/global library) can return null when Firestore
 // has no usable tracks for a mood, when the channel pool is empty, or
@@ -4151,31 +4313,62 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
     }
   }
 
-  // ─ URL probes (parallel) ─
+  // ─ URL probes (parallel, with single retry on transient failures) ─
+  // Failure handling is split by criticality:
+  //   - voiceover / footage / music → critical: failure aborts the render
+  //     ($5+ wasted Lambda is worse than a slightly-degraded render)
+  //   - overlay imageUrl → degradable: failure drops just that overlay
+  //     and the render proceeds. An overlay is an enhancement; one missing
+  //     entityPortrait beats the whole render failing on a single Wikipedia
+  //     429 (which is what burned job nGNkm7Trin6ZTdTefohn on day-11).
   const probeJobs = [];
-  if (voiceoverUrl) probeJobs.push(probeUrl(voiceoverUrl).then((r) => ({label: 'voiceover', url: voiceoverUrl, ...r})));
-  // Music is allowed to be absent in inputProps (rare path) but if present
-  // it must be reachable. ensureMusicUrl() upstream guarantees a fallback,
-  // so this probe is defense-in-depth: catches the case where even the
-  // hardcoded fallback URL is unreachable (S3 outage, project rename, etc).
-  if (musicUrl) probeJobs.push(probeUrl(musicUrl).then((r) => ({label: 'music', url: musicUrl, ...r})));
+  if (voiceoverUrl) probeJobs.push(probeUrlWithRetry(voiceoverUrl).then((r) => ({label: 'voiceover', kind: 'critical', url: voiceoverUrl, ...r})));
+  if (musicUrl) probeJobs.push(probeUrlWithRetry(musicUrl).then((r) => ({label: 'music', kind: 'critical', url: musicUrl, ...r})));
   for (const f of footage || []) {
-    if (f?.url) probeJobs.push(probeUrl(f.url).then((r) => ({label: `footage[${f.beatIndex ?? '?'}]`, url: f.url, ...r})));
+    if (f?.url) probeJobs.push(probeUrlWithRetry(f.url).then((r) => ({label: `footage[${f.beatIndex ?? '?'}]`, kind: 'critical', url: f.url, ...r})));
   }
+  // Overlay probes carry their index so we can splice failures from
+  // overlayLayer in place (the array reference passed via inputProps is
+  // the same one the caller hands to the Lambda renderer).
   for (let i = 0; i < (overlayLayer || []).length; i++) {
     const ov = overlayLayer[i];
-    if (ov?.imageUrl) probeJobs.push(probeUrl(ov.imageUrl, {expectImage: true}).then((r) => ({label: `overlay[${i}].imageUrl (${ov.type})`, url: ov.imageUrl, ...r})));
+    if (ov?.imageUrl) {
+      probeJobs.push(probeUrlWithRetry(ov.imageUrl, {expectImage: true}).then((r) => ({
+        label: `overlay[${i}].imageUrl (${ov.type})`,
+        kind: 'overlay',
+        overlayIndex: i,
+        overlayDescriptor: `${ov.type}${ov.name ? ` "${ov.name}"` : ''}`,
+        url: ov.imageUrl,
+        ...r,
+      })));
+    }
   }
   const probeResults = await Promise.all(probeJobs);
+  // Two passes: collect critical failures into errors, collect overlay
+  // failures into a drop-list so we splice high-to-low (preserves indices).
+  const overlayDropIndices = [];
+  let retriedCount = 0;
   for (const r of probeResults) {
-    if (!r.ok) errors.push(`URL probe failed — ${r.label}: ${r.reason} (${r.url.slice(0, 100)})`);
+    if (r.retried) retriedCount++;
+    if (r.ok) continue;
+    if (r.kind === 'overlay') {
+      overlayDropIndices.push(r.overlayIndex);
+      warnings.push(`dropped overlay[${r.overlayIndex}] (${r.overlayDescriptor}): probe failed — ${r.reason}`);
+    } else {
+      errors.push(`URL probe failed — ${r.label}: ${r.reason} (${r.url.slice(0, 100)})`);
+    }
+  }
+  // Splice high-to-low so indices stay valid as we remove.
+  if (overlayDropIndices.length && Array.isArray(overlayLayer)) {
+    overlayDropIndices.sort((a, b) => b - a);
+    for (const idx of overlayDropIndices) overlayLayer.splice(idx, 1);
   }
 
   const ok = errors.length === 0;
-  console.log(`[preflight] ${jobId}: ok=${ok} probes=${probeResults.length} errors=${errors.length} warnings=${warnings.length}`);
+  console.log(`[preflight] ${jobId}: ok=${ok} probes=${probeResults.length} errors=${errors.length} warnings=${warnings.length} retries=${retriedCount} overlaysDropped=${overlayDropIndices.length}`);
   if (warnings.length) console.warn(`[preflight] ${jobId} warnings:\n  - ${warnings.join('\n  - ')}`);
   if (errors.length) console.warn(`[preflight] ${jobId} errors:\n  - ${errors.join('\n  - ')}`);
-  return {ok, errors, warnings, probesRun: probeResults.length};
+  return {ok, errors, warnings, probesRun: probeResults.length, overlaysDropped: overlayDropIndices.length};
 }
 
 async function renderOnLambda(inputProps, jobRef, {progressLabel = 'Rendering on Lambda', useStagingRender = false} = {}) {
@@ -4878,7 +5071,9 @@ async function processJob(job) {
     currentStep: 'Analyzing voiceover timing with Gemini',
     updatedAt: FieldValue.serverTimestamp(),
   });
-  const timingTags = await getGeminiTimingTags(voiceoverUrl, captions, process.env.GEMINI_API_KEY);
+  const timingTags = await getGeminiTimingTags(voiceoverUrl, captions, process.env.GEMINI_API_KEY, {
+    useStagingRender: !!job.useStagingRender,
+  });
   const timingMs = Date.now() - timingT0;
   await jobRef.update({
     'timings.geminiTimingMs': timingMs,

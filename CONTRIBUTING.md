@@ -140,11 +140,12 @@ if (useStaging) {
 ```
 
 (Example placeholder — no live gated default exists right now. Earlier
-day-11 music-volume gate was reverted after short-test showed 0.06 is
-correct and the v6 "no music" issue had a different root cause. When a
-new gated default is added, it should follow the same shape: a helper
-that branches on `useStagingRender`, with per-channel UI override still
-winning in both branches.)
+day-12 Gemini chunking gate was removed after the v6 "entity timing
+off on long voiceovers" issue was confirmed to need the same fix.
+Chunking is now the default for any voiceover >300s, both v6 and v7.
+When a new gated default is added, it should follow the same shape:
+a helper that branches on `useStagingRender`, with per-channel UI
+override still winning in both branches.)
 
 **B) Remotion-side only** (visual changes that don't touch
 `functions/index.js`):
