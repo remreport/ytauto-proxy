@@ -1264,7 +1264,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readBody(req);
       const p = JSON.parse(body);
-      const { channelId, title, description, videoUrl, thumbnailUrl, tags, privacyStatus, publishAt } = p;
+      const { channelId, title, description, videoUrl, thumbnailUrl, tags, privacyStatus, publishAt, categoryId } = p;
       if (!channelId || !videoUrl) return sendJSON(res, 400, { error: 'channelId and videoUrl required' });
 
       // 1) Load tokens from Firestore
@@ -1310,7 +1310,9 @@ const server = http.createServer(async (req, res) => {
             title: (title || 'Untitled').slice(0, 100),
             description: description || '',
             tags: Array.isArray(tags) ? tags.slice(0, 15) : [],
-            categoryId: '22', // "People & Blogs" — safe default
+            // Day-13 F4: default to Entertainment (24); accept override from body.
+            // Manual UI uploads can pass their own categoryId. Auto-pilot sends 24.
+            categoryId: (typeof categoryId === 'string' && /^\d+$/.test(categoryId)) ? categoryId : '24',
           },
           status,
         },
@@ -1456,6 +1458,58 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       console.error('YouTube unschedule error:', e);
       return sendJSON(res, 500, { error: e.message || 'Unschedule failed' });
+    }
+  }
+
+  // Day-13 F5: bulk YouTube stats lookup for videoPerformance fetcher.
+  // POST /youtube/stats  body: { channelId, videoIds: [string] }
+  // Returns: { ok, stats: [{videoId, views, likes, comments, shares}] }
+  //
+  // Reads channel OAuth tokens from Firestore, calls YouTube Data API
+  // videos.list (part=statistics) for the requested IDs. Up to 50 IDs
+  // per call — caller is responsible for chunking. Uses the same OAuth
+  // scope already in use for /youtube/upload (youtube + youtube.upload);
+  // no extra permission needed.
+  if (req.method === 'POST' && pathname === '/youtube/stats') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const body = await readBody(req);
+      const { channelId, videoIds } = JSON.parse(body);
+      if (!channelId || !Array.isArray(videoIds) || videoIds.length === 0) {
+        return sendJSON(res, 400, { error: 'channelId and videoIds[] required' });
+      }
+      if (videoIds.length > 50) {
+        return sendJSON(res, 400, { error: 'max 50 videoIds per request' });
+      }
+      const snap = await db.collection('channels').doc(channelId).get();
+      if (!snap.exists) return sendJSON(res, 404, { error: 'Channel not found' });
+      const data = snap.data();
+      if (!data.youtubeRefreshToken) return sendJSON(res, 400, { error: 'YouTube not connected for this channel' });
+      const oauth = makeOAuthClient();
+      oauth.setCredentials({
+        refresh_token: data.youtubeRefreshToken,
+        access_token: data.youtubeAccessToken || undefined,
+        expiry_date: data.youtubeTokenExpiry || undefined,
+      });
+      const yt = google.youtube({ version: 'v3', auth: oauth });
+      const resp = await yt.videos.list({ part: ['statistics'], id: videoIds });
+      const items = resp.data.items || [];
+      const stats = items.map((it) => ({
+        videoId: it.id,
+        views: parseInt(it.statistics?.viewCount || '0', 10),
+        likes: parseInt(it.statistics?.likeCount || '0', 10),
+        comments: parseInt(it.statistics?.commentCount || '0', 10),
+        // Shares is not in the statistics object on the Data API — Analytics
+        // API has it but requires extra scope. Return 0 as placeholder; a
+        // future channel-analytics endpoint can populate it from the
+        // already-pulled analytics summary.
+        shares: 0,
+      }));
+      console.log(`[youtube/stats] ch=${channelId} returned stats for ${stats.length}/${videoIds.length} videoIds`);
+      return sendJSON(res, 200, { ok: true, stats });
+    } catch (e) {
+      console.error('YouTube stats error:', e);
+      return sendJSON(res, 500, { error: e.message || 'Stats fetch failed' });
     }
   }
 
