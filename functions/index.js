@@ -8830,6 +8830,9 @@ async function spawnBulkVideo(bulkRun, bulkRunId) {
       currentStage: '0/7',
       stageLabel: 'Queued by bulk auto-pilot',
       updatedAt: FieldValue.serverTimestamp(),
+      // Day-14 Phase 5b: inherit the bulk run's v7-staging choice so
+      // every child project carries the flag through to its editingJob.
+      useStagingRender: !!bulkRun.useStagingRender,
     },
   });
   // Step 2: flip requestStart=true via update — this triggers
@@ -9359,6 +9362,10 @@ exports.autoPilotWorker = onRequest(
             scriptText: proj.script || '',
             projectTitle: proj.title || proj.topic || 'project',
             status: 'pending',
+            // Day-14 Phase 5b: propagate the autopilot's staging flag to
+            // the editingJob doc so processEditingJobHttp routes to v7
+            // (scene plan + multi-source) instead of v6.
+            useStagingRender: !!proj.autoPilot?.useStagingRender,
             createdAt: FieldValue.serverTimestamp(),
           });
           jobId = newJob.id;
