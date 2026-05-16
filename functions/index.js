@@ -58,6 +58,12 @@ const KICKER_SECRET = defineSecret('KICKER_SECRET');
 // degrade silently, so always bind these on processEditingJobHttp.
 const GEMINI_API_KEY = defineSecret('GEMINI_API_KEY');
 const LOGO_DEV_API_KEY = defineSecret('LOGO_DEV_API_KEY');
+// Day-14 Phase 4: fal.ai Nano Banana for ai_generated scene assets.
+// $0.039/image @ 1024x1024, 5-10s latency. Bound on processEditingJobHttp
+// alongside other footage secrets. Graceful no-op if absent — the routing
+// branch will fall through to stock_footage so a missing key never breaks
+// the render. Per-video budget cap enforced inside the helper.
+const FAL_AI_API_KEY = defineSecret('FAL_AI_API_KEY');
 
 // ─── Non-secret config ──────────────────────────────────────────────
 const AWS_REGION = 'us-east-1';
@@ -2614,6 +2620,134 @@ async function wikimediaImageSearchTop(query, n = 3) {
   return out;
 }
 
+// Day-14 Phase 4: fal.ai Nano Banana for ai_generated scenes.
+// Original Nano Banana model — $0.039/image @ 1024x1024, 5-10s latency.
+// Per-video budget cap so a runaway script can't drain monthly budget.
+// SHA256-keyed Firebase Storage cache so re-renders of the same prompt
+// hit cache instead of paying again. Falls back silently on any failure
+// (key missing, API down, budget exceeded) — the caller's existing
+// per-beat sourcing loop catches the null and tries Pexels.
+const AI_IMAGE_BUDGET_PER_VIDEO = 1.00; // USD
+const AI_IMAGE_COST_PER_GENERATION = 0.039; // USD per 1024x1024 fal.ai Nano Banana
+const FAL_AI_NANO_BANANA_URL = 'https://fal.run/fal-ai/nano-banana';
+const AI_IMAGE_STYLE_PREFIX = 'Photorealistic, cinematic lighting, news-documentary style, professional finance/business content. ';
+
+function createAiImageBudgetTracker() {
+  return {spent: 0, generated: 0, cacheHits: 0, skipped: 0, capUsd: AI_IMAGE_BUDGET_PER_VIDEO};
+}
+
+async function generateAiImage({prompt, falApiKey, budgetTracker}) {
+  if (!prompt || typeof prompt !== 'string' || prompt.trim().length < 10) {
+    console.warn('[ai-image] empty/short prompt — skipping');
+    return null;
+  }
+  if (!falApiKey) {
+    console.warn('[ai-image] FAL_AI_API_KEY not set — skipping (will fall back to stock_footage)');
+    return null;
+  }
+  // Locked style prefix for cross-scene consistency.
+  const fullPrompt = AI_IMAGE_STYLE_PREFIX + prompt.trim();
+  // SHA256 cache key over the FULL prompt (style prefix included so a
+  // future prefix change invalidates cleanly).
+  const hash = crypto.createHash('sha256').update(fullPrompt).digest('hex');
+  const cachePath = `aiImages/${hash}.png`;
+  const bucket = admin.storage().bucket();
+  const cacheFile = bucket.file(cachePath);
+  try {
+    const [cacheExists] = await cacheFile.exists();
+    if (cacheExists) {
+      const url = `https://storage.googleapis.com/${bucket.name}/${cachePath}`;
+      budgetTracker.cacheHits++;
+      console.log(`[ai-image] CACHE HIT for prompt hash ${hash.slice(0, 8)} — ${url.split('/').pop()}`);
+      return url;
+    }
+  } catch (e) {
+    console.warn(`[ai-image] cache check failed: ${e.message} — proceeding to generate`);
+  }
+  // Budget check (after cache so cache hits don't count against budget).
+  if (budgetTracker.spent + AI_IMAGE_COST_PER_GENERATION > budgetTracker.capUsd) {
+    budgetTracker.skipped++;
+    console.warn(`[ai-image-budget] budget exceeded $${budgetTracker.spent.toFixed(3)}/$${budgetTracker.capUsd.toFixed(2)} — falling back to stock_footage`);
+    return null;
+  }
+  // Generate via fal.run (sync endpoint — Nano Banana finishes in 5-10s
+  // so we don't need the async queue endpoint).
+  const t0 = Date.now();
+  console.log(`[ai-image] generating: "${prompt.slice(0, 60)}${prompt.length > 60 ? '…' : ''}"`);
+  let imageUrl = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const resp = await fetch(FAL_AI_NANO_BANANA_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Key ${falApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          prompt: fullPrompt,
+          image_size: 'square_hd',
+          num_images: 1,
+          output_format: 'png',
+        }),
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!resp.ok) {
+        const errText = await resp.text();
+        if (resp.status >= 500 && attempt === 1) {
+          console.warn(`[ai-image] fal.ai ${resp.status} on attempt ${attempt} — retrying in 2s`);
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
+        console.warn(`[ai-image] fal.ai ${resp.status}: ${errText.slice(0, 200)}`);
+        return null;
+      }
+      const data = await resp.json();
+      imageUrl = data?.images?.[0]?.url;
+      if (!imageUrl) {
+        console.warn(`[ai-image] fal.ai response missing image url: ${JSON.stringify(data).slice(0, 200)}`);
+        return null;
+      }
+      break;
+    } catch (e) {
+      if (attempt === 1) {
+        console.warn(`[ai-image] fal.ai network error attempt ${attempt}: ${e.message} — retrying`);
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+      console.warn(`[ai-image] fal.ai failed: ${e.message}`);
+      return null;
+    }
+  }
+  if (!imageUrl) return null;
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  // Cache the result to Firebase Storage so Lambda has a stable URL
+  // (fal.ai-hosted URLs may expire).
+  try {
+    const imgResp = await fetch(imageUrl);
+    if (!imgResp.ok) throw new Error(`download ${imgResp.status}`);
+    const {pipeline} = require('node:stream/promises');
+    const {Readable} = require('node:stream');
+    await pipeline(
+      Readable.fromWeb(imgResp.body),
+      cacheFile.createWriteStream({
+        metadata: {contentType: imgResp.headers.get('content-type') || 'image/png'},
+        resumable: false,
+      }),
+    );
+    await cacheFile.makePublic();
+    const cachedUrl = `https://storage.googleapis.com/${bucket.name}/${cachePath}`;
+    budgetTracker.spent += AI_IMAGE_COST_PER_GENERATION;
+    budgetTracker.generated++;
+    console.log(`[ai-image] generated in ${elapsed}s, $${AI_IMAGE_COST_PER_GENERATION.toFixed(3)} spent, cumulative $${budgetTracker.spent.toFixed(3)}/$${budgetTracker.capUsd.toFixed(2)} → ${cachedUrl.split('/').pop()}`);
+    return cachedUrl;
+  } catch (e) {
+    console.warn(`[ai-image] cache upload failed: ${e.message} — returning fal.ai URL directly (may expire mid-render)`);
+    budgetTracker.spent += AI_IMAGE_COST_PER_GENERATION;
+    budgetTracker.generated++;
+    return imageUrl;
+  }
+}
+
 // Validate that a URL is reachable + returns image/* content-type. Parallel
 // to validatePexelsVideo but image-shaped. Used by the per-beat sourcing
 // loop when a wikimedia-image candidate is being committed.
@@ -4216,6 +4350,7 @@ function applyScenesToBeats(rawBeats, scenes) {
         sceneIndex: scene.index,
         assetType: scene.assetType,
         visualConcept: scene.visualConcept,
+        aiPrompt: scene.aiPrompt || null,
       };
       touched++;
     }
@@ -4382,6 +4517,10 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
 
   const perBeatT0 = Date.now();
   const footage = [];
+  // Day-14 Phase 4: per-video AI image budget tracker. Caps spend even
+  // when a script has 20+ ai_generated scenes — extras fall back to
+  // stock_footage automatically.
+  const aiImageBudget = createAiImageBudgetTracker();
   // Per-video stock URL dedup. The previous pipeline picked the top
   // validated Pexels candidate per beat with no awareness of prior
   // beats — for a 122-beat finance video where many beats search
@@ -4409,7 +4548,22 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     let source = null;
     let pexelsAlternates = [];
     const validationFailures = [];
-    if (query) {
+    // Day-14 Phase 4: ai_generated scenes try fal.ai Nano Banana first.
+    // On success (or budget exceeded / API failure) URL is set or we
+    // fall through to the existing per-beat sourcing ladder below.
+    if (beat.scenePlanContext?.assetType === 'ai_generated' && beat.scenePlanContext?.aiPrompt) {
+      const aiUrl = await generateAiImage({
+        prompt: beat.scenePlanContext.aiPrompt,
+        falApiKey: process.env.FAL_AI_API_KEY,
+        budgetTracker: aiImageBudget,
+      });
+      if (aiUrl) {
+        url = aiUrl;
+        source = 'fal-ai-image';
+        usedStockUrls.add(aiUrl);
+      }
+    }
+    if (!url && query) {
       // Multi-source chain: Pexels → Pixabay → Wikimedia → Internet
       // Archive (channel-toggleable). First source returning candidates
       // becomes the source for the beat. Validation pattern unchanged
@@ -4499,7 +4653,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
 
   const perBeatSourcingMs = Date.now() - perBeatT0;
   // Tally where each beat's footage came from for transparency.
-  const footageBySource = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'ai-video': 0, none: 0};
+  const footageBySource = {pexels: 0, pixabay: 0, wikimedia: 0, 'wikimedia-image': 0, archive: 0, 'ai-video': 0, 'fal-ai-image': 0, none: 0};
   for (const b of footage) {
     if (!b) continue;
     const k = b.url ? (b.source || 'none') : 'none';
@@ -4508,8 +4662,12 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   await jobRef.update({
     'timings.perBeatSourcingMs': perBeatSourcingMs,
     'timings.footageBySource': footageBySource,
+    'timings.aiImageBudget': {spent: aiImageBudget.spent, generated: aiImageBudget.generated, cacheHits: aiImageBudget.cacheHits, skipped: aiImageBudget.skipped, capUsd: aiImageBudget.capUsd},
   }).catch(() => {});
   console.log(`  per-beat sourcing total: ${(perBeatSourcingMs / 1000).toFixed(1)}s for ${footage.length} beats — by source: ${JSON.stringify(footageBySource)}`);
+  if (aiImageBudget.generated || aiImageBudget.cacheHits || aiImageBudget.skipped) {
+    console.log(`  [ai-image-budget] generated=${aiImageBudget.generated}, cacheHits=${aiImageBudget.cacheHits}, skipped=${aiImageBudget.skipped}, spent=$${aiImageBudget.spent.toFixed(3)}/$${aiImageBudget.capUsd.toFixed(2)}`);
+  }
 
   // AI video generation pass. Runs between Pexels sourcing and caching
   // so the rest of the pipeline (preflight, render, gap-fill) treats
@@ -9478,6 +9636,7 @@ exports.processEditingJobHttp = onRequest(
       KICKER_SECRET,
       GEMINI_API_KEY,
       LOGO_DEV_API_KEY,
+      FAL_AI_API_KEY,
     ],
   },
   async (req, res) => {
