@@ -1565,6 +1565,102 @@ function parseStatNumber(text) {
   if (/thousand|\bk\b/.test(lower)) return n * 1e3;
   return n;
 }
+
+// Day-13 F2: stronger entity-name normalization for caption matching.
+// Strips corporate suffixes ("Inc", "LLC", "Capital", "Holdings", "Group",
+// etc.) so "Pershing Square Capital" matches "Pershing Square" in the
+// voiceover. Used by findEntityFirstMentionInCaptions + verifyAndScoreOverlays.
+const CORPORATE_SUFFIX_RE = /\b(inc|incorporated|llc|llp|ltd|limited|corp|corporation|company|co|holdings|group|plc|sa|ag|gmbh|capital|partners|associates|chase|securities|bank|holdings)\b\.?/gi;
+function normalizeEntityForMatch(s) {
+  return (s || '')
+    .toLowerCase()
+    .replace(CORPORATE_SUFFIX_RE, '')
+    .replace(/[\s\-_.,'’&]/g, '');
+}
+
+// Levenshtein distance with an early-exit optimization. Used for fuzzy
+// entity matching (≤2 edits) to catch AssemblyAI mishearings like
+// "Powel" / "Powell" or "Goldman Sax" / "Goldman Sachs".
+function levenshtein(a, b) {
+  if (!a || !b) return Math.max((a || '').length, (b || '').length);
+  if (a === b) return 0;
+  const m = a.length, n = b.length;
+  if (Math.abs(m - n) > 4) return Math.abs(m - n);
+  const dp = Array.from({length: m + 1}, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]) + 1;
+    }
+  }
+  return dp[m][n];
+}
+
+// Day-13 F2: walks AssemblyAI's word-level captions (much tighter timing
+// than Gemini tags) to find the first moment an entity is mentioned within
+// a search window. Returns the absolute timestamp (sec) of the first word
+// of the match, or null. Used by verifyAndScoreOverlays to re-anchor
+// entityPortrait/quote/lowerThird overlays to spoken-word timing.
+function findEntityFirstMentionInCaptions(entityName, captions, startSec, endSec) {
+  const target = normalizeEntityForMatch(entityName);
+  if (!target || target.length < 3) return null;
+  for (const sentence of captions || []) {
+    if (!sentence) continue;
+    if (typeof sentence.start === 'number' && sentence.start > endSec) break;
+    if (typeof sentence.end === 'number' && sentence.end < startSec) continue;
+    const words = sentence.words || [];
+    for (let i = 0; i < words.length; i++) {
+      const w0 = words[i];
+      if (typeof w0.start !== 'number') continue;
+      if (w0.start < startSec || w0.start > endSec) continue;
+      // Try concatenating up to 5 consecutive words and check matches.
+      let combined = '';
+      for (let j = i; j < Math.min(i + 5, words.length); j++) {
+        const norm = normalizeEntityForMatch(words[j].text);
+        if (!norm) continue;
+        combined += norm;
+        if (combined === target) return w0.start;
+        if (combined.length >= 4 && combined.includes(target)) return w0.start;
+        // Caption has shorter form of target (e.g. "Powell" vs "Jerome Powell")
+        if (combined.length >= 4 && combined.length >= target.length * 0.4 && target.includes(combined)) {
+          return w0.start;
+        }
+        // Fuzzy fallback: caption text close to target with ≤2 edits
+        if (combined.length >= 4 && Math.abs(combined.length - target.length) <= 2 && levenshtein(combined, target) <= 2) {
+          return w0.start;
+        }
+        if (combined.length > target.length + 5) break;
+      }
+    }
+  }
+  return null;
+}
+
+// Find the first word in captions whose stat-number value matches the
+// overlay's number (within 5% tolerance). Used for bigStat verification.
+function findStatFirstMentionInCaptions(statText, captions, startSec, endSec) {
+  const target = parseStatNumber(statText);
+  if (target === null) return null;
+  const tol = Math.max(Math.abs(target) * 0.05, 0.5);
+  for (const sentence of captions || []) {
+    if (!sentence) continue;
+    if (typeof sentence.start === 'number' && sentence.start > endSec) break;
+    if (typeof sentence.end === 'number' && sentence.end < startSec) continue;
+    const words = sentence.words || [];
+    for (let i = 0; i < words.length; i++) {
+      const w0 = words[i];
+      if (typeof w0.start !== 'number' || w0.start < startSec || w0.start > endSec) continue;
+      // Look in a small window around this word (number may be split across words)
+      const chunk = words.slice(i, Math.min(i + 4, words.length)).map((w) => w.text || '').join(' ');
+      const n = parseStatNumber(chunk);
+      if (n !== null && Math.abs(n - target) <= tol) return w0.start;
+    }
+  }
+  return null;
+}
 function anchorOverlaysToTimingTags(rawBeats, timingTags) {
   if (!Array.isArray(rawBeats) || !Array.isArray(timingTags) || timingTags.length === 0) return 0;
   let anchored = 0;
@@ -1620,6 +1716,144 @@ function anchorOverlaysToTimingTags(rawBeats, timingTags) {
   }
   if (anchored || unmatched) console.log(`[anchor] anchored ${anchored} overlays to timing tags, ${unmatched} had no matching tag (kept original startOffset)`);
   return anchored;
+}
+
+// Day-13 F2+F3: combined verify + score pass for overlays.
+//
+// Runs AFTER anchorOverlaysToTimingTags (which uses Gemini tag timestamps —
+// the model's estimate of when an entity is spoken) and BEFORE
+// trimOverlayDurationsToNextAnchor (which uses Gemini tags to clip
+// duration). This pass:
+//
+//   1. Re-anchors entity/stat overlays to AssemblyAI's word-level caption
+//      timestamps (TIGHTER than Gemini — the captioner is sample-accurate
+//      to the spoken word; Gemini estimates from listening). Only re-anchors
+//      when the caption mention falls inside the beat AND within ±5s of the
+//      currently-planned overlay placement (avoids cross-beat jumps).
+//
+//   2. Drops overlays whose entity/stat does NOT appear in captions within
+//      ±5s of the planned timestamp (PHANTOM CATCH). This is the main fix
+//      for "overlays appearing for content not actually spoken" — Claude
+//      occasionally invents entityPortrait/bigStat for entities mentioned in
+//      the source article but trimmed from the final voiceover.
+//
+//   3. Scores each surviving overlay 0-1 on a relevance composite:
+//        +0.5 entity confirmed in captions (the verification bonus)
+//        +0.2 duration in healthy range (1.5-5s)
+//        +0.2 density spacing (no neighbor within ±3s)
+//        +0.1 anchored vs fallback-positioned
+//      Drops anything < 0.5. Catches degraded-quality overlays that
+//      survived verification but cluster too tightly / have weird timing.
+//
+// Quote / entityPortrait that were SERVER-injected (those don't go through
+// Claude's overlay enum) — skip verification but score them.
+function verifyAndScoreOverlays(rawBeats, captions) {
+  if (!Array.isArray(rawBeats)) return {dropped: 0, reanchored: 0, kept: 0};
+  // Flatten all overlays into absolute-timeline view for density check.
+  const allAbs = [];
+  for (let i = 0; i < rawBeats.length; i++) {
+    const b = rawBeats[i];
+    if (!Array.isArray(b?.overlays)) continue;
+    for (const ov of b.overlays) {
+      allAbs.push({beatIdx: i, absStart: (b.start || 0) + (ov.startOffset || 0)});
+    }
+  }
+  let dropped = 0;
+  let reanchored = 0;
+  let kept = 0;
+  for (let i = 0; i < rawBeats.length; i++) {
+    const beat = rawBeats[i];
+    if (!Array.isArray(beat?.overlays) || beat.overlays.length === 0) continue;
+    const beatStart = beat.start || 0;
+    const beatEnd = beat.end || 0;
+    const beatDur = Math.max(0.5, beatEnd - beatStart);
+    beat.overlays = beat.overlays.filter((ov) => {
+      const absStart = beatStart + (ov.startOffset || 0);
+      // Verification window is ±5s ABSOLUTE (not clamped to beat). An
+      // overlay whose entity is spoken in a neighboring beat survives
+      // verification but may not get re-anchored (re-anchor only if the
+      // caption mention falls inside THIS beat — otherwise we'd shift
+      // the overlay past beat boundaries).
+      const windowStart = absStart - 5;
+      const windowEnd = absStart + 5;
+      let captionAnchorAbs = null;
+      let needsVerification = false;
+      let searchLabel = '';
+      // Decide which text to search for based on overlay type.
+      if (ov.type === 'entityPortrait' && ov.name) {
+        needsVerification = true;
+        searchLabel = ov.name;
+        captionAnchorAbs = findEntityFirstMentionInCaptions(ov.name, captions, windowStart, windowEnd);
+      } else if (ov.type === 'bigStat' && ov.text) {
+        needsVerification = true;
+        searchLabel = ov.text;
+        captionAnchorAbs = findStatFirstMentionInCaptions(ov.text, captions, windowStart, windowEnd);
+        // Fallback: try entity-name search on the text (e.g., "+47%" may
+        // appear as both digit and word — entity search will catch text labels).
+        if (captionAnchorAbs === null) {
+          captionAnchorAbs = findEntityFirstMentionInCaptions(ov.text, captions, windowStart, windowEnd);
+        }
+      } else if (ov.type === 'lowerThird' && ov.text) {
+        // lowerThird text after the source-only filter is "Source: X" form.
+        // Verify the X (everything after the prefix word) appears in captions.
+        const m = ov.text.match(/^(?:Source|Per|Via)[:\s]+(.+)$/i);
+        const searchTerm = m ? m[1] : ov.text;
+        needsVerification = true;
+        searchLabel = searchTerm;
+        captionAnchorAbs = findEntityFirstMentionInCaptions(searchTerm, captions, windowStart, windowEnd);
+      } else if (ov.type === 'quote' && ov.source) {
+        needsVerification = true;
+        searchLabel = ov.source;
+        captionAnchorAbs = findEntityFirstMentionInCaptions(ov.source, captions, windowStart, windowEnd);
+      }
+
+      if (needsVerification && captionAnchorAbs === null) {
+        console.log(`[verify-overlay] dropped ${ov.type} "${searchLabel.slice(0, 50)}" beat ${i} — not found in captions near ${absStart.toFixed(1)}s (window ${windowStart.toFixed(1)}-${windowEnd.toFixed(1)}s)`);
+        dropped++;
+        return false;
+      }
+      // Re-anchor to caption timestamp ONLY when the caption mention
+      // falls inside THIS beat — otherwise we'd push the overlay's
+      // startOffset negative or past beatDur. If entity is mentioned
+      // outside the beat, verification passes (entity confirmed in
+      // voiceover) but we keep original timing.
+      if (captionAnchorAbs !== null && captionAnchorAbs >= beatStart && captionAnchorAbs < beatEnd) {
+        const newOffset = Math.max(0, captionAnchorAbs - beatStart);
+        const oldOffset = ov.startOffset || 0;
+        const drift = Math.abs(newOffset - oldOffset);
+        if (drift > 0.15) {
+          const dur = typeof ov.duration === 'number' && ov.duration > 0 ? ov.duration : 2;
+          const newDur = Math.max(0.5, Math.min(dur, beatDur - newOffset));
+          console.log(`[verify-overlay] re-anchored ${ov.type} "${searchLabel.slice(0, 40)}" beat ${i} startOffset ${oldOffset.toFixed(2)}s → ${newOffset.toFixed(2)}s (caption match)`);
+          ov.startOffset = newOffset;
+          ov.duration = newDur;
+          reanchored++;
+        }
+      }
+      // Relevance score.
+      let score = 0;
+      const reasons = [];
+      if (captionAnchorAbs !== null) { score += 0.5; reasons.push('caption+0.5'); }
+      const d = ov.duration;
+      if (typeof d === 'number' && d >= 1.5 && d <= 5) { score += 0.2; reasons.push('duration+0.2'); }
+      const absNow = beatStart + (ov.startOffset || 0);
+      const neighbors = allAbs.filter((x) => x.absStart !== absStart && Math.abs(x.absStart - absNow) < 3).length;
+      if (neighbors === 0) { score += 0.2; reasons.push('density+0.2'); }
+      // "Anchored" credit: if startOffset changed (vs default 0) or matches a Gemini/caption pick.
+      if ((ov.startOffset || 0) > 0.1 || captionAnchorAbs !== null) { score += 0.1; reasons.push('anchored+0.1'); }
+      if (score < 0.5) {
+        console.log(`[verify-overlay] dropped ${ov.type} "${(searchLabel || ov.text || ov.name || '').slice(0, 40)}" beat ${i} — score ${score.toFixed(2)} < 0.5 (${reasons.join(', ') || 'none'})`);
+        dropped++;
+        return false;
+      }
+      kept++;
+      return true;
+    });
+  }
+  if (dropped || reanchored) {
+    console.log(`[verify-overlay] kept ${kept}, re-anchored ${reanchored} to captions, dropped ${dropped}`);
+  }
+  return {dropped, reanchored, kept};
 }
 
 // Trim overlay duration so it ends BEFORE the next "different anchor"
@@ -3791,6 +4025,10 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   //    — runs LAST so spacing uses the post-anchor + post-clamp times
   validateBigStatContent(rawBeats);
   anchorOverlaysToTimingTags(rawBeats, timingTags);
+  // Day-13 F2+F3: re-anchor to AssemblyAI word-level captions (tighter
+  // than Gemini), drop overlays whose entity isn't actually spoken
+  // (phantom catch), drop low-relevance overlays.
+  verifyAndScoreOverlays(rawBeats, captions);
   trimOverlayDurationsToNextAnchor(rawBeats, timingTags);
   pairQuotesWithEntityPortraits(rawBeats);
   dropRedundantLowerThirds(rawBeats);
@@ -6989,6 +7227,93 @@ exports.autoForensicScheduler = onSchedule(
   },
 );
 
+// Day-13 F5: nightly YouTube performance fetcher. Reads videoPerformance
+// docs published in the last 30 days, groups by channelId (one OAuth
+// roundtrip per channel), calls the Render proxy's /youtube/stats endpoint
+// to fetch views/likes/comments via YouTube Data API, updates each doc's
+// `stats` field. The self-learning analysis layer (planned for Day 14+)
+// reads from these docs.
+exports.collectYouTubePerformance = onSchedule(
+  {
+    schedule: 'every day 03:00',
+    timeZone: 'UTC',
+    region: 'us-central1',
+    timeoutSeconds: 540,
+    memory: '512MiB',
+  },
+  async () => {
+    const cycleStart = Date.now();
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    let snap;
+    try {
+      snap = await db.collection('videoPerformance')
+        .where('publishedAt', '>=', thirtyDaysAgo)
+        .get();
+    } catch (e) {
+      // Collection may not exist yet on a fresh install — exit gracefully.
+      console.warn(`[videoPerformance] query failed: ${e.message} — exiting`);
+      return;
+    }
+    console.log(`[videoPerformance] cycle start: ${snap.size} videos in last 30 days`);
+    // Group videos by channelId so we issue one OAuth-authenticated stats
+    // call per channel (vs N per-video calls). YouTube Data API videos.list
+    // accepts up to 50 IDs per call.
+    const byChannel = new Map();
+    for (const docSnap of snap.docs) {
+      const x = docSnap.data();
+      if (!x.youtubeVideoId || !x.channelId) continue;
+      if (!byChannel.has(x.channelId)) byChannel.set(x.channelId, []);
+      byChannel.get(x.channelId).push(x.youtubeVideoId);
+    }
+    console.log(`[videoPerformance] grouped: ${byChannel.size} channels`);
+    let updated = 0;
+    let failed = 0;
+    for (const [channelId, videoIds] of byChannel.entries()) {
+      // Chunk to 50 per call (YouTube Data API limit on videos.list).
+      for (let i = 0; i < videoIds.length; i += 50) {
+        const chunk = videoIds.slice(i, i + 50);
+        try {
+          const r = await fetch(`${RENDER_PROXY_URL}/youtube/stats`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({channelId, videoIds: chunk}),
+          });
+          if (!r.ok) {
+            console.warn(`[videoPerformance] stats fetch failed for ch ${channelId}: HTTP ${r.status}`);
+            failed += chunk.length;
+            continue;
+          }
+          const d = await r.json();
+          if (!d.ok || !Array.isArray(d.stats)) {
+            console.warn(`[videoPerformance] stats response malformed for ch ${channelId}`);
+            failed += chunk.length;
+            continue;
+          }
+          const writeAt = FieldValue.serverTimestamp();
+          for (const s of d.stats) {
+            if (!s.videoId) continue;
+            await db.collection('videoPerformance').doc(s.videoId).update({
+              'stats.lastFetchedAt': writeAt,
+              'stats.views': s.views || 0,
+              'stats.likes': s.likes || 0,
+              'stats.comments': s.comments || 0,
+              'stats.shares': s.shares || 0,
+            }).catch((e) => {
+              console.warn(`[videoPerformance] update failed for ${s.videoId}: ${e.message}`);
+            });
+            updated++;
+          }
+        } catch (e) {
+          console.warn(`[videoPerformance] channel ${channelId} fetch error: ${e.message}`);
+          failed += chunk.length;
+        }
+      }
+    }
+    const elapsed = ((Date.now() - cycleStart) / 1000).toFixed(1);
+    console.log(`[videoPerformance] cycle done in ${elapsed}s — updated=${updated}, failed=${failed}, channels=${byChannel.size}`);
+  },
+);
+
 // ─── Auto-pilot orchestrator (server-side replacement for the frontend
 // runAutoPilot in App.jsx) ────────────────────────────────────────────
 //
@@ -7443,6 +7768,130 @@ async function autoPilotLoadUserSecrets(uid) {
   }
 }
 
+// Day-13 F4: YouTube upload defaults for auto-pilot uploads. Manual UI
+// uploads pass through the proxy with explicit values from the user — the
+// proxy's defaults catch any path that omits these fields.
+const DEFAULT_YOUTUBE_CATEGORY_ID = '24'; // "Entertainment" — broader reach than "People & Blogs" (22)
+const TAG_STOPWORDS = new Set([
+  'a', 'an', 'the', 'of', 'in', 'on', 'and', 'or', 'for', 'to', 'with',
+  'at', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+]);
+
+// Build a YouTube tags array from the published title + any entities
+// extracted from the script at Stage 2. Strategy:
+//   1. Full title (first tag — YouTube weights position-1 highest)
+//   2. Title tokens > 3 chars, minus stopwords + punctuation
+//   3. Script entities (people, companies, places)
+// Deduped (case-insensitive on first-seen casing), capped at 500 chars
+// total to stay under YouTube's hard limit on the aggregated tags string.
+function generateTagsFromTitle(title, scriptEntities = []) {
+  if (!title || typeof title !== 'string') return [];
+  const seen = new Set(); // lowercase canonical
+  const ordered = []; // preserves order + original casing
+  const push = (raw) => {
+    const t = String(raw || '').trim().slice(0, 80);
+    if (!t) return;
+    const key = t.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    ordered.push(t);
+  };
+  push(title.trim());
+  for (const tok of title.toLowerCase().replace(/[^a-z0-9\s'-]/g, ' ').split(/\s+/)) {
+    if (tok.length > 3 && !TAG_STOPWORDS.has(tok)) push(tok);
+  }
+  for (const e of Array.isArray(scriptEntities) ? scriptEntities : []) {
+    if (e?.name) push(e.name);
+  }
+  const out = [];
+  let total = 0;
+  for (const tag of ordered) {
+    const cost = tag.length + 1; // +1 for separator
+    if (total + cost > 500) break;
+    out.push(tag);
+    total += cost;
+  }
+  return out;
+}
+
+// Day-13 F5: pipeline version tag — bumped each "day" so historical
+// videoPerformance docs can be sliced by code version when the
+// self-learning analysis lands.
+const PIPELINE_VERSION = 'day-13';
+
+// Build the config snapshot written to videoPerformance/{youtubeVideoId}
+// when Stage 7 (upload) completes. Captures every input that may
+// influence performance so future analysis can correlate them with
+// stats. Pulls from proj (editingJob output), ch (channel settings),
+// and the most-recent successful editingJob doc.
+async function buildVideoPerformanceSnapshot({youtubeVideoId, channelId, projectId, proj, ch, publishAtIso}) {
+  // Locate the most recent successful editingJob for this project to
+  // capture its timings + overlay breakdown.
+  let job = null;
+  try {
+    const jobSnap = await db.collection('editingJobs')
+      .where('projectId', '==', projectId)
+      .where('status', '==', 'done')
+      .orderBy('updatedAt', 'desc')
+      .limit(1)
+      .get();
+    if (!jobSnap.empty) job = jobSnap.docs[0].data();
+  } catch { /* ignore — snapshot is best-effort */ }
+  const timings = job?.timings || {};
+  return {
+    youtubeVideoId,
+    channelId,
+    projectId,
+    publishedAt: publishAtIso ? new Date(publishAtIso) : FieldValue.serverTimestamp(),
+    title: proj.ytTitle || proj.title || '',
+    config: {
+      pipelineVersion: PIPELINE_VERSION,
+      // Thumbnail
+      thumbnailUrl: proj.thumbnailUrl || null,
+      thumbnailGenerationModel: 'pikzels_v2',
+      thumbnailFormulaUsed: ch?.forensic?.thumbnailFormula ? {
+        topColors: ch.forensic.thumbnailFormula.topColors || [],
+        faceUsage: ch.forensic.thumbnailFormula.faceUsage || null,
+        commonExpressions: ch.forensic.thumbnailFormula.commonExpressions || [],
+      } : null,
+      // Voiceover
+      voiceoverVoiceId: proj.voiceoverVoiceId || ch?.defaultVoiceoverVoiceId || null,
+      voiceoverDurationSec: timings.voiceoverDurationSec || null,
+      // Music
+      musicTrackId: proj.musicSelectionUsed?.trackId || null,
+      musicTrackName: proj.musicSelectionUsed?.trackName || null,
+      musicTrackMood: proj.musicSelectionUsed?.trackMood || null,
+      musicVolume: timings.musicVolume || null,
+      // Pipeline counts
+      beatCount: timings.beatCount || null,
+      overlayBreakdown: timings.overlayBreakdown || {},
+      sfxCount: timings.sfxResolvedCount || 0,
+      geminiTagCount: timings.geminiTagCount || 0,
+      // Render
+      renderModeSegments: timings.renderModeSegments || null,
+      // Timings (per-pass durations for performance vs quality analysis)
+      renderTimings: {
+        totalSec: timings.totalMs ? Math.round(timings.totalMs / 1000) : null,
+        sourcingMs: timings.sourcingMs || null,
+        cachingMs: timings.cachingMs || null,
+        geminiTimingMs: timings.geminiTimingMs || null,
+        musicMs: timings.musicMs || null,
+        preflightMs: timings.preflightMs || null,
+        loudnormMs: timings.loudnormMs || null,
+        uploadMs: timings.uploadMs || null,
+      },
+    },
+    stats: {
+      lastFetchedAt: null,
+      views: 0,
+      likes: 0,
+      comments: 0,
+      shares: 0,
+    },
+    failureReason: null,
+  };
+}
+
 function autoPilotNextPublishSlot(schedule, lastScheduledMs = 0) {
   if (!schedule) schedule = {};
   const [hh, mm] = (schedule.publishTime || '14:00').split(':').map((n) => parseInt(n, 10) || 0);
@@ -7539,49 +7988,57 @@ function getExpressionForTopic(topic, idx) {
 // missing — fresh channels still get a workable prompt from base
 // style alone.
 function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFormula, globalPatterns}) {
-  // Pikzels' /v2/thumbnail/text endpoint works best with concise prompts
-  // (~300-500 chars). The previous multi-section builder produced
-  // 2000-2800-char prompts which Pikzels rejected outright — Rem hit
-  // repeated failures and had to add a Replicate fallback key just to
-  // get anything generated. Keeping it tight: brand style + subject +
-  // headline entity + text overlay. The rest (channel formula, competitor
-  // benchmark, hard requirements) is dropped from the prompt body — the
-  // model already knows what a finance thumbnail looks like, and Pikzels
-  // doesn't have the token budget for layered instructions anyway.
+  // Day-13 F1: locked style template for cross-video consistency. Every
+  // thumbnail uses the same font (Anton), composition (subject right /
+  // text left), and palette so the channel reads as one brand at scroll
+  // speed. Pikzels' /v2/thumbnail/text endpoint caps usefully at ~600
+  // chars; we stay tight by stating each constraint once.
   const parts = [];
 
-  parts.push('Dramatic high-contrast YouTube finance thumbnail.');
-  parts.push('Photorealistic, cinematic lighting, brand colours #49181E (deep burgundy shadows) + #ED6F32 (glowing orange rim-light).');
+  parts.push('Dramatic high-contrast YouTube finance thumbnail, photorealistic, cinematic lighting.');
+  parts.push('Background: dark gradient #0a0a0a → #49181E burgundy with #ED6F32 orange rim-light, vignette edges.');
+  // Composition lock — subject right, text block left, channel badge bottom-right.
+  parts.push('Composition: subject occupies right 50% of frame; text block fills left 45%; channel badge bottom-right corner, small.');
+  // Font lock — Anton everywhere, white primary + orange accent.
+  parts.push('Text font: Anton (bold condensed sans-serif, UPPERCASE) — white primary, accent stat in #ED6F32 orange.');
 
-  // Subject: title is the headline. Topic context only if it adds info.
+  // Subject: title is the headline.
   parts.push(`Subject: ${(title || '').slice(0, 120)}.`);
 
   // First named person/company is featured photorealistically.
   const entList = Array.isArray(entities) ? entities.slice(0, 1) : [];
   for (const e of entList) {
     if (e?.type === 'person') {
-      parts.push(`Feature ${e.name} photorealistically with ${getExpressionForTopic(topic, 0)} expression.`);
+      parts.push(`Feature ${e.name} photorealistically with ${getExpressionForTopic(topic, 0)} expression — recognizable face, dramatic side-lighting.`);
     } else if (e?.type === 'company') {
-      parts.push(`Show ${e.name} logo / branding prominently.`);
+      parts.push(`Show ${e.name} logo / branding prominently in the right half.`);
     } else if (e?.type === 'place') {
-      parts.push(`Iconic visual of ${e.name} (skyline / landmark).`);
+      parts.push(`Iconic visual of ${e.name} (skyline / landmark) filling the right half.`);
     } else if (e?.name) {
       parts.push(`Feature ${e.name}.`);
     }
   }
 
-  // Text overlay — the headline number / hook. Big bold sans-serif.
+  // Text overlay — the headline number / hook. Anton white, with stat in Anton orange.
   const overlay = generateThumbnailText(title);
   if (overlay) {
-    parts.push(`Bold sans-serif text overlay: "${overlay.slice(0, 30)}", white with black outline, 20-30% of frame, in clear space (never over the subject's face).`);
+    parts.push(`Left text block: large Anton UPPERCASE headline "${overlay.slice(0, 30)}" in white; smaller Anton orange stat / subtitle below. Never over the subject's face.`);
   }
 
-  parts.push('16:9, subject 40-60% of frame, vignette edges, dark gradient background with orange rim-light. NOT cartoon, NOT generic stock.');
+  parts.push('NOT cartoon, NOT generic stock, NOT 3D-render look.');
 
-  // Optional: bias toward this channel's proven expressions if extracted.
-  // ONE short line max — keeps the prompt under Pikzels' budget.
+  // Optional bias: channel's proven expressions if extracted.
   if (ownFormula && Array.isArray(ownFormula.commonExpressions) && ownFormula.commonExpressions.length) {
     parts.push(`Channel's proven expressions: ${ownFormula.commonExpressions.slice(0, 2).join(', ')}.`);
+  }
+
+  // Optional bias: niche-wide competitor palette as a contrast hint.
+  // Day-13: was collected but never injected. ONE short line; stays
+  // within Pikzels' char budget. Avoids overriding the locked palette —
+  // these are accent suggestions for chart bars / highlights, not bg.
+  if (globalPatterns && Array.isArray(globalPatterns.topColors) && globalPatterns.topColors.length) {
+    const palette = globalPatterns.topColors.slice(0, 3).join(', ');
+    parts.push(`Niche-proven accent palette (for chart highlights / data viz): ${palette}.`);
   }
 
   const out = parts.join(' ');
@@ -8574,6 +9031,10 @@ exports.autoPilotWorker = onRequest(
         const lastSchedMs = sch?.lastScheduledAt?.toMillis?.() || 0;
         const slotMs = autoPilotNextPublishSlot(sch, lastSchedMs);
         const publishAtIso = slotMs ? new Date(slotMs).toISOString() : null;
+        // Day-13 F4: auto-populate categoryId + tags. categoryId=24 (Entertainment)
+        // for broader reach than the proxy's 22 default. Tags built from title +
+        // script entities so the upload doesn't go out tag-less.
+        const ytTags = generateTagsFromTitle(proj.ytTitle, proj.scriptEntities);
         const r = await fetch(`${RENDER_PROXY_URL}/youtube/upload`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
@@ -8581,6 +9042,7 @@ exports.autoPilotWorker = onRequest(
             channelId, title: proj.ytTitle, description: proj.ytDesc || '',
             videoUrl: proj.editingFile.url, thumbnailUrl: proj.thumbnailUrl || '',
             privacyStatus: 'private', publishAt: publishAtIso,
+            categoryId: DEFAULT_YOUTUBE_CATEGORY_ID, tags: ytTags,
           }),
         });
         const d = await r.json();
@@ -8597,6 +9059,26 @@ exports.autoPilotWorker = onRequest(
         await projRef.update(patch);
         if (publishAtIso) {
           await chRef.update({publishSchedule: {...(sch || {}), lastScheduledAt: new Date(slotMs)}});
+        }
+        // Day-13 F5: snapshot config to videoPerformance for future
+        // analytics. Captures every input that could influence stats so
+        // the nightly fetcher can update the same doc with views/likes/
+        // comments + later self-learning can correlate.
+        try {
+          const projAfter = (await projRef.get()).data();
+          const chAfter = (await chRef.get()).data();
+          const snapshot = await buildVideoPerformanceSnapshot({
+            youtubeVideoId: d.videoId,
+            channelId,
+            projectId,
+            proj: projAfter,
+            ch: chAfter,
+            publishAtIso,
+          });
+          await db.collection('videoPerformance').doc(d.videoId).set(snapshot);
+          console.log(`[videoPerformance] snapshot saved for video ${d.videoId}`);
+        } catch (e) {
+          console.warn(`[videoPerformance] snapshot failed for ${d.videoId}: ${e.message}`);
         }
       }
 
