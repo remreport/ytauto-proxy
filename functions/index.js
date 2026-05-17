@@ -3679,13 +3679,15 @@ function sliceCaptionsForSegment(captions, segStart, segEnd) {
 // neighbour driving the stretch — they're invisible to MainComp anyway.
 // Original `end` is preserved on `originalEnd` for diagnostics.
 function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
-  // Phase-6a-fix: scene-shaped footage (sceneIndex present) caps stretch
-  // at maxStretchSec (default 1.5s) so a single null-url scene cannot
-  // cause a neighbor to stretch by 10-20s. Beat-shaped footage retains
-  // the old unbounded behavior — beats are short (3-5s) and naturally
-  // contiguous, so the cap doesn't apply.
-  const looksSceneShaped = footage.some((f) => f && typeof f.sceneIndex === 'number');
-  const cap = maxStretchSec != null ? maxStretchSec : (looksSceneShaped ? 1.5 : Infinity);
+  // Phase-6b: gap-fill is now UNCAPPED for both beat- and scene-shaped
+  // footage. Phase-6a-fix originally capped scene-shaped at 1.5s to
+  // protect against null-url neighbors pulling a scene 20s long. That
+  // concern is moot in Phase-6b — the availability-probed scene plan
+  // GUARANTEES every scene has a working URL. Capping caused 0.5-5s
+  // BLACK intervals between scenes whenever inter-scene gap exceeded
+  // 1.5s (logged "stretched 82/115 beats" in failed run — most of
+  // those left visible black tails).
+  const cap = maxStretchSec != null ? maxStretchSec : Infinity;
   const result = footage.slice();
   for (let i = 0; i < result.length; i++) {
     const cur = result[i];
@@ -4482,6 +4484,114 @@ Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the
   return out;
 }
 
+// ─── Phase 6b: coupled scene-plan + asset-availability probe ───────
+// User insight: "Scene plan and asset plan should work TOGETHER, not
+// sequentially. The system should KNOW these things beforehand."
+//
+// Problem with Phase 6a: Claude classified 51% of a script as
+// `ai_generated`, but fal.ai budget only allows 12 images → 47 scenes
+// silently fell back to Pexels generic queries → user saw 100% stock
+// despite scene plan saying otherwise. Same for Wikimedia (22 planned,
+// 1 hit) and Mapbox (3 planned, 0 hit).
+//
+// Phase 6b solution: probe asset availability for each scene BEFORE
+// committing to its assetType. Downgrade unavailable types through
+// fallbackChain → sourcing then trivially fetches the GUARANTEED type.
+//
+// Probe costs are tiny:
+//   - ai_generated:  budget arithmetic only (free)
+//   - map:           coordinate-object validation (free)
+//   - archival_photo: 1 Wikimedia API call per archival scene (~200ms)
+//   - stock_footage: 1 Pexels API call per stock scene (~200ms),
+//                    skipped because the existing cascade handles it.
+
+async function finalizeScenePlanWithAvailability(draftScenes, aiImageBudget) {
+  if (!Array.isArray(draftScenes) || draftScenes.length === 0) return draftScenes;
+  const t0 = Date.now();
+
+  // Stage A: AI budget pre-allocation. Claude often picks ai_generated
+  // for 40-60% of scenes; budget caps at ~12 images per video. Without
+  // pre-allocation, the FIRST 12 ai_generated scenes win the budget and
+  // the rest fall through silently. Pre-allocation = pick the 12 BEST
+  // ai_generated candidates and downgrade the rest. Heuristic: scenes
+  // with the most-vivid aiPrompts win (longer prompts proxy for richer
+  // visual concepts).
+  const aiCapImages = Math.max(1, Math.floor((aiImageBudget?.capUsd || 1.0) / 0.08));
+  const aiCandidates = draftScenes
+    .map((s, idx) => ({idx, scene: s, promptLen: (s.aiPrompt || '').length}))
+    .filter((c) => c.scene.assetType === 'ai_generated' && c.scene.aiPrompt);
+  let aiBudgetDowngraded = 0;
+  if (aiCandidates.length > aiCapImages) {
+    // Keep the longest-prompt candidates (proxy for "scene with richest
+    // visual concept"); downgrade the rest to their fallback.
+    aiCandidates.sort((a, b) => b.promptLen - a.promptLen);
+    const losers = aiCandidates.slice(aiCapImages);
+    for (const l of losers) {
+      l.scene._originalAssetType = l.scene.assetType;
+      l.scene.assetType = (l.scene.fallbackChain || []).find((t) => t !== 'ai_generated') || 'stock_footage';
+      aiBudgetDowngraded++;
+    }
+    console.log(`[scene-plan] AI budget pre-alloc: ${aiCapImages} kept, ${aiBudgetDowngraded} downgraded (Claude requested ${aiCandidates.length} ai_generated)`);
+  }
+
+  // Stage B: Wikimedia availability probe (parallelized). Each archival
+  // scene gets a count-only probe. If count===0, downgrade to fallback.
+  // Skipped scenes that AI-budget already kicked from archival aren't
+  // re-probed.
+  const archivalScenes = draftScenes.filter((s) => s.assetType === 'archival_photo');
+  let archivalDowngraded = 0;
+  if (archivalScenes.length) {
+    const probes = await Promise.all(archivalScenes.map(async (s) => {
+      try {
+        const q = (s.searchKeywords || []).join(' ').slice(0, 100);
+        if (!q) return {scene: s, count: 0};
+        const url = new URL('https://commons.wikimedia.org/w/api.php');
+        url.searchParams.set('action', 'query');
+        url.searchParams.set('format', 'json');
+        url.searchParams.set('list', 'search');
+        url.searchParams.set('srsearch', q + ' filemime:image');
+        url.searchParams.set('srnamespace', '6');
+        url.searchParams.set('srlimit', '1');
+        url.searchParams.set('origin', '*');
+        const resp = await fetch(url, {signal: AbortSignal.timeout(3000)});
+        if (!resp.ok) return {scene: s, count: 0};
+        const data = await resp.json();
+        return {scene: s, count: data?.query?.searchinfo?.totalhits || 0};
+      } catch { return {scene: s, count: 0}; }
+    }));
+    for (const {scene, count} of probes) {
+      if (count === 0) {
+        scene._originalAssetType = scene._originalAssetType || scene.assetType;
+        scene.assetType = (scene.fallbackChain || []).find((t) => t !== 'archival_photo') || 'stock_footage';
+        archivalDowngraded++;
+      }
+    }
+  }
+
+  // Stage C: Mapbox coord validation (no API call). Downgrade scenes
+  // with missing/invalid coordinates.
+  const mapScenes = draftScenes.filter((s) => s.assetType === 'map');
+  let mapDowngraded = 0;
+  for (const s of mapScenes) {
+    const locs = s.mapContext?.locations || [];
+    const hasReal = locs.some((l) => typeof l.longitude === 'number' && typeof l.latitude === 'number' && !(l.longitude === 0 && l.latitude === 0));
+    if (!hasReal || !process.env.MAPBOX_ACCESS_TOKEN) {
+      s._originalAssetType = s._originalAssetType || s.assetType;
+      s.assetType = (s.fallbackChain || []).find((t) => t !== 'map') || 'stock_footage';
+      mapDowngraded++;
+    }
+  }
+
+  // Stage D: rebuild type breakdown for telemetry.
+  const finalBreakdown = {stock_footage: 0, archival_photo: 0, ai_generated: 0, map: 0};
+  for (const s of draftScenes) {
+    finalBreakdown[s.assetType] = (finalBreakdown[s.assetType] || 0) + 1;
+  }
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[scene-plan] availability probe in ${elapsed}s — final types: ${JSON.stringify(finalBreakdown)} — downgrades: ai-budget=${aiBudgetDowngraded}, archival-empty=${archivalDowngraded}, map-invalid=${mapDowngraded}`);
+  return draftScenes;
+}
+
 // Maps scenes back onto beats. Each beat in a scene inherits the scene's
 // refined searchKeywords (so the existing per-beat sourcing loop benefits
 // from scene-level cohesion) and gets a scenePlanContext stamp for
@@ -4851,19 +4961,32 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   // empty otherwise (graceful fall-through). Hoisted out of the try
   // block so the Phase-6a scene-driven sourcing branch below can read it.
   let scenes = [];
+  // Phase-6b: AI budget tracker hoisted out of sourcing so the scene-plan
+  // availability probe can pre-allocate against it. Same instance is
+  // reused inside sourceScenesAndBuildFootage — spend accumulates as
+  // images are actually generated. Pre-allocation only marks which
+  // scenes win the budget; it doesn't spend.
+  const aiImageBudget = createAiImageBudgetTracker();
   if (useStagingRender) {
     try {
       const sceneT0 = Date.now();
       const voiceoverDurForScenePlan = (captions && captions.length)
         ? Math.max(...captions.map((c) => c.end || 0))
         : 0;
-      scenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan);
+      const draftScenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan);
+      // Phase-6b: probe asset availability + downgrade unavailable
+      // primary types through fallbackChain BEFORE applyScenesToBeats.
+      // Result: scene.assetType reflects what will ACTUALLY render,
+      // not what Claude wished for. Eliminates the "scene plan said
+      // archival, video shows Pexels" disconnect.
+      scenes = await finalizeScenePlanWithAvailability(draftScenes, aiImageBudget);
       const touched = applyScenesToBeats(rawBeats, scenes);
       const sceneMs = Date.now() - sceneT0;
       await jobRef.update({
         'timings.scenePlanMs': sceneMs,
         'timings.sceneCount': scenes.length,
         'timings.sceneBeatsTouched': touched,
+        'timings.sceneFinalTypes': scenes.reduce((acc, s) => { acc[s.assetType] = (acc[s.assetType] || 0) + 1; return acc; }, {}),
       }).catch(() => {});
     } catch (e) {
       console.warn(`[scene-plan] EXCEPTION: ${e.message} — falling back to per-beat keywords`);
@@ -4889,10 +5012,9 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
 
   const perBeatT0 = Date.now();
   let footage = [];
-  // Day-14 Phase 4: per-video AI image budget tracker. Caps spend even
-  // when a script has 20+ ai_generated scenes — extras fall back to
-  // stock_footage automatically.
-  const aiImageBudget = createAiImageBudgetTracker();
+  // Phase-6b: aiImageBudget is now hoisted above the scene-plan block
+  // so the availability probe can pre-allocate. Reused here for actual
+  // sourcing — spend accumulates across the run.
   // Per-video stock URL dedup. The previous pipeline picked the top
   // validated Pexels candidate per beat with no awareness of prior
   // beats — for a 122-beat finance video where many beats search
