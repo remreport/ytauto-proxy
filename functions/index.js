@@ -2856,6 +2856,56 @@ async function wikimediaImageSearchTop(query, n = 3) {
   return out;
 }
 
+// Day-15 Phase 15c: Wikimedia Commons VIDEO search. Same API as
+// wikimediaImageSearchTop but filemime:video. Commons is ~100% WebM in
+// 2026 (VP8/VP9), which Remotion's OffthreadVideo handles via FFmpeg.
+// Hit rate is poor for pre-1950 archival content (use Internet Archive
+// Prelinger for those) — best for MODERN government footage:
+// Bernanke/Powell/Yellen lectures, White House addresses, congressional
+// hearings, Occupy-era B-roll. Same license filter as images.
+async function wikimediaVideoSearchTop(query, n = 3) {
+  const url = new URL('https://commons.wikimedia.org/w/api.php');
+  url.searchParams.set('action', 'query');
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('generator', 'search');
+  url.searchParams.set('gsrsearch', query + ' filemime:video');
+  url.searchParams.set('gsrnamespace', '6');
+  url.searchParams.set('gsrlimit', '15');
+  url.searchParams.set('prop', 'imageinfo');
+  url.searchParams.set('iiprop', 'url|mime|size|extmetadata');
+  url.searchParams.set('iiextmetadatafilter', 'LicenseShortName|Restrictions');
+  url.searchParams.set('origin', '*');
+  let resp;
+  try { resp = await fetch(url, {signal: AbortSignal.timeout(4000)}); }
+  catch (e) { console.warn(`[wikimedia-video] search threw for "${query}": ${e.message}`); return []; }
+  if (!resp.ok) {
+    console.warn(`[wikimedia-video] HTTP ${resp.status} for "${query}"`);
+    return [];
+  }
+  const data = await resp.json();
+  const pages = Object.values(data.query?.pages || {});
+  const allowedLicenseRe = /\b(cc0|public domain|pd|cc[\-\s]?by(?:[\-\s]?sa)?|gfdl)\b/i;
+  const out = [];
+  for (const p of pages) {
+    const info = (p.imageinfo || [])[0];
+    if (!info || !info.mime || !info.url) continue;
+    if (!/^video\//i.test(info.mime)) continue;
+    // Skip if non-empty restrictions
+    const restrictions = info.extmetadata?.Restrictions?.value;
+    if (restrictions && String(restrictions).trim().length > 0 && !/^false$/i.test(String(restrictions))) {
+      continue;
+    }
+    const license = info.extmetadata?.LicenseShortName?.value || '';
+    if (license && !allowedLicenseRe.test(String(license))) continue;
+    // Size cap: 100 MB (Commons videos can be large; Lambda /tmp is 512 MB)
+    if (info.size && info.size > 100 * 1024 * 1024) continue;
+    out.push(info.url);
+    if (out.length >= n) break;
+  }
+  if (out.length) console.log(`[wikimedia-video] ${out.length} hits for "${query.slice(0, 60)}"`);
+  return out;
+}
+
 // Day-14 Phase 4 (tweak): fal.ai Nano Banana 2 for ai_generated scenes.
 // Upgraded from original Nano Banana ($0.039) → Nano Banana 2 ($0.08) for
 // higher quality + native 16:9 aspect ratio (matches YouTube widescreen
@@ -3247,10 +3297,20 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
       console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image (${imageUrls.length} candidates)`);
       return {urls: imageUrls, source: 'wikimedia-image', sourceCounts};
     }
-    // Phase 15b: Wikimedia missed → try Internet Archive (Prelinger
-    // first, then general PD movies). Gated on cfg.archive default-on
-    // via the v7-staging override path — production channels keep
-    // their existing footageSources.archive toggle.
+    // Phase 15c: Wikimedia image missed → try Wikimedia video (good
+    // for modern Fed/Powell speeches, congressional hearings).
+    if (cfg.wikimediaVideo !== false) {
+      let videoUrls;
+      try { videoUrls = await wikimediaVideoSearchTop(query, n); }
+      catch (e) { console.warn(`[footage] wikimedia-video threw for "${query}": ${e.message}`); videoUrls = []; }
+      if (videoUrls && videoUrls.length) {
+        const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'wikimedia-video': videoUrls.length};
+        console.log(`[source-ladder] archival_photo "${query}" → wikimedia-video (${videoUrls.length} candidates, image empty)`);
+        return {urls: videoUrls, source: 'wikimedia-video', sourceCounts};
+      }
+    }
+    // Phase 15b: Wikimedia (both image + video) missed → try Internet
+    // Archive (Prelinger first, then general PD movies).
     if (cfg.archiveOrgVideo !== false) {
       let archiveUrls;
       try { archiveUrls = await archiveSearchTop(query, n); }
@@ -3261,7 +3321,7 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
         return {urls: archiveUrls, source: 'archive-org-video', sourceCounts};
       }
     }
-    console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image + archive-org-video both empty, falling through to stock ladder`);
+    console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image + wikimedia-video + archive-org-video all empty, falling through to stock ladder`);
   }
 
   const order = [
@@ -4022,7 +4082,7 @@ function sliceCaptionsForSegment(captions, segStart, segEnd) {
 // have a Pexels-CDN-typical 5-10s natural duration so stretching them
 // further than ~3s past their natural end risks running out of frames
 // → black tail or frozen frame.
-const VIDEO_SOURCE_NAMES = new Set(['pexels', 'pixabay', 'wikimedia', 'archive', 'ai-video', 'archive-org-video']);
+const VIDEO_SOURCE_NAMES = new Set(['pexels', 'pixabay', 'wikimedia', 'archive', 'ai-video', 'archive-org-video', 'wikimedia-video']);
 
 function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
   // Phase-6b fix 2: per-entry cap. Image-shaped entries (fal-ai-image,
@@ -4696,12 +4756,15 @@ async function runAiVideoGenerationPass(footage, beatIndices, channelId, cfg, jo
 // that's Phases 3-5. Gated behind useStagingRender per CONTRIBUTING.md.
 async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurationSec) {
   if (!Array.isArray(rawBeats) || rawBeats.length === 0) return [];
-  // Group beats into scenes. Phase-6a-fixes: tighter caps to prevent
-  // 12s+ stretches that get even longer after gap-fill. Hard cap 8s,
-  // soft sentence-boundary cap 7s, sentence-change trigger at 6s.
-  // Pexels video clips are 5-10s; capping at 8s keeps source playback
-  // within natural duration (less freeze-frame perception on shorter
-  // clips) and Ken Burns stays lively on still images.
+  // Phase 15d: STRICT sentence-boundary cuts. Scenes close ONLY when
+  // the sentence changes (no more mid-sentence cuts). Soft target 5-8s,
+  // hard cap 15s emergency-break (single sentences >15s force a cut to
+  // prevent unwieldy scenes; rare in well-paced finance scripts). This
+  // produces natural flow at the cost of slightly uneven pacing —
+  // 15a+15e+15f variants will tune pacing within the sentence
+  // constraint.
+  const SCENE_SOFT_MIN = 4; // close at sentence-change once we're past this
+  const SCENE_HARD_MAX = 15; // emergency cut even mid-sentence
   const scenes = [];
   let cur = {start: rawBeats[0].start || 0, beats: [0]};
   for (let i = 1; i < rawBeats.length; i++) {
@@ -4711,7 +4774,10 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
     const wouldDur = (b.end || prevEnd) - cur.start;
     const accumDur = prevEnd - cur.start;
     const sentenceChanged = (b.sentence || '') !== (prevBeat.sentence || '');
-    if (wouldDur > 8 || (wouldDur > 7 && sentenceChanged) || (accumDur >= 6 && sentenceChanged)) {
+    // Close conditions, in priority order:
+    //  1. Hard cap exceeded (emergency — cut even mid-sentence)
+    //  2. Sentence boundary AND we're past the soft minimum
+    if (wouldDur > SCENE_HARD_MAX || (sentenceChanged && accumDur >= SCENE_SOFT_MIN)) {
       scenes.push(cur);
       cur = {start: b.start || prevEnd, beats: [i]};
     } else {
@@ -4764,6 +4830,11 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
     - mapStyle: "dark" (default — fits finance/news brand) | "satellite" | "streets"
     - zoom: 1-18 integer (continental=3, country=5, region=7, city=10) — only used when locations.length === 1, else auto-fit
 - fallbackChain: array of 1-3 assetTypes in fallback order (e.g., ["ai_generated", "stock_footage"])
+- pacingHint (Phase 15e — optional, default "standard"): one of "rapid" | "standard" | "slow" | "hold"
+    * "rapid" — for opening hooks, breaking-news moments, rapid-fire stat sequences, dramatic shock reveals
+    * "standard" — default narrative pace (most scenes)
+    * "slow" — for explanations of complex concepts, walking the viewer through cause and effect
+    * "hold" — for climactic statements, key numbers, callout-worthy quotes that should sit on screen
 
 Rules — pick the BEST type for EACH specific scene, NOT a default:
 
@@ -4862,12 +4933,18 @@ Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the
       fallbackChain: Array.isArray(e.fallbackChain)
         ? e.fallbackChain.filter((t) => validTypes.has(t)).slice(0, 3)
         : ['stock_footage'],
+      // Phase 15e: pacingHint (optional). Captured for downstream
+      // future use (transitions, Ken Burns intensity). Defaults to
+      // 'standard' when Claude omits or returns an invalid value.
+      pacingHint: ['rapid', 'standard', 'slow', 'hold'].includes(e.pacingHint) ? e.pacingHint : 'standard',
       resolvedSource: null,
       resolvedUrl: null,
     };
   });
+  // Phase 15e: count pacingHint distribution for telemetry
+  const pacingBreakdown = out.reduce((acc, s) => { acc[s.pacingHint] = (acc[s.pacingHint] || 0) + 1; return acc; }, {});
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-  console.log(`[scene-plan] generated ${out.length} scenes for ${rawBeats.length} beats in ${elapsed}s — types: ${JSON.stringify(breakdown)}`);
+  console.log(`[scene-plan] generated ${out.length} scenes for ${rawBeats.length} beats in ${elapsed}s — types: ${JSON.stringify(breakdown)} — pacing: ${JSON.stringify(pacingBreakdown)}`);
   return out;
 }
 
@@ -5041,6 +5118,7 @@ function applyScenesToBeats(rawBeats, scenes) {
         visualConcept: scene.visualConcept,
         aiPrompt: scene.aiPrompt || null,
         mapContext: scene.mapContext || null,
+        pacingHint: scene.pacingHint || 'standard',
       };
       touched++;
     }
