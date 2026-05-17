@@ -85,8 +85,11 @@ function getRemotionServeUrl(useStagingRender) {
   return useStagingRender === true ? REMOTION_LAMBDA_SERVE_URL_STAGING : REMOTION_LAMBDA_SERVE_URL_PROD;
 }
 // Music volume default. Per-channel UI override (channelMusicSettings.volume)
-// still wins. 0.05 is a deliberately quiet bed — never competes with voice.
-const DEFAULT_MUSIC_VOLUME = 0.05;
+// still wins. Phase-6b: bumped 0.05 → 0.08. At 0.05, ambient/suspense tracks
+// were near-inaudible under -14 LUFS voiceover (multiple "no music" reports);
+// 0.08 is a small lift that makes quiet tracks perceptible without crowding
+// voice. Loud orchestral tracks are still well below voice at this level.
+const DEFAULT_MUSIC_VOLUME = 0.08;
 function getDefaultMusicVolume() {
   return DEFAULT_MUSIC_VOLUME;
 }
@@ -3678,16 +3681,26 @@ function sliceCaptionsForSegment(captions, segStart, segEnd) {
 // skipped both as the "current" beat being stretched and as the "next"
 // neighbour driving the stretch — they're invisible to MainComp anyway.
 // Original `end` is preserved on `originalEnd` for diagnostics.
+// Source-name → renders-as-video classification. Mirror of MainComp.jsx
+// whitelist at line ~356. Used to decide gap-fill stretch budget:
+// images stretch infinitely (Ken Burns covers any duration), videos
+// have a Pexels-CDN-typical 5-10s natural duration so stretching them
+// further than ~3s past their natural end risks running out of frames
+// → black tail or frozen frame.
+const VIDEO_SOURCE_NAMES = new Set(['pexels', 'pixabay', 'wikimedia', 'archive', 'ai-video']);
+
 function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
-  // Phase-6b: gap-fill is now UNCAPPED for both beat- and scene-shaped
-  // footage. Phase-6a-fix originally capped scene-shaped at 1.5s to
-  // protect against null-url neighbors pulling a scene 20s long. That
-  // concern is moot in Phase-6b — the availability-probed scene plan
-  // GUARANTEES every scene has a working URL. Capping caused 0.5-5s
-  // BLACK intervals between scenes whenever inter-scene gap exceeded
-  // 1.5s (logged "stretched 82/115 beats" in failed run — most of
-  // those left visible black tails).
-  const cap = maxStretchSec != null ? maxStretchSec : Infinity;
+  // Phase-6b fix 2: per-entry cap. Image-shaped entries (fal-ai-image,
+  // mapbox-image, wikimedia-image, placeholder-black) get the original
+  // uncapped behavior — <Img> + Ken Burns gracefully covers any
+  // duration. Video-shaped entries (pexels et al.) cap at +3s past
+  // their natural end — Pexels videos are typically 5-10s, and
+  // OffthreadVideo's loop prop has known edge cases when the loop
+  // boundary lands mid-render-chunk, producing black tails. Cap of 3s
+  // means even a 5s source covers the most-common 4-8s scene duration
+  // plus a small headroom for gap-fill, but never extends so far past
+  // the source that loop failure produces visible black.
+  const explicitCap = maxStretchSec != null ? maxStretchSec : null;
   const result = footage.slice();
   for (let i = 0; i < result.length; i++) {
     const cur = result[i];
@@ -3701,6 +3714,8 @@ function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
       }
     }
     if ((cur.end || 0) < nextStart) {
+      const isVideo = VIDEO_SOURCE_NAMES.has(cur.source);
+      const cap = explicitCap != null ? explicitCap : (isVideo ? 3 : Infinity);
       const targetEnd = Math.min(nextStart, (cur.end || 0) + cap);
       if (targetEnd > (cur.end || 0)) {
         result[i] = {...cur, originalEnd: cur.end, end: targetEnd};
@@ -10023,10 +10038,19 @@ exports.autoPilotWorker = onRequest(
       proj = (await projRef.get()).data();
       ch = (await chRef.get()).data();
       if (!proj.youtubeVideoId) {
-        await setStage('7/7', 'Uploading + scheduling on YouTube…');
+        // Phase-6b fix 1: v7 staging renders upload as PERMANENTLY
+        // UNLISTED (no publishAt). YouTube would otherwise auto-flip
+        // any scheduled-private upload to PUBLIC at publishAt time.
+        // Staging videos must never enter the production scheduling
+        // pipeline — user keeps the URL for QA review, but the video
+        // never appears in search/feeds/recommendations.
+        const isStagingUpload = !!proj.autoPilot?.useStagingRender;
+        await setStage('7/7', isStagingUpload
+          ? 'Uploading to YouTube as UNLISTED (v7 staging — no public schedule)…'
+          : 'Uploading + scheduling on YouTube…');
         const sch = ch.publishSchedule || null;
         const lastSchedMs = sch?.lastScheduledAt?.toMillis?.() || 0;
-        const slotMs = autoPilotNextPublishSlot(sch, lastSchedMs);
+        const slotMs = isStagingUpload ? 0 : autoPilotNextPublishSlot(sch, lastSchedMs);
         const publishAtIso = slotMs ? new Date(slotMs).toISOString() : null;
         // Day-13 F4: auto-populate categoryId + tags. categoryId=24 (Entertainment)
         // for broader reach than the proxy's 22 default. Tags built from title +
@@ -10038,7 +10062,8 @@ exports.autoPilotWorker = onRequest(
           body: JSON.stringify({
             channelId, title: proj.ytTitle, description: proj.ytDesc || '',
             videoUrl: proj.editingFile.url, thumbnailUrl: proj.thumbnailUrl || '',
-            privacyStatus: 'private', publishAt: publishAtIso,
+            privacyStatus: isStagingUpload ? 'unlisted' : 'private',
+            publishAt: isStagingUpload ? null : publishAtIso,
             categoryId: DEFAULT_YOUTUBE_CATEGORY_ID, tags: ytTags,
           }),
         });
