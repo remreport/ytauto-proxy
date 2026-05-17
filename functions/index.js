@@ -3678,7 +3678,14 @@ function sliceCaptionsForSegment(captions, segStart, segEnd) {
 // skipped both as the "current" beat being stretched and as the "next"
 // neighbour driving the stretch — they're invisible to MainComp anyway.
 // Original `end` is preserved on `originalEnd` for diagnostics.
-function stretchFootageToFillGaps(footage, totalDuration) {
+function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
+  // Phase-6a-fix: scene-shaped footage (sceneIndex present) caps stretch
+  // at maxStretchSec (default 1.5s) so a single null-url scene cannot
+  // cause a neighbor to stretch by 10-20s. Beat-shaped footage retains
+  // the old unbounded behavior — beats are short (3-5s) and naturally
+  // contiguous, so the cap doesn't apply.
+  const looksSceneShaped = footage.some((f) => f && typeof f.sceneIndex === 'number');
+  const cap = maxStretchSec != null ? maxStretchSec : (looksSceneShaped ? 1.5 : Infinity);
   const result = footage.slice();
   for (let i = 0; i < result.length; i++) {
     const cur = result[i];
@@ -3692,7 +3699,10 @@ function stretchFootageToFillGaps(footage, totalDuration) {
       }
     }
     if ((cur.end || 0) < nextStart) {
-      result[i] = {...cur, originalEnd: cur.end, end: nextStart};
+      const targetEnd = Math.min(nextStart, (cur.end || 0) + cap);
+      if (targetEnd > (cur.end || 0)) {
+        result[i] = {...cur, originalEnd: cur.end, end: targetEnd};
+      }
     }
   }
   return result;
@@ -4323,12 +4333,14 @@ async function runAiVideoGenerationPass(footage, beatIndices, channelId, cfg, jo
 // beat.keywords; applyScenesToBeats() overrides those with scene-level
 // keywords for cohesion. Phase 2 does NOT yet route by assetType —
 // that's Phases 3-5. Gated behind useStagingRender per CONTRIBUTING.md.
-async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey) {
+async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurationSec) {
   if (!Array.isArray(rawBeats) || rawBeats.length === 0) return [];
-  // Group beats into scenes. Hard rule: close scene at sentence boundary
-  // once accumulated duration is 5-10s, or unconditionally at 12s.
-  // AssemblyAI sentence-level captions inform boundaries via beat.sentence
-  // (each beat carries the sentence text it was carved from).
+  // Group beats into scenes. Phase-6a-fixes: tighter caps to prevent
+  // 12s+ stretches that get even longer after gap-fill. Hard cap 8s,
+  // soft sentence-boundary cap 7s, sentence-change trigger at 6s.
+  // Pexels video clips are 5-10s; capping at 8s keeps source playback
+  // within natural duration (less freeze-frame perception on shorter
+  // clips) and Ken Burns stays lively on still images.
   const scenes = [];
   let cur = {start: rawBeats[0].start || 0, beats: [0]};
   for (let i = 1; i < rawBeats.length; i++) {
@@ -4338,7 +4350,7 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey) {
     const wouldDur = (b.end || prevEnd) - cur.start;
     const accumDur = prevEnd - cur.start;
     const sentenceChanged = (b.sentence || '') !== (prevBeat.sentence || '');
-    if (wouldDur > 12 || (wouldDur > 10 && sentenceChanged) || (accumDur >= 7.5 && sentenceChanged)) {
+    if (wouldDur > 8 || (wouldDur > 7 && sentenceChanged) || (accumDur >= 6 && sentenceChanged)) {
       scenes.push(cur);
       cur = {start: b.start || prevEnd, beats: [i]};
     } else {
@@ -4346,10 +4358,28 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey) {
     }
   }
   scenes.push(cur);
+  // Phase-6a-fix: force first scene to start at t=0 so MainComp covers
+  // the opening frames even if AssemblyAI's first caption starts slightly
+  // after 0 (dead-air trim leaves ~0.05-0.2s of leading micro-silence).
+  // Without this, no <Sequence> covers [0, firstBeat.start) → black screen
+  // for those frames.
+  if (scenes.length > 0) scenes[0].start = 0;
+  // Phase-6a-fix: extend last scene to cover full voiceover. Last
+  // AssemblyAI caption.end is sometimes 0.5-2s shy of actual voiceover
+  // duration; without this the trailing audio plays over black.
+  if (scenes.length > 0 && typeof voiceoverDurationSec === 'number' && voiceoverDurationSec > 0) {
+    const lastScene = scenes[scenes.length - 1];
+    const lastBeatIdx = lastScene.beats[lastScene.beats.length - 1];
+    const lastBeat = rawBeats[lastBeatIdx];
+    if (lastBeat && (lastBeat.end || 0) < voiceoverDurationSec) {
+      lastBeat._extendedEnd = voiceoverDurationSec;
+    }
+  }
 
   const sceneInputs = scenes.map((s, idx) => {
     const sceneBeats = s.beats.map((bi) => rawBeats[bi]);
-    const endSec = sceneBeats[sceneBeats.length - 1].end || s.start;
+    const lastBeat = sceneBeats[sceneBeats.length - 1];
+    const endSec = lastBeat._extendedEnd || lastBeat.end || s.start;
     const sentenceTexts = Array.from(new Set(sceneBeats.map((b) => b.sentence).filter(Boolean)));
     const keywordHints = Array.from(new Set(sceneBeats.flatMap((b) => b.keywords || [])));
     return {
@@ -4375,13 +4405,14 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey) {
 - fallbackChain: array of 1-3 assetTypes in fallback order (e.g., ["ai_generated", "stock_footage"])
 
 Rules:
-- Prefer stock_footage for actions/places with available real footage (trading floors, city skylines, people walking, hands on keyboards)
-- Prefer archival_photo for historic events, famous figures in known moments, vintage settings (only when truly historic)
-- Prefer ai_generated for ABSTRACT concepts that lack stock footage (recession metaphors, market collapse, supply chain, policy abstractions, "the system", "the cycle")
-- Prefer map ONLY when scene describes specific geographic information (where deals happened, country comparisons, supply routes)
-- Cap maps at 1-2 per video. If unsure, never use map.
+- DEFAULT to stock_footage. Stock works for nearly every finance/news scene — trading floors, city skylines, office settings, hands typing, paperwork, generic crowds, generic protests, etc. When in doubt, choose stock_footage.
+- ai_generated is BUDGET-CAPPED at ~$1/video (12 images max). HARD LIMIT: at most 25% of scenes may be ai_generated, and ONLY for scenes that are genuinely impossible to represent with stock (true abstractions like "the system collapsing", "shadow economy", "monetary tide", "policy machine") — NEVER for things stock can do (people walking, money, buildings, charts).
+- archival_photo ONLY for scenes describing pre-2000 historic events involving truly historic figures/moments (FDR signing the New Deal, 1929 floor traders, MLK speeches). Modern events (2010+) → stock_footage.
+- map ONLY when the scene names 2+ specific geographic locations being compared/connected. Cap at 1-2 per video total.
+- When unsure between any two types → pick stock_footage.
+- searchKeywords for stock must be CONCRETE and VISUAL (objects, settings, people doing things) not abstract concepts. "trading floor screens" beats "market panic", "federal reserve building" beats "monetary policy uncertainty", "businessman walking" beats "executive uncertainty".
 - searchKeywords must refine the beat hints with full scene context — better than the beat hints in isolation
-- fallbackChain MUST start with the primary assetType and list cheaper/safer fallbacks (never list map as a fallback)
+- fallbackChain MUST start with the primary assetType and list cheaper/safer fallbacks. ai_generated scenes MUST have stock_footage as the last fallback. Never list map as a fallback.
 
 Input scenes (JSON):
 ${JSON.stringify(sceneInputs, null, 2)}
@@ -4547,8 +4578,38 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
         validationFailures.push({url: cand, reason: v.reason});
       }
     }
+    // Phase-6a-fix: generic stock fallback so a scene NEVER has url=null.
+    // Null-url scenes render as black holes that gap-fill then stretches
+    // neighbor scenes over (root cause of 17s black starts + 20s clips).
+    // Try a short cascade of finance-generic queries before giving up.
     if (!url) {
-      console.log(`scene ${si + 1}: no validated match for "${query.slice(0, 60)}" — gap-fill or swap loop will cover`);
+      const genericQueries = [
+        'financial district city skyline night',
+        'businessman walking office corridor',
+        'stock market trading floor screens',
+        'modern office boardroom dark',
+        'abstract data visualization',
+      ];
+      for (const gq of genericQueries) {
+        const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(channelId, gq, 5, 'stock_footage');
+        const candidates = rawCandidates.filter((c) => !blocklist.has(c) && !usedStockUrls.has(c));
+        for (const cand of candidates) {
+          const v = await validatePexelsVideo(cand);
+          if (v.ok) {
+            url = cand;
+            source = pickedSource + '-generic';
+            usedStockUrls.add(cand);
+            console.log(`scene ${si + 1}: GENERIC fallback "${gq}" → ${cand.split('/').pop().slice(0, 60)}`);
+            break;
+          }
+        }
+        if (url) break;
+      }
+    }
+    if (!url) {
+      console.warn(`scene ${si + 1}: ALL fallbacks exhausted — using last-resort 1×1 black PNG to avoid render gap`);
+      url = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+      source = 'placeholder-black';
     }
 
     // Aggregate overlays + sfx from constituent beats. Remap timestamps
@@ -4741,7 +4802,10 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   if (useStagingRender) {
     try {
       const sceneT0 = Date.now();
-      scenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey);
+      const voiceoverDurForScenePlan = (captions && captions.length)
+        ? Math.max(...captions.map((c) => c.end || 0))
+        : 0;
+      scenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan);
       const touched = applyScenesToBeats(rawBeats, scenes);
       const sceneMs = Date.now() - sceneT0;
       await jobRef.update({
@@ -6049,7 +6113,12 @@ async function processJob(job) {
   let musicUrl = null;
   let pickedMood = null;
   let sfxLayer = [];
-  let musicVolume = getDefaultMusicVolume();
+  // Phase-6a-fix: v7 staging users report "no music" with the 0.05
+  // default — many tracks (especially ambient/suspense beds) are barely
+  // perceptible underneath -14 LUFS voiceover. Bump v7 default to 0.10
+  // (still well below voiceover); v6 production unchanged at 0.05.
+  // Channel-level musicSettings.volume always wins over both defaults.
+  let musicVolume = job.useStagingRender ? 0.10 : getDefaultMusicVolume();
   let musicSelection = null;
   const musicT0 = Date.now();
   const channelMusicSettings = await getChannelMusicSettings(job.channelId);
@@ -6076,7 +6145,7 @@ async function processJob(job) {
       });
       musicUrl = sel.url;
       musicSelection = sel;
-      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : getDefaultMusicVolume();
+      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : (job.useStagingRender ? 0.10 : getDefaultMusicVolume());
       console.log(`music: "${sel.trackName}" id=${sel.trackId} mood=${sel.trackMood} dur=${Math.round(sel.trackDuration)}s vol=${musicVolume.toFixed(3)} — ${sel.reasoning}`);
       // Save the pick on the project doc so the user can trace which
       // track was used if a YouTube Content ID claim shows up later.
@@ -6097,7 +6166,7 @@ async function processJob(job) {
     } catch (selErr) {
       console.warn(`Claude music selection failed (${selErr.message}) — falling back to mood-random`);
       musicUrl = await pickMusicTrack(job.channelId, pickedMood);
-      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : getDefaultMusicVolume();
+      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : (job.useStagingRender ? 0.10 : getDefaultMusicVolume());
     }
   } catch (e) {
     console.warn(`Music pick failed entirely: ${e.message} — fallback will substitute`);
@@ -8708,18 +8777,56 @@ function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFo
   // Subject: title is the headline.
   parts.push(`Subject: ${(title || '').slice(0, 120)}.`);
 
-  // First named person/company is featured photorealistically.
+  // Phase-6a-fix: text-to-image models (Pikzels pkz_4) cannot render
+  // real-person likenesses — when prompted with a celebrity name they
+  // produce a generic random face that looks like NOBODY in particular.
+  // User report: "thumbnail uses random AI person instead of recognizable
+  // real person". Fix: never ask for a person's face. For person entities,
+  // use representational visuals (institutional setting, silhouette,
+  // suit/podium iconography) so the visual conveys authority without
+  // attempting an unrecognizable portrait.
   const entList = Array.isArray(entities) ? entities.slice(0, 1) : [];
   for (const e of entList) {
     if (e?.type === 'person') {
-      parts.push(`Feature ${e.name} photorealistically with ${getExpressionForTopic(topic, 0)} expression — recognizable face, dramatic side-lighting.`);
+      // Map known finance institutions → iconic visual. Falls back to
+      // generic "powerful figure" iconography when no institution match.
+      const nameLow = String(e.name || '').toLowerCase();
+      let symbolic;
+      if (/powell|fed|federal reserve|yellen/.test(nameLow)) {
+        symbolic = 'Federal Reserve building marble façade with American flag, dramatic angle, podium microphone in foreground';
+      } else if (/trump|biden|obama|president/.test(nameLow)) {
+        symbolic = 'White House podium with presidential seal, empty microphone, dramatic side-lighting';
+      } else if (/xi|china/.test(nameLow)) {
+        symbolic = 'Tiananmen / Great Hall of the People exterior with red Chinese flags';
+      } else if (/musk|tesla|spacex/.test(nameLow)) {
+        symbolic = 'Tesla / SpaceX factory or rocket silhouette under dramatic sky';
+      } else if (/dimon|jpmorgan|chase/.test(nameLow)) {
+        symbolic = 'JPMorgan Chase tower exterior with corporate logo, glass façade reflections';
+      } else if (/ackman|hedge fund|pershing/.test(nameLow)) {
+        symbolic = 'Manhattan hedge-fund office tower, trading floor screens visible through windows';
+      } else if (/buffett|berkshire/.test(nameLow)) {
+        symbolic = 'Berkshire Hathaway sign / Omaha conference hall with empty chairs';
+      } else {
+        symbolic = `Symbolic institutional setting associated with ${e.name} — boardroom / podium / corporate tower exterior — NO human face`;
+      }
+      parts.push(`Right half: ${symbolic}. Photorealistic, dramatic side-lighting. NEVER generate a portrait or face of ${e.name} (model cannot render real-person likenesses — use the symbolic setting instead).`);
     } else if (e?.type === 'company') {
       parts.push(`Show ${e.name} logo / branding prominently in the right half.`);
     } else if (e?.type === 'place') {
       parts.push(`Iconic visual of ${e.name} (skyline / landmark) filling the right half.`);
     } else if (e?.name) {
-      parts.push(`Feature ${e.name}.`);
+      // Unknown-type entity: representational only, never a face.
+      parts.push(`Right half: symbolic visual referencing ${e.name} (setting / object / location — NO human portraits).`);
+    } else {
+      // No entity at all: use abstract finance/news iconography rather
+      // than letting Pikzels improvise a generic person.
+      parts.push('Right half: dramatic abstract finance imagery — trading screens with red/orange data, financial district skyline at dusk, or breaking-news graphic. NO human portraits.');
     }
+  }
+  // Belt-and-braces: even if entList was empty above, ensure NO PORTRAIT
+  // policy is explicit so Pikzels doesn't default to inventing a face.
+  if (entList.length === 0) {
+    parts.push('Right half: dramatic abstract finance imagery — trading screens with red/orange data, financial district skyline at dusk, or breaking-news graphic. NO human portraits.');
   }
 
   // Text overlay — the headline number / hook. Anton white, with stat in Anton orange.
@@ -8728,7 +8835,7 @@ function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFo
     parts.push(`Left text block: large Anton UPPERCASE headline "${overlay.slice(0, 30)}" in white; smaller Anton orange stat / subtitle below. Never over the subject's face.`);
   }
 
-  parts.push('NOT cartoon, NOT generic stock, NOT 3D-render look.');
+  parts.push('NOT cartoon, NOT generic stock, NOT 3D-render look. NO random/invented human portraits — model cannot render real-person likenesses, so use symbolic/institutional visuals instead.');
 
   // Optional bias: channel's proven expressions if extracted.
   if (ownFormula && Array.isArray(ownFormula.commonExpressions) && ownFormula.commonExpressions.length) {
