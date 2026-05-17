@@ -3369,6 +3369,18 @@ async function deepValidateBeat(url, opts = {}) {
 // stored Pexels alternates first — these are fast (one fetch + one
 // probe each, no external API) and don't touch Replicate. Only fall
 // back to Flux when every alternate fails.
+// Phase-6b CRITICAL: source names that produce IMAGE assets (PNG/JPEG)
+// rather than video files. Preflight's deepValidateBeat is video-only
+// (ffprobe expects a video stream); running it on PNGs throws "no
+// video stream" → preflight nuked + blocklisted + cache-evicted every
+// fal-ai-image / mapbox-image / wikimedia-image URL → MainComp received
+// null URLs for those scenes → BLACK SCREENS for every image-source
+// scene in v7 staging renders. This whitelist makes preflight skip
+// image sources (they get a HEAD-probe instead for defense-in-depth).
+const PREFLIGHT_IMAGE_SOURCES = new Set([
+  'fal-ai-image', 'wikimedia-image', 'mapbox-image', 'placeholder-black', 'flux',
+]);
+
 async function preflightValidateFootage(footage, jobRef, {channelId} = {}) {
   selfTestFfprobeOnce();
   const VALIDATE_BATCH = 5;
@@ -3382,6 +3394,8 @@ async function preflightValidateFootage(footage, jobRef, {channelId} = {}) {
   const failures = [];
   let probedCount = 0;
   let evictedCount = 0;
+  let imageHeadProbed = 0;
+  let imageHeadFailed = 0;
   for (let i = 0; i < footage.length; i += VALIDATE_BATCH) {
     const end = Math.min(i + VALIDATE_BATCH, footage.length);
     await jobRef.update({
@@ -3390,7 +3404,30 @@ async function preflightValidateFootage(footage, jobRef, {channelId} = {}) {
     });
     await Promise.all(footage.slice(i, end).map(async (beat, batchIdx) => {
       const idx = i + batchIdx;
-      if (!beat || !beat.url || beat.source === 'flux') return;
+      if (!beat || !beat.url) return;
+      // Phase-6b CRITICAL fix: image-source beats use HEAD probe, NOT
+      // ffprobe. Defense-in-depth confirms the image URL is reachable
+      // + returns image/* content-type, without spawning ffprobe (which
+      // would falsely fail on PNGs). Failures here are best-effort
+      // logs only — we do NOT null the beat, since the image is the
+      // ONLY asset planned for this scene (no alternates exist for
+      // ai_generated / map / archival_photo scenes). Better to let
+      // Lambda attempt the URL and produce a partial render than to
+      // wipe the URL and produce black.
+      if (PREFLIGHT_IMAGE_SOURCES.has(beat.source)) {
+        imageHeadProbed++;
+        try {
+          const r = await validateImageUrl(beat.url);
+          if (!r.ok) {
+            imageHeadFailed++;
+            console.warn(`[preflight] scene ${idx + 1} image HEAD probe failed (${beat.source}): ${r.reason} — keeping URL, Lambda will retry`);
+          }
+        } catch (e) {
+          imageHeadFailed++;
+          console.warn(`[preflight] scene ${idx + 1} image HEAD probe threw (${beat.source}): ${e.message}`);
+        }
+        return;
+      }
       probedCount++;
       try {
         const r = await deepValidateBeat(beat.url);
@@ -3409,6 +3446,9 @@ async function preflightValidateFootage(footage, jobRef, {channelId} = {}) {
         }
       }
     }));
+  }
+  if (imageHeadProbed) {
+    console.log(`[preflight] image scenes: ${imageHeadProbed} HEAD-probed, ${imageHeadFailed} failed (kept anyway — no alternates exist for image-source scenes)`);
   }
   const probeMs = Date.now() - t0;
 
