@@ -4585,9 +4585,12 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       }
     }
     // Phase-6a-fix: generic stock fallback so a scene NEVER has url=null.
-    // Null-url scenes render as black holes that gap-fill then stretches
-    // neighbor scenes over (root cause of 17s black starts + 20s clips).
-    // Try a short cascade of finance-generic queries before giving up.
+    // Source name stays canonical (e.g. 'pexels') so MainComp's
+    // video-source whitelist matches; genericFallback flag retained on
+    // the footage entry for telemetry/diagnostics.
+    // Fix-C: widened from 5 → 10 queries with thematic variety so the
+    // cascade is more likely to hit a working URL on flaky days.
+    let genericFallbackUsed = false;
     if (!url) {
       const genericQueries = [
         'financial district city skyline night',
@@ -4595,27 +4598,69 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
         'stock market trading floor screens',
         'modern office boardroom dark',
         'abstract data visualization',
+        'banker handshake suit business',
+        'central bank building marble columns',
+        'newspaper headlines breaking finance',
+        'global currency money exchange',
+        'aerial city economic activity',
       ];
       for (const gq of genericQueries) {
         const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(channelId, gq, 5, 'stock_footage');
         const candidates = rawCandidates.filter((c) => !blocklist.has(c) && !usedStockUrls.has(c));
         for (const cand of candidates) {
           const v = await validatePexelsVideo(cand);
-          if (v.ok) {
-            url = cand;
-            source = pickedSource + '-generic';
-            usedStockUrls.add(cand);
-            console.log(`scene ${si + 1}: GENERIC fallback "${gq}" → ${cand.split('/').pop().slice(0, 60)}`);
-            break;
-          }
+          if (!v.ok) continue;
+          // Fix-C: secondary HEAD probe — validatePexelsVideo only checks
+          // the ftyp box, not whether the bytes are actually reachable.
+          // Many stale Pexels CDN URLs pass content-check but 403 at
+          // preflight. A 2-second HEAD probe catches those upfront.
+          let reachable = true;
+          try {
+            const headProbe = await fetch(cand, {method: 'HEAD', signal: AbortSignal.timeout(2500)});
+            reachable = headProbe.ok;
+          } catch { reachable = false; }
+          if (!reachable) continue;
+          url = cand;
+          source = pickedSource; // Fix-B: canonical name matches MainComp whitelist
+          genericFallbackUsed = true;
+          usedStockUrls.add(cand);
+          console.log(`scene ${si + 1}: GENERIC fallback "${gq}" → ${cand.split('/').pop().slice(0, 60)}`);
+          break;
         }
         if (url) break;
       }
     }
+    // Fix-C: archival_photo (Wikimedia Commons) as PRE-PNG resort. Free,
+    // image-shaped (validates differently), totally separate CDN from
+    // Pexels — covers the case where Pexels is having a bad day.
     if (!url) {
+      try {
+        const {urls: rawCandidates} = await searchAllFootageSources(channelId, query || 'financial history', 3, 'archival_photo');
+        for (const cand of rawCandidates) {
+          if (blocklist.has(cand) || usedStockUrls.has(cand)) continue;
+          const v = await validateImageUrl(cand);
+          if (v.ok) {
+            url = cand;
+            source = 'wikimedia-image';
+            genericFallbackUsed = true;
+            usedStockUrls.add(cand);
+            console.log(`scene ${si + 1}: WIKIMEDIA-IMAGE fallback → ${cand.split('/').pop().slice(0, 60)}`);
+            break;
+          }
+        }
+      } catch (e) {
+        console.warn(`scene ${si + 1}: wikimedia fallback threw: ${e.message}`);
+      }
+    }
+    if (!url) {
+      // Last resort: 1×1 black PNG via data URL. MainComp routes this
+      // to <Img> which DOES render data URLs correctly. Source name
+      // stays 'placeholder-black' so the video preflight + cache code
+      // skips it (it's not a real video URL).
       console.warn(`scene ${si + 1}: ALL fallbacks exhausted — using last-resort 1×1 black PNG to avoid render gap`);
       url = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
       source = 'placeholder-black';
+      genericFallbackUsed = true;
     }
 
     // Aggregate overlays + sfx from constituent beats. Remap timestamps
@@ -4663,6 +4708,7 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       ...(aggregatedOverlays.length ? {overlays: aggregatedOverlays} : {}),
       ...(musicMood ? {musicMoodFromClaude: musicMood} : {}),
       ...(validationFailures.length ? {pexelsValidationFailures: validationFailures} : {}),
+      ...(genericFallbackUsed ? {genericFallback: true} : {}),
       // Scene metadata for diagnostics / future analysis
       assetType: scene.assetType,
       visualConcept: scene.visualConcept,
@@ -5644,6 +5690,17 @@ async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = 
       // matching the user-promised "$5-10 but guaranteed completion"
       // trade. Only fires once per render — if the AI-only retry still
       // fails, the original CORRUPT_SOURCE error throws.
+      // Phase-6a-fix A: gate aiOnlyFallback on useStagingRender=false.
+      // v7 scene-driven path already has its own generic-stock cascade
+      // (Pexels generic queries → Wikimedia → 1×1 PNG placeholder) which
+      // guarantees every scene has a URL upfront. The Kling-based
+      // emergency fallback ($5-10/render) was v6's last-resort safety
+      // net; with v7's upfront cascade it's redundant + violates the
+      // "no Kling in scene-driven" intent + creates cost overruns.
+      if (attempt >= maxAttempts && useStagingRender) {
+        console.warn(`[${jobId}] ${label} hit ${maxAttempts} swap attempts — v7 scene-driven mode: skipping Kling AI-only fallback, throwing CORRUPT_SOURCE`);
+        throw e;
+      }
       if (attempt >= maxAttempts) {
         if (aiOnlyAttempted) throw e;
         aiOnlyAttempted = true;
