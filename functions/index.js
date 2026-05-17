@@ -1027,7 +1027,7 @@ async function fetchWikipediaImage(name) {
 // at the start of each beat that mentions them. Mutates `rawBeats` in
 // place. No-op if no beats have entities. Caps total enrichment time
 // at ~6s (12 entities × 500ms typical Wikipedia latency).
-async function enrichBeatsWithEntityImages(rawBeats) {
+async function enrichBeatsWithEntityImages(rawBeats, captions = null) {
   if (!Array.isArray(rawBeats) || rawBeats.length === 0) return;
   const unique = new Map(); // canonicalName → {type, imageUrl?}
   for (const b of rawBeats) {
@@ -1072,31 +1072,118 @@ async function enrichBeatsWithEntityImages(rawBeats) {
   const logoCount = results.filter((r) => r.source === 'logo.dev' && r.imageUrl).length;
   const wikiCount = results.filter((r) => r.source === 'wikipedia' && r.imageUrl).length;
   console.log(`[entities] resolved images: ${logoCount} via logo.dev, ${wikiCount} via wikipedia`);
-  // Inject ONE entityPortrait per beat — but dedup at IMAGE-URL level.
-  // User feedback: "never repeat pictures". Previously the same entity
-  // (e.g. Powell mentioned 4 times) injected the identical Wikipedia
-  // portrait 4 times. Now we track every URL we've already used in
-  // this video; subsequent beats referencing the same image skip the
-  // portrait overlay entirely (the name still narrates via the script).
-  // Aliases that resolve to the same Wikipedia article (e.g. "Powell"
-  // and "Jerome Powell") share an imageUrl and are caught here too.
+  // Phase-6b quality fix C: portrait overlays now fire ONCE PER SENTENCE
+  // each entity is mentioned — not once per video. User feedback: "When
+  // people/companies/logos are mentioned, picture/logo should appear
+  // EXACTLY at that moment, nearly every mention." The original
+  // once-per-video dedup left 56 entity mentions un-illustrated in a
+  // typical 10-min video.
   //
-  // SFX-on-appear: when we inject a portrait, push a 'whoosh' SFX at
-  // offset 0 so it audibly punctuates the slide-in. Skipped if the
-  // beat already has the 2-sfx max so we don't stack on Claude's own
-  // SFX requests.
-  // True if a beat already carries a bigStat in ANY position. With the
-  // new "max 1 overlay per beat" rule, ANY co-located overlay collides
-  // — bigStat always wins per the data-loss-preferred policy, so defer
-  // entityPortrait to an adjacent clean beat regardless of bigStat's
-  // position field.
+  // New algorithm:
+  //   1. Find ALL caption mentions of every resolved entity (across
+  //      the full transcript)
+  //   2. Dedup by SENTENCE — at most ONE portrait per entity per
+  //      AssemblyAI sentence
+  //   3. Enforce 4s minimum gap between same-entity portraits (covers
+  //      back-to-back short sentences mentioning same name)
+  //   4. Map each mention to the rawBeat covering that timestamp
+  //   5. Place portrait at the EXACT caption-derived offset on that beat
+  //   6. Skip beats whose home is bigStat-occupied (existing rule
+  //      preserved — bigStat always wins per data-loss-preferred policy)
+  //
+  // Falls back to the legacy "once per beat from entity list" path when
+  // captions are not provided (script-only callers, tests).
   const hasBigStat = (beat) => Array.isArray(beat?.overlays) && beat.overlays.some((ov) => ov?.type === 'bigStat');
-  // Build a {name, entityType, imageUrl, sourceBeatIdx} list — defer
-  // candidates whose home beat is bigStat-occupied to the next clean
-  // beat. The two-pass design is so logging/dedup matches the actual
-  // landed beat, not the original mention.
-  const usedImageUrls = new Set();
+  const findBeatCoveringTime = (t) => {
+    for (let i = 0; i < rawBeats.length; i++) {
+      const b = rawBeats[i];
+      if ((b.start || 0) <= t && t < (b.end || 0)) return i;
+    }
+    return rawBeats.length - 1;
+  };
+
   let injected = 0;
+  let perSentenceSkipped = 0;
+  let perEntitySpacingSkipped = 0;
+  let bigStatCollisionDropped = 0;
+
+  if (Array.isArray(captions) && captions.length > 0) {
+    // ── PATH A: caption-driven, per-sentence dedup ────────────────
+    // Build a flat list of (entity, mention) pairs across all entities.
+    // Then dedup by (entityName, sentenceStart) and enforce per-entity
+    // 4s spacing globally.
+    const MIN_SAME_ENTITY_GAP_SEC = 4;
+    const placementCandidates = [];
+    for (const [name, meta] of unique) {
+      if (!meta?.imageUrl) continue;
+      const mentions = findAllEntityMentionsInCaptions(name, captions);
+      if (mentions.length === 0) continue;
+      // Per-sentence dedup: keep only the FIRST mention in each sentence
+      const seenSentences = new Set();
+      for (const m of mentions) {
+        const sentKey = `${m.sentenceStart.toFixed(1)}-${m.sentenceEnd.toFixed(1)}`;
+        if (seenSentences.has(sentKey)) { perSentenceSkipped++; continue; }
+        seenSentences.add(sentKey);
+        placementCandidates.push({
+          name, entityType: meta.type, imageUrl: meta.imageUrl, imageSource: meta.imageSource,
+          timestamp: m.timestamp,
+        });
+      }
+    }
+    // Sort by timestamp so spacing logic can scan forward
+    placementCandidates.sort((a, b) => a.timestamp - b.timestamp);
+    // Per-entity 4s gap enforcement (global across the video)
+    const lastPlacedAt = new Map(); // entityName → timestamp
+    for (const c of placementCandidates) {
+      const prev = lastPlacedAt.get(c.name);
+      if (prev != null && c.timestamp - prev < MIN_SAME_ENTITY_GAP_SEC) {
+        perEntitySpacingSkipped++;
+        continue;
+      }
+      // Find beat covering this timestamp; defer if bigStat collision
+      let beatIdx = findBeatCoveringTime(c.timestamp);
+      if (beatIdx < 0) continue;
+      let beat = rawBeats[beatIdx];
+      if (hasBigStat(beat)) {
+        // Try next beat if it's clean and the mention is near its start
+        const nextIdx = beatIdx + 1;
+        if (nextIdx < rawBeats.length && !hasBigStat(rawBeats[nextIdx])) {
+          beatIdx = nextIdx;
+          beat = rawBeats[nextIdx];
+        } else {
+          bigStatCollisionDropped++;
+          continue;
+        }
+      }
+      const beatStart = beat.start || 0;
+      const beatEnd = beat.end || 0;
+      const beatDur = Math.max(1, beatEnd - beatStart);
+      const offset = Math.max(0, Math.min(beatDur - 0.5, c.timestamp - beatStart));
+      const overlayDuration = Math.min(beatDur - offset, 3.5);
+      beat.overlays = beat.overlays || [];
+      beat.overlays.push({
+        type: 'entityPortrait',
+        name: c.name,
+        entityType: c.entityType,
+        imageUrl: c.imageUrl,
+        imageSource: c.imageSource,
+        position: 'topRight',
+        startOffset: offset,
+        duration: overlayDuration,
+      });
+      beat.sfx = beat.sfx || [];
+      if (beat.sfx.length < 2) beat.sfx.push({tag: 'whoosh', offset: Math.max(0, offset - 0.05)});
+      lastPlacedAt.set(c.name, c.timestamp);
+      injected++;
+    }
+    console.log(`[entities] injected ${injected} entityPortrait overlays (per-sentence dedup) — skipped ${perSentenceSkipped} same-sentence dupes, ${perEntitySpacingSkipped} within 4s spacing window, ${bigStatCollisionDropped} bigStat-collisions`);
+    return;
+  }
+
+  // ── PATH B: fallback to legacy once-per-video-per-image dedup ──
+  // (Only when captions aren't available — should be rare in practice.)
+  const usedImageUrls = new Set();
+  let injectedLegacy = 0;
   let skippedDuplicates = 0;
   let deferred = 0;
   let deferralFailed = 0;
@@ -1106,26 +1193,14 @@ async function enrichBeatsWithEntityImages(rawBeats) {
     const firstWithImage = b.entities.find((e) => e?.name && unique.get(e.name.trim())?.imageUrl);
     if (!firstWithImage) continue;
     const enriched = unique.get(firstWithImage.name.trim());
-    if (usedImageUrls.has(enriched.imageUrl)) {
-      skippedDuplicates++;
-      continue;
-    }
-    // Pick landing beat. Prefer the home beat; if it has a centered
-    // bigStat, try the next beat. If that ALSO has a centered bigStat
-    // (or doesn't exist), skip the entity entirely — visible overlap
-    // would be worse than a missing portrait.
+    if (usedImageUrls.has(enriched.imageUrl)) { skippedDuplicates++; continue; }
     let landingIdx = i;
     if (hasBigStat(b)) {
       const nextIdx = i + 1;
       if (nextIdx < rawBeats.length && !hasBigStat(rawBeats[nextIdx])) {
         landingIdx = nextIdx;
         deferred++;
-        console.log(`[entities] deferred entity "${firstWithImage.name}" from beat ${i} to ${nextIdx} — bigStat-center present on home beat`);
-      } else {
-        deferralFailed++;
-        console.log(`[entities] skipped entity "${firstWithImage.name}" on beat ${i} — bigStat-center present, no clean adjacent beat`);
-        continue;
-      }
+      } else { deferralFailed++; continue; }
     }
     usedImageUrls.add(enriched.imageUrl);
     const landing = rawBeats[landingIdx];
@@ -1143,12 +1218,10 @@ async function enrichBeatsWithEntityImages(rawBeats) {
       duration: overlayDuration,
     });
     landing.sfx = landing.sfx || [];
-    if (landing.sfx.length < 2) {
-      landing.sfx.push({tag: 'whoosh', offset: 0});
-    }
-    injected++;
+    if (landing.sfx.length < 2) landing.sfx.push({tag: 'whoosh', offset: 0});
+    injectedLegacy++;
   }
-  console.log(`[entities] injected ${injected} entityPortrait overlays (deferred ${deferred} to adjacent beat, dropped ${deferralFailed} for unresolvable bigStat collision), skipped ${skippedDuplicates} duplicate-image beat(s)`);
+  console.log(`[entities] LEGACY path (no captions): injected ${injectedLegacy} (deferred ${deferred}, dropped ${deferralFailed}), skipped ${skippedDuplicates} duplicate-image beat(s)`);
 }
 
 // Cap every Claude-placed overlay's `duration` to its parent beat's
@@ -1572,10 +1645,13 @@ function parseStatNumber(text) {
   const n = parseFloat(m[1].replace(/,/g, ''));
   if (!Number.isFinite(n)) return null;
   const lower = (text || '').toLowerCase();
-  if (/trillion|\bt\b/.test(lower)) return n * 1e12;
-  if (/billion|\bb\b/.test(lower)) return n * 1e9;
-  if (/million|\bm\b/.test(lower)) return n * 1e6;
-  if (/thousand|\bk\b/.test(lower)) return n * 1e3;
+  // Phase-6b: relaxed unit detection. \b doesn't fire between digit
+  // and letter (e.g. "50b" has no boundary between 0 and b), so
+  // /\bb\b/ missed "$50B". Now also matches digit+letter pattern.
+  if (/trillion|\d\s*t\b/.test(lower)) return n * 1e12;
+  if (/billion|\d\s*b\b/.test(lower)) return n * 1e9;
+  if (/million|\d\s*m\b/.test(lower)) return n * 1e6;
+  if (/thousand|\d\s*k\b/.test(lower)) return n * 1e3;
   return n;
 }
 
@@ -1673,6 +1749,152 @@ function findStatFirstMentionInCaptions(statText, captions, startSec, endSec) {
     }
   }
   return null;
+}
+
+// Phase-6b quality fix B: number → word forms for stat-overlay matching.
+// AssemblyAI captions typically transcribe "$50 billion" as the WORDS
+// "fifty billion" or "50 billion" — never "$50B". The old
+// findStatFirstMentionInCaptions only matched by NUMERIC value, so
+// "2%" never matched the spoken "two percent" and the overlay landed
+// on Claude's guessed beat offset (often visibly wrong). This helper
+// produces the alternate string forms so a follow-up text search can
+// find spoken-word renderings.
+const _DIGIT_WORDS = ['zero','one','two','three','four','five','six','seven','eight','nine','ten','eleven','twelve','thirteen','fourteen','fifteen','sixteen','seventeen','eighteen','nineteen'];
+const _TENS_WORDS = ['','','twenty','thirty','forty','fifty','sixty','seventy','eighty','ninety'];
+function _intToWords(n) {
+  if (!Number.isFinite(n) || n < 0) return null;
+  if (n < 20) return _DIGIT_WORDS[n];
+  if (n < 100) {
+    const t = Math.floor(n / 10);
+    const o = n % 10;
+    return o === 0 ? _TENS_WORDS[t] : `${_TENS_WORDS[t]} ${_DIGIT_WORDS[o]}`;
+  }
+  if (n < 1000) {
+    const h = Math.floor(n / 100);
+    const rest = n % 100;
+    return rest === 0 ? `${_DIGIT_WORDS[h]} hundred` : `${_DIGIT_WORDS[h]} hundred ${_intToWords(rest)}`;
+  }
+  return null; // numbers ≥1000 — let the digit form carry it
+}
+function expandStatTextVariants(text) {
+  const out = new Set();
+  const raw = (text || '').trim();
+  if (!raw) return [];
+  out.add(raw.toLowerCase());
+  out.add(raw.replace(/[\$%,]/g, '').toLowerCase().trim());
+  const num = parseStatNumber(raw);
+  if (num === null) return [...out].filter(Boolean);
+  // Unit detection: $/percent/billion/etc.
+  const lower = raw.toLowerCase();
+  const hasDollar = /\$/.test(raw);
+  const isPercent = /(%|\bpercent\b|\bper cent\b)/i.test(lower);
+  // Unit detection: match "$50B", "50b", "$1.4 trillion", "50 billion" etc.
+  // The digit-adjacent forms (50B, 50b) need a relaxed pattern — \b doesn't
+  // fire between digit and letter, so /\bb\b/ wouldn't catch "50b".
+  let unit = '';
+  if (/\btrillion\b|\d\s*t\b/.test(lower)) unit = 'trillion';
+  else if (/\bbillion\b|\d\s*b\b/.test(lower)) unit = 'billion';
+  else if (/\bmillion\b|\d\s*m\b/.test(lower)) unit = 'million';
+  else if (/\bthousand\b|\d\s*k\b/.test(lower)) unit = 'thousand';
+  const baseNum = unit ? num / ({trillion: 1e12, billion: 1e9, million: 1e6, thousand: 1e3}[unit]) : num;
+  // Compose digit forms
+  const digitForms = new Set();
+  if (Number.isInteger(baseNum)) {
+    digitForms.add(`${baseNum}`);
+  } else {
+    digitForms.add(baseNum.toString());
+    digitForms.add(baseNum.toFixed(1));
+    digitForms.add(baseNum.toFixed(2));
+  }
+  // Compose word forms (only for clean integers)
+  const wordForms = new Set();
+  if (Number.isInteger(baseNum) && baseNum < 1000) {
+    const w = _intToWords(baseNum);
+    if (w) wordForms.add(w);
+  }
+  // Cross-product with unit + percent + dollar variants
+  const allNumForms = [...digitForms, ...wordForms];
+  for (const numForm of allNumForms) {
+    if (unit) {
+      out.add(`${numForm} ${unit}`);
+      if (hasDollar) out.add(`${numForm} ${unit} dollars`);
+    } else if (isPercent) {
+      out.add(`${numForm} percent`);
+      out.add(`${numForm} per cent`);
+      out.add(`${numForm}%`);
+    } else if (hasDollar) {
+      out.add(`$${numForm}`);
+      out.add(`${numForm} dollars`);
+    } else {
+      out.add(numForm);
+    }
+  }
+  return [...out].filter(Boolean);
+}
+// Search for any of the stat-text variants in captions. Returns first
+// match's absolute timestamp, or null.
+function findStatTextVariantInCaptions(statText, captions, startSec, endSec) {
+  const variants = expandStatTextVariants(statText);
+  if (variants.length === 0) return null;
+  // Build a quick lookup: walk captions, for each sentence, scan word
+  // window of size 1-4 for any variant.
+  for (const sentence of captions || []) {
+    if (!sentence) continue;
+    if (typeof sentence.start === 'number' && sentence.start > endSec) break;
+    if (typeof sentence.end === 'number' && sentence.end < startSec) continue;
+    const words = sentence.words || [];
+    for (let i = 0; i < words.length; i++) {
+      const w0 = words[i];
+      if (typeof w0.start !== 'number' || w0.start < startSec || w0.start > endSec) continue;
+      for (let span = 1; span <= 4 && i + span <= words.length; span++) {
+        const chunk = words.slice(i, i + span).map((w) => (w.text || '').toLowerCase().replace(/[.,!?]/g, '')).join(' ').trim();
+        for (const v of variants) {
+          if (chunk === v) return w0.start;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// Phase-6b quality fix C: find EVERY mention of an entity across the
+// full caption transcript, with the sentence each mention falls into.
+// Used to inject portrait overlays on (nearly) every spoken mention —
+// not just the first — for the "video feels synced to script" effect.
+// Returns: [{timestamp, sentenceStart, sentenceEnd}, ...] sorted by ts.
+function findAllEntityMentionsInCaptions(entityName, captions) {
+  const target = normalizeEntityForMatch(entityName);
+  const hits = [];
+  if (!target || target.length < 3) return hits;
+  for (const sentence of captions || []) {
+    if (!sentence) continue;
+    const words = sentence.words || [];
+    for (let i = 0; i < words.length; i++) {
+      const w0 = words[i];
+      if (typeof w0.start !== 'number') continue;
+      let combined = '';
+      for (let j = i; j < Math.min(i + 5, words.length); j++) {
+        const norm = normalizeEntityForMatch(words[j].text);
+        if (!norm) continue;
+        combined += norm;
+        let matched = false;
+        if (combined === target) matched = true;
+        else if (combined.length >= 4 && combined.includes(target)) matched = true;
+        else if (combined.length >= 4 && combined.length >= target.length * 0.4 && target.includes(combined)) matched = true;
+        else if (combined.length >= 4 && Math.abs(combined.length - target.length) <= 2 && levenshtein(combined, target) <= 2) matched = true;
+        if (matched) {
+          hits.push({
+            timestamp: w0.start,
+            sentenceStart: sentence.start ?? w0.start,
+            sentenceEnd: sentence.end ?? w0.start,
+          });
+          break; // one hit per starting position
+        }
+        if (combined.length > target.length + 5) break;
+      }
+    }
+  }
+  return hits;
 }
 function anchorOverlaysToTimingTags(rawBeats, timingTags) {
   if (!Array.isArray(rawBeats) || !Array.isArray(timingTags) || timingTags.length === 0) return 0;
@@ -1801,6 +2023,13 @@ function verifyAndScoreOverlays(rawBeats, captions) {
         needsVerification = true;
         searchLabel = ov.text;
         captionAnchorAbs = findStatFirstMentionInCaptions(ov.text, captions, windowStart, windowEnd);
+        // Phase-6b quality fix B: numeric match failed → try string
+        // variants (digits ↔ words, $/percent/billion expansions).
+        // Captures the most common miss: "2%" overlay vs "two percent"
+        // spoken; "$50B" overlay vs "fifty billion" spoken.
+        if (captionAnchorAbs === null) {
+          captionAnchorAbs = findStatTextVariantInCaptions(ov.text, captions, windowStart, windowEnd);
+        }
         // Fallback: try entity-name search on the text (e.g., "+47%" may
         // appear as both digit and word — entity search will catch text labels).
         if (captionAnchorAbs === null) {
@@ -3432,6 +3661,14 @@ async function preflightValidateFootage(footage, jobRef, {channelId} = {}) {
       try {
         const r = await deepValidateBeat(beat.url);
         if (r && r.skipped) return;
+        // Phase-6b fix A: capture source-video duration so gap-fill can
+        // cap stretch at source-duration + 0.5s. Eliminates black tails
+        // from OffthreadVideo loop-boundary edge cases (Pexels videos
+        // are 5-10s; without this cap, a 5s clip stretched to 9s by
+        // gap-fill can produce 4s of unbounded loop failure).
+        if (r && typeof r.duration === 'number' && r.duration > 0) {
+          footage[idx] = {...footage[idx], sourceDuration: r.duration};
+        }
       } catch (probeErr) {
         failures.push({idx, reason: probeErr.message.slice(0, 160)});
         console.warn(`[preflight] beat ${idx + 1} probe failed: ${probeErr.message.slice(0, 120)}`);
@@ -3756,7 +3993,16 @@ function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
     if ((cur.end || 0) < nextStart) {
       const isVideo = VIDEO_SOURCE_NAMES.has(cur.source);
       const cap = explicitCap != null ? explicitCap : (isVideo ? 3 : Infinity);
-      const targetEnd = Math.min(nextStart, (cur.end || 0) + cap);
+      let targetEnd = Math.min(nextStart, (cur.end || 0) + cap);
+      // Phase-6b fix A: when video source has a known sourceDuration
+      // (set by preflight from ffprobe), cap displayed duration at
+      // sourceDuration + 0.5s (the +0.5s is OffthreadVideo loop
+      // headroom). Guarantees the displayed scene never outruns the
+      // underlying clip → no loop-boundary black tails.
+      if (isVideo && typeof cur.sourceDuration === 'number' && cur.sourceDuration > 0) {
+        const maxDisplayEnd = (cur.start || 0) + cur.sourceDuration + 0.5;
+        targetEnd = Math.min(targetEnd, maxDisplayEnd);
+      }
       if (targetEnd > (cur.end || 0)) {
         result[i] = {...cur, originalEnd: cur.end, end: targetEnd};
       }
@@ -4893,7 +5139,9 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   const rawBeats = await breakIntoBeats(captions, anthropicKey, {channelId, timingTags});
   // Enrich beats with Wikipedia portraits for named entities. Inserts
   // entityPortrait overlays where lookups succeeded. Silent on failure.
-  await enrichBeatsWithEntityImages(rawBeats).catch((e) =>
+  // Phase-6b: pass captions so per-sentence dedup can place portraits
+  // on caption-derived timestamps (one per sentence per entity).
+  await enrichBeatsWithEntityImages(rawBeats, captions).catch((e) =>
     console.warn(`[entities] enrich threw: ${e.message}`),
   );
   // (countUp upgrade pass removed — bigStat now animates count-up
