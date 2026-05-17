@@ -4404,15 +4404,21 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
     - zoom: 1-18 integer (continental=3, country=5, region=7, city=10) — only used when locations.length === 1, else auto-fit
 - fallbackChain: array of 1-3 assetTypes in fallback order (e.g., ["ai_generated", "stock_footage"])
 
-Rules:
-- DEFAULT to stock_footage. Stock works for nearly every finance/news scene — trading floors, city skylines, office settings, hands typing, paperwork, generic crowds, generic protests, etc. When in doubt, choose stock_footage.
-- ai_generated is BUDGET-CAPPED at ~$1/video (12 images max). HARD LIMIT: at most 25% of scenes may be ai_generated, and ONLY for scenes that are genuinely impossible to represent with stock (true abstractions like "the system collapsing", "shadow economy", "monetary tide", "policy machine") — NEVER for things stock can do (people walking, money, buildings, charts).
-- archival_photo ONLY for scenes describing pre-2000 historic events involving truly historic figures/moments (FDR signing the New Deal, 1929 floor traders, MLK speeches). Modern events (2010+) → stock_footage.
-- map ONLY when the scene names 2+ specific geographic locations being compared/connected. Cap at 1-2 per video total.
-- When unsure between any two types → pick stock_footage.
-- searchKeywords for stock must be CONCRETE and VISUAL (objects, settings, people doing things) not abstract concepts. "trading floor screens" beats "market panic", "federal reserve building" beats "monetary policy uncertainty", "businessman walking" beats "executive uncertainty".
-- searchKeywords must refine the beat hints with full scene context — better than the beat hints in isolation
-- fallbackChain MUST start with the primary assetType and list cheaper/safer fallbacks. ai_generated scenes MUST have stock_footage as the last fallback. Never list map as a fallback.
+Rules — pick the BEST type for EACH specific scene, NOT a default:
+
+- archival_photo (free, NO CAP — use liberally): ANY mention of a historic event, historic figure, or pre-2010 era. Examples: "FDR's New Deal", "2008 Lehman collapse", "1929 crash", "Cold War", "dot-com bubble", "Volcker era", "Carter administration", "Reagan tax cuts". When a scene references the PAST in any way, this is the right choice.
+
+- ai_generated (BUDGET-CAPPED at $1/video ≈ 12 images, HARD LIMIT 25% of scenes): use liberally for ABSTRACT concepts, METAPHORS, FUTURE projections, HYPOTHETICAL scenarios, EMOTIONAL/conceptual moments. Examples: "the system collapsing", "shadow economy", "monetary tide", "policy machine", "the cycle repeating", "what if the dollar fell", "imagine a world without", "the looming crisis", "a generation's wealth evaporating". When a scene describes a CONCEPT rather than a physical thing, this is the right choice. Within the 25% cap, prefer ai_generated over stock for these.
+
+- map (HARD CAP 3 per video for visual variety): ANY mention of specific countries, cities, regions, trade routes, supply chains, geographic comparisons, or location-based information. Examples: "Beijing pressures Brussels", "$50B China deal", "Shanghai port volumes", "EU-US tariffs", "supply chain through Singapore". When a scene names a PLACE in a meaningful way, this is the right choice.
+
+- stock_footage: ONLY when the scene literally describes a present-day CONCRETE action that stock footage shows well — "people walking on Wall Street", "hands typing on keyboards", "traders looking at screens", "executive in suit walking through office", "smartphone displaying app". If the scene is anything other than a literal present-day action with obvious stock visuals, prefer one of the other three types.
+
+Distribution targets (informational, not strict): aim for roughly archival 15-20%, ai_generated 20-25%, map 5-10%, stock 40-50%. The mix depends entirely on the script content — a historic script may be 80% archival, a geopolitics script 40% map, a market-psychology script 50% ai_generated. Pick the BEST type per scene, don't quota-fill.
+
+- searchKeywords must be CONCRETE and VISUAL (objects, settings, people doing things) for stock_footage. For archival_photo, include the era/year ("1929 NYSE floor traders", "Lehman Brothers 2008 closing day"). For map, the locations live in mapContext, so searchKeywords can be short descriptive labels.
+- searchKeywords must refine the beat hints with full scene context — better than the beat hints in isolation.
+- fallbackChain MUST start with the primary assetType. ai_generated → fallback ["ai_generated", "stock_footage"]; archival_photo → ["archival_photo", "stock_footage"]; map → ["map", "stock_footage"] (never use map as anyone's fallback).
 
 Input scenes (JSON):
 ${JSON.stringify(sceneInputs, null, 2)}
@@ -6113,12 +6119,7 @@ async function processJob(job) {
   let musicUrl = null;
   let pickedMood = null;
   let sfxLayer = [];
-  // Phase-6a-fix: v7 staging users report "no music" with the 0.05
-  // default — many tracks (especially ambient/suspense beds) are barely
-  // perceptible underneath -14 LUFS voiceover. Bump v7 default to 0.10
-  // (still well below voiceover); v6 production unchanged at 0.05.
-  // Channel-level musicSettings.volume always wins over both defaults.
-  let musicVolume = job.useStagingRender ? 0.10 : getDefaultMusicVolume();
+  let musicVolume = getDefaultMusicVolume();
   let musicSelection = null;
   const musicT0 = Date.now();
   const channelMusicSettings = await getChannelMusicSettings(job.channelId);
@@ -6145,7 +6146,7 @@ async function processJob(job) {
       });
       musicUrl = sel.url;
       musicSelection = sel;
-      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : (job.useStagingRender ? 0.10 : getDefaultMusicVolume());
+      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : getDefaultMusicVolume();
       console.log(`music: "${sel.trackName}" id=${sel.trackId} mood=${sel.trackMood} dur=${Math.round(sel.trackDuration)}s vol=${musicVolume.toFixed(3)} — ${sel.reasoning}`);
       // Save the pick on the project doc so the user can trace which
       // track was used if a YouTube Content ID claim shows up later.
@@ -6166,7 +6167,7 @@ async function processJob(job) {
     } catch (selErr) {
       console.warn(`Claude music selection failed (${selErr.message}) — falling back to mood-random`);
       musicUrl = await pickMusicTrack(job.channelId, pickedMood);
-      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : (job.useStagingRender ? 0.10 : getDefaultMusicVolume());
+      musicVolume = typeof channelMusicSettings.volume === 'number' ? channelMusicSettings.volume : getDefaultMusicVolume();
     }
   } catch (e) {
     console.warn(`Music pick failed entirely: ${e.message} — fallback will substitute`);
