@@ -3129,40 +3129,86 @@ async function wikimediaSearchTop(query, n = 3) {
 }
 
 // Internet Archive movies collection, public-domain filtered. No API
-// key. Quality is variable — older PD footage, often grainy. Default-off
-// in the channel toggle list because most channels won't want this.
+// key. Phase-15b upgrades: User-Agent header (IA explicitly requests it),
+// prefer the auto-generated _512kb.mp4 derivative (1-3 MB vs 50-200 MB
+// originals), Prelinger collection bias (the canonical PD US gov/
+// industrial newsreel trove — strong for finance/historical), per-item
+// duration probe via metadata (filter out feature-length reels that
+// would be unsuitable for 5-10s scenes).
+const _ARCHIVE_UA = 'rem-report-bot/1.0 (yt-automation; contact via channel owner)';
+const _ARCHIVE_PUBLISHER_LICENSE_RE = /publicdomain|cc0|cc-by/i;
+const _ARCHIVE_MAX_RUNTIME_SEC = 600; // 10 min — Lambda caps + scene relevance
+
 async function archiveSearchTop(query, n = 3) {
-  const q = `${query} AND mediatype:(movies) AND licenseurl:(*publicdomain*)`;
-  const url = new URL('https://archive.org/advancedsearch.php');
-  url.searchParams.set('q', q);
-  url.searchParams.append('fl[]', 'identifier');
-  url.searchParams.append('fl[]', 'title');
-  url.searchParams.set('rows', '10');
-  url.searchParams.set('output', 'json');
-  url.searchParams.set('sort[]', 'downloads desc');
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    console.warn(`InternetArchive ${resp.status} for "${query}"`);
-    return [];
-  }
-  const data = await resp.json();
-  const docs = (data.response?.docs || []).slice(0, n);
-  const out = [];
-  // Resolve each identifier → file list via /metadata/. Pick first mp4.
-  for (const d of docs) {
+  // Two-pass query: first try Prelinger (best curated PD finance/news
+  // footage), fall through to general movies search if no hits.
+  const queries = [
+    `${query} AND collection:prelinger AND mediatype:movies`,
+    `${query} AND mediatype:movies AND licenseurl:(*publicdomain*)`,
+  ];
+  for (const q of queries) {
+    const url = new URL('https://archive.org/advancedsearch.php');
+    url.searchParams.set('q', q);
+    url.searchParams.append('fl[]', 'identifier');
+    url.searchParams.append('fl[]', 'title');
+    url.searchParams.append('fl[]', 'licenseurl');
+    url.searchParams.append('fl[]', 'runtime');
+    url.searchParams.set('rows', '15');
+    url.searchParams.set('output', 'json');
+    url.searchParams.set('sort[]', 'downloads desc');
+    let resp;
     try {
-      const m = await fetch(`https://archive.org/metadata/${d.identifier}`);
-      if (!m.ok) continue;
-      const meta = await m.json();
-      const files = meta.files || [];
-      const mp4 = files.find((f) => /\.mp4$/i.test(f.name || ''));
-      if (mp4) {
-        out.push(`https://archive.org/download/${d.identifier}/${encodeURIComponent(mp4.name)}`);
+      resp = await fetch(url, {headers: {'User-Agent': _ARCHIVE_UA}});
+    } catch (e) {
+      console.warn(`[archive-org] fetch threw for "${q.slice(0, 60)}": ${e.message}`);
+      continue;
+    }
+    if (!resp.ok) {
+      console.warn(`[archive-org] HTTP ${resp.status} for "${q.slice(0, 60)}"`);
+      continue;
+    }
+    const data = await resp.json();
+    const docs = data.response?.docs || [];
+    if (docs.length === 0) continue;
+    console.log(`[archive-org] search: ${docs.length} hits for "${q.slice(0, 80)}"`);
+    const out = [];
+    for (const d of docs) {
+      if (out.length >= n) break;
+      try {
+        const m = await fetch(`https://archive.org/metadata/${d.identifier}`, {headers: {'User-Agent': _ARCHIVE_UA}});
+        if (!m.ok) continue;
+        const meta = await m.json();
+        const files = meta.files || [];
+        // Prefer _512kb.mp4 derivative (auto-generated, 1-3 MB).
+        // Fall through to other .mp4s if not present.
+        let pick = files.find((f) => /_512kb\.mp4$/i.test(f.name || ''));
+        if (!pick) pick = files.find((f) => /\.mp4$/i.test(f.name || '') && f.format !== 'Thumbnail');
+        if (!pick) continue;
+        // Filter by duration if available (IA's `length` field on the
+        // file is typically "MM:SS" or seconds-as-string).
+        const lenRaw = pick.length || meta.metadata?.runtime;
+        let lenSec = null;
+        if (typeof lenRaw === 'string') {
+          if (/^\d+$/.test(lenRaw)) lenSec = parseInt(lenRaw, 10);
+          else if (/^\d+:\d+/.test(lenRaw)) {
+            const parts = lenRaw.split(':').map((p) => parseInt(p, 10) || 0);
+            lenSec = parts.length === 3 ? parts[0] * 3600 + parts[1] * 60 + parts[2] : parts[0] * 60 + parts[1];
+          }
+        } else if (typeof lenRaw === 'number') {
+          lenSec = lenRaw;
+        }
+        if (lenSec && lenSec > _ARCHIVE_MAX_RUNTIME_SEC) {
+          console.log(`[archive-org] skip ${d.identifier} — runtime ${lenSec}s > ${_ARCHIVE_MAX_RUNTIME_SEC}s cap`);
+          continue;
+        }
+        out.push(`https://archive.org/download/${d.identifier}/${encodeURIComponent(pick.name)}`);
+      } catch (e) {
+        console.warn(`[archive-org] metadata fetch threw for ${d.identifier}: ${e.message}`);
       }
-    } catch { /* skip */ }
-    if (out.length >= n) break;
+    }
+    if (out.length > 0) return out;
   }
-  return out;
+  return [];
 }
 
 // Channel-aware footage source chain. Tries enabled sources in order
@@ -3187,13 +3233,11 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
     } catch {/* keep fallback */}
   }
 
-  // Day-14 Phase 3: archival_photo scenes try Wikimedia Commons IMAGES
-  // FIRST (free, public-domain-filtered). On no-hit, fall through to the
-  // usual Pexels-first video ladder. Source name is reported as
-  // 'wikimedia-image' so the downstream renderer routes it to <Img>
-  // (MainComp.jsx falls back to <Img> for any non-video source).
-  // Gated implicitly by scenePlanContext.assetType — only set on staging
-  // renders that ran buildScenePlan; v6 prod never reaches this branch.
+  // Day-14 Phase 3 + Day-15 15b: archival_photo scenes try Wikimedia
+  // Commons IMAGES first (best for known figures/iconic moments), then
+  // Internet Archive movies (best for era/industry footage from the
+  // Prelinger collection — 1929 trading floors, 1970s gas lines, etc).
+  // On both empty, fall through to the usual Pexels-first ladder.
   if (assetTypeHint === 'archival_photo' && cfg.wikimedia) {
     let imageUrls;
     try { imageUrls = await wikimediaImageSearchTop(query, n); }
@@ -3203,7 +3247,21 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
       console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image (${imageUrls.length} candidates)`);
       return {urls: imageUrls, source: 'wikimedia-image', sourceCounts};
     }
-    console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image empty, falling through to stock ladder`);
+    // Phase 15b: Wikimedia missed → try Internet Archive (Prelinger
+    // first, then general PD movies). Gated on cfg.archive default-on
+    // via the v7-staging override path — production channels keep
+    // their existing footageSources.archive toggle.
+    if (cfg.archiveOrgVideo !== false) {
+      let archiveUrls;
+      try { archiveUrls = await archiveSearchTop(query, n); }
+      catch (e) { console.warn(`[footage] archive-org-video threw for "${query}": ${e.message}`); archiveUrls = []; }
+      if (archiveUrls && archiveUrls.length) {
+        const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'archive-org-video': archiveUrls.length};
+        console.log(`[source-ladder] archival_photo "${query}" → archive-org-video (${archiveUrls.length} candidates, Wikimedia empty)`);
+        return {urls: archiveUrls, source: 'archive-org-video', sourceCounts};
+      }
+    }
+    console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image + archive-org-video both empty, falling through to stock ladder`);
   }
 
   const order = [
@@ -3964,7 +4022,7 @@ function sliceCaptionsForSegment(captions, segStart, segEnd) {
 // have a Pexels-CDN-typical 5-10s natural duration so stretching them
 // further than ~3s past their natural end risks running out of frames
 // → black tail or frozen frame.
-const VIDEO_SOURCE_NAMES = new Set(['pexels', 'pixabay', 'wikimedia', 'archive', 'ai-video']);
+const VIDEO_SOURCE_NAMES = new Set(['pexels', 'pixabay', 'wikimedia', 'archive', 'ai-video', 'archive-org-video']);
 
 function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
   // Phase-6b fix 2: per-entry cap. Image-shaped entries (fal-ai-image,
@@ -4719,7 +4777,35 @@ Rules — pick the BEST type for EACH specific scene, NOT a default:
 
 Distribution targets (informational, not strict): aim for roughly archival 15-20%, ai_generated 20-25%, map 5-10%, stock 40-50%. The mix depends entirely on the script content — a historic script may be 80% archival, a geopolitics script 40% map, a market-psychology script 50% ai_generated. Pick the BEST type per scene, don't quota-fill.
 
-- searchKeywords must be CONCRETE and VISUAL (objects, settings, people doing things) for stock_footage. For archival_photo, include the era/year ("1929 NYSE floor traders", "Lehman Brothers 2008 closing day"). For map, the locations live in mapContext, so searchKeywords can be short descriptive labels.
+- searchKeywords RULES (Phase 15a — quality lift):
+  * At LEAST 2 keywords MUST contain a specific entity, year, or place
+    name. Generic adjectives like "dramatic", "intense", "scary",
+    "powerful", "epic" are BANNED — they don't help any search API
+    return better results.
+  * For stat/number scenes: include the actual NUMBER in the keyword
+    ("$700 billion TARP bailout", "25 percent unemployment 1933").
+  * For person scenes: include FIRST + LAST + ROLE
+    ("Jerome Powell Federal Reserve chair", "Henry Paulson Treasury
+    Secretary 2008").
+  * For historic events: include YEAR + MONTH where possible
+    ("Lehman Brothers September 15 2008", "Black Tuesday October 29 1929").
+  * For places: include city/region + descriptor
+    ("Shanghai port container terminal", "Wall Street trading floor NYSE").
+  * Stock scene examples (GOOD): ["NYSE trading floor traders shouting",
+    "Federal Reserve building marble columns Washington", "container ship
+    Long Beach port aerial"]
+  * Stock scene examples (BAD): ["financial crisis", "dramatic markets",
+    "scary headlines"]
+- For archival_photo specifically: 2026 has BOTH Wikimedia Commons AND
+  Internet Archive video as backing sources. Wikimedia is better for
+  WELL-KNOWN named figures + iconic moments (FDR, Lincoln, Bernanke);
+  Internet Archive (Prelinger collection) is better for ERA/INDUSTRY
+  footage (1929 trading floors, 1950s factory lines, 1970s gas crisis).
+  When the scene is a generic-era visual, lean Internet Archive — use
+  era + activity keywords ("1929 stock exchange floor", "1970s gas
+  station line", "great depression breadline 1933").
+- For map, the locations live in mapContext, so searchKeywords can be
+  short descriptive labels.
 - searchKeywords must refine the beat hints with full scene context — better than the beat hints in isolation.
 - fallbackChain MUST start with the primary assetType. ai_generated → fallback ["ai_generated", "stock_footage"]; archival_photo → ["archival_photo", "stock_footage"]; map → ["map", "stock_footage"] (never use map as anyone's fallback).
 
@@ -4835,36 +4921,77 @@ async function finalizeScenePlanWithAvailability(draftScenes, aiImageBudget) {
     console.log(`[scene-plan] AI budget pre-alloc: ${aiCapImages} kept, ${aiBudgetDowngraded} downgraded (Claude requested ${aiCandidates.length} ai_generated)`);
   }
 
-  // Stage B: Wikimedia availability probe (parallelized). Each archival
-  // scene gets a count-only probe. If count===0, downgrade to fallback.
-  // Skipped scenes that AI-budget already kicked from archival aren't
-  // re-probed.
+  // Stage B: Wikimedia + Internet Archive parallel availability probe
+  // for archival scenes. Phase 15a tail: if Wikimedia returns 0, try a
+  // stripped-down query (entity-only, no year/dates) before giving up.
+  // Phase 15b: if Wikimedia still 0, probe Internet Archive — Prelinger
+  // collection often has era/industry footage where Wikimedia has none.
+  // Downgrade only when BOTH probes return 0.
   const archivalScenes = draftScenes.filter((s) => s.assetType === 'archival_photo');
   let archivalDowngraded = 0;
+  let archivalFromArchiveOrg = 0;
   if (archivalScenes.length) {
-    const probes = await Promise.all(archivalScenes.map(async (s) => {
+    const probeWikimedia = async (query) => {
+      if (!query) return 0;
       try {
-        const q = (s.searchKeywords || []).join(' ').slice(0, 100);
-        if (!q) return {scene: s, count: 0};
         const url = new URL('https://commons.wikimedia.org/w/api.php');
         url.searchParams.set('action', 'query');
         url.searchParams.set('format', 'json');
         url.searchParams.set('list', 'search');
-        url.searchParams.set('srsearch', q + ' filemime:image');
+        url.searchParams.set('srsearch', query + ' filemime:image');
         url.searchParams.set('srnamespace', '6');
         url.searchParams.set('srlimit', '1');
         url.searchParams.set('origin', '*');
         const resp = await fetch(url, {signal: AbortSignal.timeout(3000)});
-        if (!resp.ok) return {scene: s, count: 0};
+        if (!resp.ok) return 0;
         const data = await resp.json();
-        return {scene: s, count: data?.query?.searchinfo?.totalhits || 0};
-      } catch { return {scene: s, count: 0}; }
+        return data?.query?.searchinfo?.totalhits || 0;
+      } catch { return 0; }
+    };
+    const probeArchiveOrg = async (query) => {
+      if (!query) return 0;
+      try {
+        const url = new URL('https://archive.org/advancedsearch.php');
+        url.searchParams.set('q', `${query} AND mediatype:movies AND licenseurl:(*publicdomain*)`);
+        url.searchParams.set('rows', '1');
+        url.searchParams.set('output', 'json');
+        url.searchParams.append('fl[]', 'identifier');
+        const resp = await fetch(url, {signal: AbortSignal.timeout(4000), headers: {'User-Agent': _ARCHIVE_UA}});
+        if (!resp.ok) return 0;
+        const data = await resp.json();
+        return data.response?.numFound || 0;
+      } catch { return 0; }
+    };
+    // 15a stripped-down: drop years/numbers to widen Wikimedia hits
+    const stripDates = (q) => (q || '').replace(/\b(19|20)\d{2}\b/g, '').replace(/\s+/g, ' ').trim();
+
+    const probes = await Promise.all(archivalScenes.map(async (s) => {
+      const fullQ = (s.searchKeywords || []).join(' ').slice(0, 100);
+      const [wikiFull, archiveCount] = await Promise.all([
+        probeWikimedia(fullQ),
+        probeArchiveOrg(fullQ),
+      ]);
+      let wikiCount = wikiFull;
+      if (wikiCount === 0) {
+        const strippedQ = stripDates(fullQ);
+        if (strippedQ && strippedQ !== fullQ) {
+          wikiCount = await probeWikimedia(strippedQ);
+        }
+      }
+      return {scene: s, wikiCount, archiveCount};
     }));
-    for (const {scene, count} of probes) {
-      if (count === 0) {
+    for (const {scene, wikiCount, archiveCount} of probes) {
+      if (wikiCount === 0 && archiveCount === 0) {
         scene._originalAssetType = scene._originalAssetType || scene.assetType;
         scene.assetType = (scene.fallbackChain || []).find((t) => t !== 'archival_photo') || 'stock_footage';
         archivalDowngraded++;
+      } else if (wikiCount === 0 && archiveCount > 0) {
+        // Phase 15b: keep archival_photo, but mark that this scene will
+        // resolve via Internet Archive (sourcing layer reads assetType
+        // and routes via searchAllFootageSources which already does the
+        // wikimedia-first/archive-org-fallback cascade).
+        scene._archivalSource = 'archive-org-video';
+        archivalFromArchiveOrg++;
       }
     }
   }
@@ -4889,7 +5016,7 @@ async function finalizeScenePlanWithAvailability(draftScenes, aiImageBudget) {
     finalBreakdown[s.assetType] = (finalBreakdown[s.assetType] || 0) + 1;
   }
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-  console.log(`[scene-plan] availability probe in ${elapsed}s — final types: ${JSON.stringify(finalBreakdown)} — downgrades: ai-budget=${aiBudgetDowngraded}, archival-empty=${archivalDowngraded}, map-invalid=${mapDowngraded}`);
+  console.log(`[scene-plan] availability probe in ${elapsed}s — final types: ${JSON.stringify(finalBreakdown)} — downgrades: ai-budget=${aiBudgetDowngraded}, archival-empty=${archivalDowngraded}, map-invalid=${mapDowngraded}, archival-from-archive-org=${archivalFromArchiveOrg}`);
   return draftScenes;
 }
 
