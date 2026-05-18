@@ -5266,15 +5266,222 @@ function applyScenesToBeats(rawBeats, scenes) {
   return touched;
 }
 
-// Day-14 Phase 6a: per-scene asset routing. Returns ONE footage entry
-// per scene (covers ~7-10s) instead of one per beat (~3-5s). Aggregates
-// overlays + sfx from the constituent beats into the scene entry with
-// timestamps remapped scene-relative so the downstream
-// buildOverlayLayer / resolveSfxLayer math still produces correct
-// absolute timestamps. Skips the AI hero video (Kling) pass entirely
-// — abstract/ai_generated scenes use fal.ai Nano Banana 2 images
-// instead. Gated on useStagingRender + a successful scene plan; on
-// any failure the caller falls through to the existing per-beat path.
+// ═══════════════════════════════════════════════════════════════════
+// Phase 16C — HANDLERS dispatch + provenance tracking
+//
+// Each handler tries sources in priority order. A source that returns
+// null falls through to the next (NOT an error). Each handler tracks
+// what it tried (provenance[]) so the rendered footage entry carries
+// a full audit trail. Replaces the Phase 6b upfront-availability probe
+// for Wikimedia/Mapbox (handlers naturally fallthrough; provenance is
+// truth, probes lie). AI budget pre-allocation preserved as separate
+// preAllocateAiBudget() call before sourcing.
+//
+// Each handler signature: async (scene, ctx) => {url, source, provenance}
+//   provenance: [{tried: 'src-name', ok: boolean, reason?: string}]
+// ═══════════════════════════════════════════════════════════════════
+
+async function handleAiGenerated(scene, ctx) {
+  const provenance = [];
+  if (!scene.aiPrompt) {
+    provenance.push({tried: 'fal-ai-image', ok: false, reason: 'no aiPrompt'});
+    return {url: null, source: null, provenance};
+  }
+  const aiUrl = await generateAiImage({
+    prompt: scene.aiPrompt,
+    falApiKey: process.env.FAL_AI_API_KEY,
+    budgetTracker: ctx.aiImageBudget,
+  });
+  if (aiUrl) {
+    provenance.push({tried: 'fal-ai-image', ok: true});
+    ctx.usedStockUrls.add(aiUrl);
+    return {url: aiUrl, source: 'fal-ai-image', provenance};
+  }
+  provenance.push({tried: 'fal-ai-image', ok: false, reason: 'generation/budget failed'});
+  return {url: null, source: null, provenance};
+}
+
+async function handleMap(scene, ctx) {
+  const provenance = [];
+  if (!scene.mapContext) {
+    provenance.push({tried: 'mapbox-image', ok: false, reason: 'no mapContext'});
+    return {url: null, source: null, provenance};
+  }
+  const mapUrl = await generateMapImage({
+    mapContext: scene.mapContext,
+    mapboxToken: process.env.MAPBOX_ACCESS_TOKEN,
+  });
+  if (mapUrl) {
+    provenance.push({tried: 'mapbox-image', ok: true});
+    ctx.usedStockUrls.add(mapUrl);
+    return {url: mapUrl, source: 'mapbox-image', provenance};
+  }
+  provenance.push({tried: 'mapbox-image', ok: false, reason: 'generation failed'});
+  return {url: null, source: null, provenance};
+}
+
+// Stock chain (used by stock_footage primary + as fallback for other types).
+// Wraps the existing searchAllFootageSources cascade + validation +
+// dedup. Returns first validated non-duplicate candidate.
+async function handleStockChain(scene, ctx, assetTypeHint) {
+  const provenance = [];
+  const keywords = Array.isArray(scene.searchKeywords) && scene.searchKeywords.length
+    ? scene.searchKeywords
+    : (ctx.sceneBeats[0]?.keywords || []);
+  const query = keywords.join(' ');
+  if (!query) {
+    provenance.push({tried: 'stock-chain', ok: false, reason: 'no query'});
+    return {url: null, source: null, provenance, pexelsAlternates: []};
+  }
+  const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(ctx.channelId, query, 3, assetTypeHint);
+  const candidates = rawCandidates.filter((c) => !ctx.blocklist.has(c));
+  const validator = pickedSource === 'wikimedia-image' ? validateImageUrl : validatePexelsVideo;
+  for (let ci = 0; ci < candidates.length; ci++) {
+    const cand = candidates[ci];
+    if (ctx.usedStockUrls.has(cand)) continue;
+    const v = await validator(cand);
+    if (v.ok) {
+      ctx.usedStockUrls.add(cand);
+      const alternates = candidates.slice(ci + 1).filter((c) => !ctx.usedStockUrls.has(c));
+      provenance.push({tried: pickedSource, ok: true});
+      return {url: cand, source: pickedSource, provenance, pexelsAlternates: alternates};
+    }
+  }
+  provenance.push({tried: pickedSource || 'stock', ok: false, reason: `${candidates.length} candidates, none validated`});
+  return {url: null, source: null, provenance, pexelsAlternates: []};
+}
+
+// Generic stock cascade (last resort). 10 finance-themed queries with
+// HEAD probe for upstream-reachability. Returns first survivor.
+async function handleGenericStock(scene, ctx) {
+  const provenance = [];
+  const GENERIC_QUERIES = [
+    'financial district city skyline night',
+    'businessman walking office corridor',
+    'stock market trading floor screens',
+    'modern office boardroom dark',
+    'abstract data visualization',
+    'banker handshake suit business',
+    'central bank building marble columns',
+    'newspaper headlines breaking finance',
+    'global currency money exchange',
+    'aerial city economic activity',
+  ];
+  for (const gq of GENERIC_QUERIES) {
+    const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(ctx.channelId, gq, 5, 'stock_footage');
+    const candidates = rawCandidates.filter((c) => !ctx.blocklist.has(c) && !ctx.usedStockUrls.has(c));
+    for (const cand of candidates) {
+      const v = await validatePexelsVideo(cand);
+      if (!v.ok) continue;
+      let reachable = true;
+      try {
+        const headProbe = await fetch(cand, {method: 'HEAD', signal: AbortSignal.timeout(2500)});
+        reachable = headProbe.ok;
+      } catch { reachable = false; }
+      if (!reachable) continue;
+      ctx.usedStockUrls.add(cand);
+      provenance.push({tried: 'generic-stock', ok: true, reason: `query="${gq}"`});
+      return {url: cand, source: pickedSource, provenance, genericFallback: true};
+    }
+  }
+  provenance.push({tried: 'generic-stock', ok: false, reason: '10 queries exhausted'});
+  return {url: null, source: null, provenance, genericFallback: false};
+}
+
+// Last-resort archival fallback (Wikimedia image search with broader query).
+async function handleArchivalFallback(scene, ctx) {
+  const provenance = [];
+  const query = (Array.isArray(scene.searchKeywords) && scene.searchKeywords.length
+    ? scene.searchKeywords.join(' ')
+    : 'financial history');
+  try {
+    const {urls: rawCandidates} = await searchAllFootageSources(ctx.channelId, query, 3, 'archival_photo');
+    for (const cand of rawCandidates) {
+      if (ctx.blocklist.has(cand) || ctx.usedStockUrls.has(cand)) continue;
+      const v = await validateImageUrl(cand);
+      if (v.ok) {
+        ctx.usedStockUrls.add(cand);
+        provenance.push({tried: 'wikimedia-image-fallback', ok: true});
+        return {url: cand, source: 'wikimedia-image', provenance, genericFallback: true};
+      }
+    }
+  } catch (e) {
+    provenance.push({tried: 'wikimedia-image-fallback', ok: false, reason: e.message});
+  }
+  provenance.push({tried: 'wikimedia-image-fallback', ok: false, reason: 'no validated archival image'});
+  return {url: null, source: null, provenance, genericFallback: false};
+}
+
+// Placeholder 1×1 PNG (absolute last resort — never null URL).
+function handlePlaceholder() {
+  return {
+    url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+    source: 'placeholder-black',
+    provenance: [{tried: 'placeholder', ok: true, reason: 'absolute-last-resort'}],
+    genericFallback: true,
+  };
+}
+
+// HANDLERS dispatch map. Keyed by assetType (Phase 16I will add visualType
+// keys alongside as we evolve the scene plan output schema).
+const ASSET_HANDLERS = {
+  ai_generated: async (scene, ctx) => {
+    const ai = await handleAiGenerated(scene, ctx);
+    if (ai.url) return ai;
+    // Fallthrough: try stock chain with ai_generated hint
+    const stock = await handleStockChain(scene, ctx, 'stock_footage');
+    return {...stock, provenance: [...ai.provenance, ...stock.provenance]};
+  },
+  map: async (scene, ctx) => {
+    const map = await handleMap(scene, ctx);
+    if (map.url) return map;
+    const stock = await handleStockChain(scene, ctx, 'stock_footage');
+    return {...stock, provenance: [...map.provenance, ...stock.provenance]};
+  },
+  archival_photo: async (scene, ctx) => {
+    // searchAllFootageSources's archival_photo path already chains
+    // Wikimedia image → Wikimedia video → Internet Archive internally.
+    const arch = await handleStockChain(scene, ctx, 'archival_photo');
+    if (arch.url) return arch;
+    const stock = await handleStockChain(scene, ctx, 'stock_footage');
+    return {...stock, provenance: [...arch.provenance, ...stock.provenance]};
+  },
+  stock_footage: async (scene, ctx) => {
+    return await handleStockChain(scene, ctx, 'stock_footage');
+  },
+};
+
+// Phase 16C: AI budget pre-allocation (extracted from old Phase 6b probe).
+// Caps ai_generated scenes to budget-affordable count BEFORE sourcing
+// fires. Picks the longest-prompt candidates as winners (proxy for
+// richest visual concept); downgrades losers through fallbackChain.
+function preAllocateAiBudget(scenes, aiImageBudget) {
+  if (!Array.isArray(scenes) || scenes.length === 0) return {kept: 0, downgraded: 0};
+  const aiCapImages = Math.max(1, Math.floor((aiImageBudget?.capUsd || 1.0) / 0.08));
+  const aiCandidates = scenes
+    .map((s, idx) => ({idx, scene: s, promptLen: (s.aiPrompt || '').length}))
+    .filter((c) => c.scene.assetType === 'ai_generated' && c.scene.aiPrompt);
+  if (aiCandidates.length <= aiCapImages) {
+    return {kept: aiCandidates.length, downgraded: 0};
+  }
+  aiCandidates.sort((a, b) => b.promptLen - a.promptLen);
+  const losers = aiCandidates.slice(aiCapImages);
+  for (const l of losers) {
+    l.scene._originalAssetType = l.scene.assetType;
+    l.scene.assetType = (l.scene.fallbackChain || []).find((t) => t !== 'ai_generated') || 'stock_footage';
+  }
+  console.log(`[scene-plan] AI budget pre-alloc: ${aiCapImages} kept, ${losers.length} downgraded (Claude requested ${aiCandidates.length} ai_generated)`);
+  return {kept: aiCapImages, downgraded: losers.length};
+}
+
+// Day-14 Phase 6a + Day-16 Phase 16C: per-scene asset routing via
+// HANDLERS dispatch with provenance tracking. Each scene's footage entry
+// carries a `provenance` array describing every source attempt and
+// outcome — visible in editingJob.footage[i].provenance for audit.
+//
+// Returns ONE footage entry per scene (covers ~7-10s). Aggregates
+// overlays + sfx from constituent beats with scene-relative timestamps.
+// Skips AI hero video (Kling) pass entirely.
 async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blocklist, aiImageBudget, usedStockUrls, jobRef, baseProgress, span}) {
   const footage = [];
   for (let si = 0; si < scenes.length; si++) {
@@ -5286,7 +5493,6 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
     const keywords = Array.isArray(scene.searchKeywords) && scene.searchKeywords.length
       ? scene.searchKeywords
       : (sceneBeats[0]?.keywords || []);
-    const query = keywords.join(' ');
 
     await jobRef.update({
       currentStep: `Sourcing scene ${si + 1}/${scenes.length} (${scene.assetType}): ${(scene.visualConcept || '').slice(0, 60)}`,
@@ -5294,129 +5500,54 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       updatedAt: FieldValue.serverTimestamp(),
     }).catch(() => {});
 
+    // Phase 16C: HANDLERS dispatch with full provenance tracking
+    const ctx = {channelId, blocklist, aiImageBudget, usedStockUrls, sceneBeats};
+    const handler = ASSET_HANDLERS[scene.assetType] || ASSET_HANDLERS.stock_footage;
     let url = null;
     let source = null;
     let pexelsAlternates = [];
-    const validationFailures = [];
-
-    // ai_generated → fal.ai Nano Banana 2 (budget-capped).
-    if (scene.assetType === 'ai_generated' && scene.aiPrompt) {
-      const aiUrl = await generateAiImage({
-        prompt: scene.aiPrompt,
-        falApiKey: process.env.FAL_AI_API_KEY,
-        budgetTracker: aiImageBudget,
-      });
-      if (aiUrl) { url = aiUrl; source = 'fal-ai-image'; usedStockUrls.add(aiUrl); }
-    }
-    // map → Mapbox Static Images (free <50K/mo).
-    if (!url && scene.assetType === 'map' && scene.mapContext) {
-      const mapUrl = await generateMapImage({
-        mapContext: scene.mapContext,
-        mapboxToken: process.env.MAPBOX_ACCESS_TOKEN,
-      });
-      if (mapUrl) { url = mapUrl; source = 'mapbox-image'; usedStockUrls.add(mapUrl); }
-    }
-    // Everything else → existing stock chain with assetTypeHint
-    // (archival_photo prefers Wikimedia images; default Pexels-first).
-    if (!url && query) {
-      const assetTypeHint = scene.assetType || null;
-      const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(channelId, query, 3, assetTypeHint);
-      const candidates = rawCandidates.filter((c) => !blocklist.has(c));
-      const validator = pickedSource === 'wikimedia-image' ? validateImageUrl : validatePexelsVideo;
-      for (let ci = 0; ci < candidates.length; ci++) {
-        const cand = candidates[ci];
-        if (usedStockUrls.has(cand)) continue;
-        const v = await validator(cand);
-        if (v.ok) {
-          url = cand;
-          source = pickedSource;
-          usedStockUrls.add(cand);
-          pexelsAlternates = candidates.slice(ci + 1).filter((c) => !usedStockUrls.has(c));
-          if (pickedSource === 'wikimedia-image') {
-            console.log(`[wikimedia-image] picked for scene ${si + 1} (${scene.assetType}): ${cand.split('/').pop().slice(0, 80)}`);
-          }
-          break;
-        }
-        validationFailures.push({url: cand, reason: v.reason});
-      }
-    }
-    // Phase-6a-fix: generic stock fallback so a scene NEVER has url=null.
-    // Source name stays canonical (e.g. 'pexels') so MainComp's
-    // video-source whitelist matches; genericFallback flag retained on
-    // the footage entry for telemetry/diagnostics.
-    // Fix-C: widened from 5 → 10 queries with thematic variety so the
-    // cascade is more likely to hit a working URL on flaky days.
+    const provenance = [];
     let genericFallbackUsed = false;
-    if (!url) {
-      const genericQueries = [
-        'financial district city skyline night',
-        'businessman walking office corridor',
-        'stock market trading floor screens',
-        'modern office boardroom dark',
-        'abstract data visualization',
-        'banker handshake suit business',
-        'central bank building marble columns',
-        'newspaper headlines breaking finance',
-        'global currency money exchange',
-        'aerial city economic activity',
-      ];
-      for (const gq of genericQueries) {
-        const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(channelId, gq, 5, 'stock_footage');
-        const candidates = rawCandidates.filter((c) => !blocklist.has(c) && !usedStockUrls.has(c));
-        for (const cand of candidates) {
-          const v = await validatePexelsVideo(cand);
-          if (!v.ok) continue;
-          // Fix-C: secondary HEAD probe — validatePexelsVideo only checks
-          // the ftyp box, not whether the bytes are actually reachable.
-          // Many stale Pexels CDN URLs pass content-check but 403 at
-          // preflight. A 2-second HEAD probe catches those upfront.
-          let reachable = true;
-          try {
-            const headProbe = await fetch(cand, {method: 'HEAD', signal: AbortSignal.timeout(2500)});
-            reachable = headProbe.ok;
-          } catch { reachable = false; }
-          if (!reachable) continue;
-          url = cand;
-          source = pickedSource; // Fix-B: canonical name matches MainComp whitelist
-          genericFallbackUsed = true;
-          usedStockUrls.add(cand);
-          console.log(`scene ${si + 1}: GENERIC fallback "${gq}" → ${cand.split('/').pop().slice(0, 60)}`);
-          break;
-        }
-        if (url) break;
-      }
+
+    try {
+      const primary = await handler(scene, ctx);
+      url = primary.url;
+      source = primary.source;
+      pexelsAlternates = primary.pexelsAlternates || [];
+      provenance.push(...(primary.provenance || []));
+    } catch (e) {
+      provenance.push({tried: scene.assetType + '-handler', ok: false, reason: e.message});
+      console.warn(`scene ${si + 1}: primary handler threw — ${e.message}`);
     }
-    // Fix-C: archival_photo (Wikimedia Commons) as PRE-PNG resort. Free,
-    // image-shaped (validates differently), totally separate CDN from
-    // Pexels — covers the case where Pexels is having a bad day.
+
+    // Generic stock cascade (last resort).
     if (!url) {
-      try {
-        const {urls: rawCandidates} = await searchAllFootageSources(channelId, query || 'financial history', 3, 'archival_photo');
-        for (const cand of rawCandidates) {
-          if (blocklist.has(cand) || usedStockUrls.has(cand)) continue;
-          const v = await validateImageUrl(cand);
-          if (v.ok) {
-            url = cand;
-            source = 'wikimedia-image';
-            genericFallbackUsed = true;
-            usedStockUrls.add(cand);
-            console.log(`scene ${si + 1}: WIKIMEDIA-IMAGE fallback → ${cand.split('/').pop().slice(0, 60)}`);
-            break;
-          }
-        }
-      } catch (e) {
-        console.warn(`scene ${si + 1}: wikimedia fallback threw: ${e.message}`);
-      }
+      const generic = await handleGenericStock(scene, ctx);
+      url = generic.url;
+      source = generic.source;
+      genericFallbackUsed = !!generic.genericFallback;
+      provenance.push(...generic.provenance);
+      if (url) console.log(`scene ${si + 1}: GENERIC fallback → ${url.split('/').pop().slice(0, 60)}`);
     }
+
+    // Archival fallback (separate-CDN safety net).
     if (!url) {
-      // Last resort: 1×1 black PNG via data URL. MainComp routes this
-      // to <Img> which DOES render data URLs correctly. Source name
-      // stays 'placeholder-black' so the video preflight + cache code
-      // skips it (it's not a real video URL).
-      console.warn(`scene ${si + 1}: ALL fallbacks exhausted — using last-resort 1×1 black PNG to avoid render gap`);
-      url = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
-      source = 'placeholder-black';
+      const archFallback = await handleArchivalFallback(scene, ctx);
+      url = archFallback.url;
+      source = archFallback.source;
+      if (url) genericFallbackUsed = true;
+      provenance.push(...archFallback.provenance);
+      if (url) console.log(`scene ${si + 1}: WIKIMEDIA-IMAGE fallback → ${url.split('/').pop().slice(0, 60)}`);
+    }
+
+    // 1×1 PNG placeholder (absolute last resort).
+    if (!url) {
+      const ph = handlePlaceholder();
+      url = ph.url;
+      source = ph.source;
       genericFallbackUsed = true;
+      provenance.push(...ph.provenance);
+      console.warn(`scene ${si + 1}: ALL fallbacks exhausted — using last-resort 1×1 black PNG`);
     }
 
     // Aggregate overlays + sfx from constituent beats. Remap timestamps
@@ -5463,8 +5594,9 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       ...(aggregatedSfx.length ? {sfxRequested: aggregatedSfx} : {}),
       ...(aggregatedOverlays.length ? {overlays: aggregatedOverlays} : {}),
       ...(musicMood ? {musicMoodFromClaude: musicMood} : {}),
-      ...(validationFailures.length ? {pexelsValidationFailures: validationFailures} : {}),
       ...(genericFallbackUsed ? {genericFallback: true} : {}),
+      // Phase 16C: full source-attempt audit trail
+      ...(provenance.length ? {provenance} : {}),
       // Scene metadata for diagnostics / future analysis
       assetType: scene.assetType,
       visualConcept: scene.visualConcept,
@@ -5627,7 +5759,13 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       // Result: scene.assetType reflects what will ACTUALLY render,
       // not what Claude wished for. Eliminates the "scene plan said
       // archival, video shows Pexels" disconnect.
-      scenes = await finalizeScenePlanWithAvailability(draftScenes, aiImageBudget);
+      // Phase 16C: replaced upfront Wikimedia/Mapbox availability probe
+      // with HANDLERS dispatch + provenance tracking inside sourcing.
+      // Probes lied (returned hits that later failed validation); handlers
+      // are truth. We still pre-allocate AI budget here so excess
+      // ai_generated scenes downgrade cleanly before sourcing fires.
+      preAllocateAiBudget(draftScenes, aiImageBudget);
+      scenes = draftScenes;
       const touched = applyScenesToBeats(rawBeats, scenes);
       const sceneMs = Date.now() - sceneT0;
       await jobRef.update({
