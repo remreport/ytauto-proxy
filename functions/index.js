@@ -4354,9 +4354,12 @@ function sliceCaptionsForSegment(captions, segStart, segEnd) {
 // visible beat so footage is on screen continuously — no black flashes
 // during inter-sentence pauses. Last visible beat extends to the
 // composition's total duration. Beats without a `url` (skipped sources)
-// are kept in the array (preserve indexing for the swap loop) but are
-// skipped both as the "current" beat being stretched and as the "next"
-// neighbour driving the stretch — they're invisible to MainComp anyway.
+// are kept in the array (preserve indexing for the swap loop) and
+// skipped as the "current" beat being stretched. As the "next" neighbour:
+// scene templates (templateType set, url=null by design) ARE used as
+// stretch boundaries — they render full-screen, so the previous beat
+// must end at the template's start or it bleeds through the template's
+// built-in opacity fade-out (BRAND.motion.fadeOutFrames).
 // Original `end` is preserved on `originalEnd` for diagnostics.
 // Source-name → renders-as-video classification. Mirror of MainComp.jsx
 // whitelist at line ~356. Used to decide gap-fill stretch budget:
@@ -4381,11 +4384,21 @@ function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
   const result = footage.slice();
   for (let i = 0; i < result.length; i++) {
     const cur = result[i];
-    if (!cur || !cur.url || cur.start == null) continue;
+    // Templates have url=null by design but render full-screen — they
+    // must stretch to cover the gap to the next beat or there's a black
+    // frame in the gap. Treat templateType-backed entries as first-class
+    // stretch candidates.
+    const isCurTemplate = !!(cur && cur.templateType);
+    if (!cur || (!cur.url && !isCurTemplate) || cur.start == null) continue;
     let nextStart = totalDuration;
     for (let j = i + 1; j < result.length; j++) {
       const nxt = result[j];
-      if (nxt && nxt.url && nxt.start != null) {
+      // Same rule on the boundary side: templates are valid stretch
+      // boundaries. Without this, the previous URL-backed beat stretches
+      // past the template, mounts beneath it, and bleeds through the
+      // template's built-in opacity fade-out (BRAND.motion.fadeOutFrames).
+      const isNxtTemplate = !!(nxt && nxt.templateType);
+      if (nxt && (nxt.url || isNxtTemplate) && nxt.start != null) {
         nextStart = nxt.start;
         break;
       }
