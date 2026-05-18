@@ -76,10 +76,9 @@ const REMOTION_LAMBDA_FUNCTION_NAME =
 // 2026-05-19: v7 promoted to canonical. Every render goes to
 // rem-report-v7 (the bundle with Phase 16/17 scene plan + templates +
 // brand.js #49181e). The v6 bundle is retained in S3 as a snapshot
-// but no traffic is routed there. `useStagingRender` is no longer
-// read on the render path; it still survives on autoPilot + editingJob
-// docs as a QA flag — when set, the upload step holds the video as
-// permanently UNLISTED instead of entering the publish schedule.
+// but no traffic is routed there. The `useStagingRender` flag has
+// been fully removed — uploads always go through the canonical
+// private + scheduled-publishAt path.
 const REMOTION_LAMBDA_SERVE_URL =
   'https://remotionlambda-useast1-1zsfacnzw9.s3.us-east-1.amazonaws.com/sites/rem-report-v7/index.html';
 // Music volume default. Per-channel UI override (channelMusicSettings.volume)
@@ -10533,9 +10532,6 @@ async function spawnBulkVideo(bulkRun, bulkRunId) {
       currentStage: '0/7',
       stageLabel: 'Queued by bulk auto-pilot',
       updatedAt: FieldValue.serverTimestamp(),
-      // Day-14 Phase 5b: inherit the bulk run's v7-staging choice so
-      // every child project carries the flag through to its editingJob.
-      useStagingRender: !!bulkRun.useStagingRender,
     },
   });
   // Step 2: flip requestStart=true via update — this triggers
@@ -11065,10 +11061,6 @@ exports.autoPilotWorker = onRequest(
             scriptText: proj.script || '',
             projectTitle: proj.title || proj.topic || 'project',
             status: 'pending',
-            // Day-14 Phase 5b: propagate the autopilot's staging flag to
-            // the editingJob doc so processEditingJobHttp routes to v7
-            // (scene plan + multi-source) instead of v6.
-            useStagingRender: !!proj.autoPilot?.useStagingRender,
             createdAt: FieldValue.serverTimestamp(),
           });
           jobId = newJob.id;
@@ -11283,19 +11275,10 @@ exports.autoPilotWorker = onRequest(
       proj = (await projRef.get()).data();
       ch = (await chRef.get()).data();
       if (!proj.youtubeVideoId) {
-        // Phase-6b fix 1: v7 staging renders upload as PERMANENTLY
-        // UNLISTED (no publishAt). YouTube would otherwise auto-flip
-        // any scheduled-private upload to PUBLIC at publishAt time.
-        // Staging videos must never enter the production scheduling
-        // pipeline — user keeps the URL for QA review, but the video
-        // never appears in search/feeds/recommendations.
-        const isStagingUpload = !!proj.autoPilot?.useStagingRender;
-        await setStage('7/7', isStagingUpload
-          ? 'Uploading to YouTube as UNLISTED (v7 staging — no public schedule)…'
-          : 'Uploading + scheduling on YouTube…');
+        await setStage('7/7', 'Uploading + scheduling on YouTube…');
         const sch = ch.publishSchedule || null;
         const lastSchedMs = sch?.lastScheduledAt?.toMillis?.() || 0;
-        const slotMs = isStagingUpload ? 0 : autoPilotNextPublishSlot(sch, lastSchedMs);
+        const slotMs = autoPilotNextPublishSlot(sch, lastSchedMs);
         const publishAtIso = slotMs ? new Date(slotMs).toISOString() : null;
         // Day-13 F4: auto-populate categoryId + tags. categoryId=24 (Entertainment)
         // for broader reach than the proxy's 22 default. Tags built from title +
@@ -11307,8 +11290,8 @@ exports.autoPilotWorker = onRequest(
           body: JSON.stringify({
             channelId, title: proj.ytTitle, description: proj.ytDesc || '',
             videoUrl: proj.editingFile.url, thumbnailUrl: proj.thumbnailUrl || '',
-            privacyStatus: isStagingUpload ? 'unlisted' : 'private',
-            publishAt: isStagingUpload ? null : publishAtIso,
+            privacyStatus: 'private',
+            publishAt: publishAtIso,
             categoryId: DEFAULT_YOUTUBE_CATEGORY_ID, tags: ytTags,
           }),
         });
