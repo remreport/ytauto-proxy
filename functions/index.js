@@ -1132,6 +1132,22 @@ async function enrichBeatsWithEntityImages(rawBeats, captions = null) {
       unique.get(r.name).imageSource = r.source;
     }
   }
+  // Phase 16H: STRIP person portrait imageUrls so we never inject a
+  // person-face entityPortrait overlay below. Their imageUrl is still
+  // fetched (above) so Wikipedia coverage is logged + cached for
+  // future Phase-16E full-screen portrait sourcing; we just don't
+  // create the corner overlay. Companies + places keep their imageUrl.
+  let personPortraitsStripped = 0;
+  for (const [name, meta] of unique) {
+    if (meta?.imageUrl && meta.type === 'person') {
+      meta._suppressedForPhase16H = meta.imageUrl;
+      meta.imageUrl = null;
+      personPortraitsStripped++;
+    }
+  }
+  if (personPortraitsStripped > 0) {
+    console.log(`[entities] Phase 16H: stripped ${personPortraitsStripped} person-portrait overlay candidates (people-faces handled at sourcing layer instead)`);
+  }
   const logoCount = results.filter((r) => r.source === 'logo.dev' && r.imageUrl).length;
   const wikiCount = results.filter((r) => r.source === 'wikipedia' && r.imageUrl).length;
   console.log(`[entities] resolved images: ${logoCount} via logo.dev, ${wikiCount} via wikipedia`);
@@ -2362,6 +2378,43 @@ function pairQuotesWithEntityPortraits(rawBeats) {
 // Claude writes "Source: Reuters" alongside an entity mention named
 // "Reuters". Word-boundary refinement deferred until false-drops show
 // up in renders.
+// Phase 16H: hard whitelist. Keep ONLY bigStat (always) and
+// entityPortrait WHERE entityType === 'company' (logos). All other
+// overlay types get filtered: lowerThird, countUp, quote, Lottie,
+// entityPortrait-for-person, stat, comparison, tickerSymbol,
+// newsAlert, progressBar, miniChart, circleEmphasis.
+//
+// Rationale: people-face portraits in the corner read as amateur and
+// often render the wrong face (Wikipedia name mismatch). People are
+// better handled at the SOURCING layer via Phase 16E (full-screen
+// Wikipedia portrait). Logos remain useful as ambient context-
+// reinforcers in the corner.
+function filterOverlaysToBigStatAndLogos(rawBeats) {
+  if (!Array.isArray(rawBeats)) return 0;
+  const droppedByType = {};
+  let kept = 0;
+  for (const beat of rawBeats) {
+    if (!Array.isArray(beat?.overlays)) continue;
+    beat.overlays = beat.overlays.filter((ov) => {
+      if (!ov || !ov.type) return false;
+      if (ov.type === 'bigStat') { kept++; return true; }
+      if (ov.type === 'entityPortrait' && ov.entityType === 'company') { kept++; return true; }
+      // Anything else dropped — including entityPortrait for non-company.
+      droppedByType[ov.type] = (droppedByType[ov.type] || 0) + 1;
+      // Person-type entityPortrait gets a distinct counter for visibility
+      if (ov.type === 'entityPortrait') {
+        droppedByType[`entityPortrait(${ov.entityType || 'unknown'})`] = (droppedByType[`entityPortrait(${ov.entityType || 'unknown'})`] || 0) + 1;
+      }
+      return false;
+    });
+  }
+  const droppedTotal = Object.values(droppedByType).reduce((a, b) => a + b, 0);
+  if (droppedTotal > 0) {
+    console.log(`[overlay-filter] Phase 16H: kept ${kept} (bigStat + company logos); dropped ${droppedTotal} (${JSON.stringify(droppedByType)})`);
+  }
+  return droppedTotal;
+}
+
 function dropRedundantLowerThirds(rawBeats) {
   if (!Array.isArray(rawBeats)) return 0;
   // Index entityPortrait names by beat index for O(1) adjacent lookups.
@@ -5826,6 +5879,12 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   pairQuotesWithEntityPortraits(rawBeats);
   dropRedundantLowerThirds(rawBeats);
   dropNonSourceLowerThirds(rawBeats);
+  // Phase 16H: hard filter — keep ONLY bigStat + entityPortrait (logos).
+  // User spec: "Remove lowerThird, countUp, Lottie, entityPortrait-for-
+  // people". People-faces are handled at the SOURCING layer via Phase
+  // 16E two-phase portraits (full Wikipedia photo, not corner overlay);
+  // lowerThird/countUp/quote/Lottie removed entirely.
+  filterOverlaysToBigStatAndLogos(rawBeats);
   clampOverlayDurationsToBeat(rawBeats);
   enforceOverlaySpacing(rawBeats, 1.5);
   const beatsExtractMs = Date.now() - beatsT0;
