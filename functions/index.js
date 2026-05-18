@@ -4787,6 +4787,101 @@ async function runAiVideoGenerationPass(footage, beatIndices, channelId, cfg, jo
 // beat.keywords; applyScenesToBeats() overrides those with scene-level
 // keywords for cohesion. Phase 2 does NOT yet route by assetType —
 // that's Phases 3-5. Gated behind useStagingRender per CONTRIBUTING.md.
+// Phase 16B — word-boundary snap helpers.
+//
+// Problem: scene boundaries inherited from beat.end / sentence boundaries
+// can fall in the middle of a word's spoken utterance — AssemblyAI
+// reports word.start/word.end with ~10ms precision, and beat boundaries
+// from breakIntoBeats round to caption text rather than word audio.
+// Result: voiceover audibly clipped mid-word at scene transitions
+// (user complaint: "off timing feel", "voiceover cut mid-word").
+//
+// Solution: snap every scene boundary to the END of the nearest word
+// whose end is >= the planned boundary. ONLY snaps forward (never
+// backward into the previous scene). Chain cursor enforces zero gaps
+// + zero overlaps: scene[i+1].start = scene[i].snappedEnd.
+
+// Returns the absolute timestamp of the END of the first word whose
+// .end is >= t. Returns null if no such word exists (t past last word).
+function _closestWordEndAfter(captions, t) {
+  if (!Array.isArray(captions) || captions.length === 0) return null;
+  for (const sentence of captions) {
+    if (!sentence) continue;
+    if (typeof sentence.end === 'number' && sentence.end < t) continue;
+    const words = sentence.words || [];
+    for (const w of words) {
+      if (typeof w.end !== 'number') continue;
+      if (w.end >= t) return w.end;
+    }
+  }
+  return null;
+}
+
+// Snap each scene's end to the nearest word boundary AFTER its planned
+// end. Then chain: scene[i+1].start = scene[i].end (zero gap, zero
+// overlap). Fail-loud: throws if any scene ends up with end <= start.
+//
+// Mutates the scenes array IN PLACE — adds `originalStart`/`originalEnd`
+// for diagnostics, updates `start`/`end` to snapped values.
+function snapScenesToWordBoundaries(scenes, rawBeats, captions, voiceoverDurationSec) {
+  if (!Array.isArray(scenes) || scenes.length === 0) return {snapped: 0, dropped: 0};
+  if (!Array.isArray(captions) || captions.length === 0) {
+    console.warn('[scene-snap] no captions provided — skipping word-boundary snap');
+    return {snapped: 0, dropped: 0};
+  }
+  let snapped = 0;
+  let dropped = 0;
+  let chainCursor = 0; // first scene always starts at 0
+  const survivors = [];
+  for (let i = 0; i < scenes.length; i++) {
+    const s = scenes[i];
+    // Original natural end from clustering (last beat's end)
+    const lastBeat = rawBeats[s.beats[s.beats.length - 1]];
+    const naturalEnd = lastBeat?._extendedEnd || lastBeat?.end || s.start;
+    // Snap end forward to nearest word boundary
+    let snappedEnd;
+    if (i === scenes.length - 1) {
+      // Last scene: extend to voiceover duration (already handled by _extendedEnd)
+      snappedEnd = Math.max(naturalEnd, voiceoverDurationSec || naturalEnd);
+    } else {
+      const w = _closestWordEndAfter(captions, naturalEnd);
+      snappedEnd = (w != null) ? w : naturalEnd;
+    }
+    // Chain start = previous scene's snapped end (zero gap)
+    const snappedStart = chainCursor;
+    // Fail-loud: if chain cursor has advanced past this scene's natural
+    // end (rare, happens when a sentence is very short + previous snap
+    // pushed past it), DROP this scene rather than ship a 0-duration
+    // <Sequence>. The previous scene already covers the time.
+    if (snappedEnd <= snappedStart + 0.05) {
+      dropped++;
+      console.warn(`[scene-snap] dropping scene ${i} — snapped duration ${(snappedEnd - snappedStart).toFixed(2)}s too short (chain cursor advanced past natural end ${naturalEnd.toFixed(2)}s)`);
+      continue;
+    }
+    // Persist snapped + original values
+    s.originalStart = s.start;
+    s.originalEnd = naturalEnd;
+    s.start = snappedStart;
+    s.end = snappedEnd;
+    if (Math.abs(snappedStart - s.originalStart) > 0.05 || Math.abs(snappedEnd - naturalEnd) > 0.05) {
+      snapped++;
+    }
+    chainCursor = snappedEnd;
+    survivors.push(s);
+  }
+  // Fail-loud assertion: every survivor MUST have end > start
+  for (const s of survivors) {
+    if (!(s.end > s.start)) {
+      throw new Error(`[scene-snap] FAIL-LOUD: scene ${s.index ?? '?'} has end ${s.end} <= start ${s.start}`);
+    }
+  }
+  // Replace contents in-place so caller's array reference still works
+  scenes.length = 0;
+  scenes.push(...survivors);
+  console.log(`[scene-snap] ${snapped}/${survivors.length} scenes snapped to word boundaries, ${dropped} dropped (chain-cursor squeeze), zero gaps/overlaps`);
+  return {snapped, dropped};
+}
+
 async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurationSec) {
   if (!Array.isArray(rawBeats) || rawBeats.length === 0) return [];
   // Phase 15d: STRICT sentence-boundary cuts. Scenes close ONLY when
@@ -4836,10 +4931,20 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
     }
   }
 
+  // Phase 16B: snap every scene boundary to the nearest word-end after
+  // its natural end. Chain cursor enforces zero gaps + zero overlaps.
+  // Eliminates the mid-word audio cut at scene transitions that gave
+  // renders their "off timing" feel. Fail-loud assertion inside —
+  // refuses to ship a plan with end<=start.
+  snapScenesToWordBoundaries(scenes, rawBeats, captions, voiceoverDurationSec);
+  // Re-assign scene.index (in case any scenes were dropped during snap)
+  for (let i = 0; i < scenes.length; i++) scenes[i].index = i;
+
   const sceneInputs = scenes.map((s, idx) => {
     const sceneBeats = s.beats.map((bi) => rawBeats[bi]);
-    const lastBeat = sceneBeats[sceneBeats.length - 1];
-    const endSec = lastBeat._extendedEnd || lastBeat.end || s.start;
+    // Phase 16B: use snapped scene.end (set by snapScenesToWordBoundaries),
+    // not the original beat-end. This is the actual displayed boundary.
+    const endSec = s.end;
     const sentenceTexts = Array.from(new Set(sceneBeats.map((b) => b.sentence).filter(Boolean)));
     const keywordHints = Array.from(new Set(sceneBeats.flatMap((b) => b.keywords || [])));
     return {
@@ -4935,7 +5040,9 @@ Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the
     const e = enriched[idx] || {};
     const at = validTypes.has(e.assetType) ? e.assetType : 'stock_footage';
     breakdown[at]++;
-    const endSec = rawBeats[s.beats[s.beats.length - 1]].end || s.start;
+    // Phase 16B: use snapped scene.end set by snapScenesToWordBoundaries
+    // (originally was last beat's natural end — could fall mid-word).
+    const endSec = s.end || rawBeats[s.beats[s.beats.length - 1]].end || s.start;
     return {
       index: idx,
       beats: s.beats.slice(),
