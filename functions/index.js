@@ -1035,21 +1035,51 @@ async function fetchCompanyLogo(name, apiKey) {
 }
 
 const _wikiImageCache = new Map();
+// Phase 16E: TWO-PHASE portrait sourcing. AI-fabricated faces of real
+// people are the #1 cause of "wrong person in thumbnail / overlay"
+// complaints. This function is the IDENTITY-LINKED Phase 1: Wikipedia
+// summary API + disambig-page fallback to common qualifiers. When all
+// Phase 1 attempts miss, returns null — caller (scene plan + AI handler)
+// is responsible for Phase 2 ERA/CONTEXT fallback (NEVER AI face).
+// Phase 2 is enforced by Phase 16D's forbiddenNames mechanism: any
+// person whose Phase 1 portrait fails will appear in forbiddenNames →
+// AI handler can never fabricate their face.
+const _PERSON_DISAMBIG_QUALIFIERS = [
+  '', // bare name first
+  '(American politician)',
+  '(American businessman)',
+  '(economist)',
+  '(banker)',
+  '(financier)',
+];
 async function fetchWikipediaImage(name) {
   if (!name || typeof name !== 'string') return null;
   const key = name.trim().toLowerCase();
   if (_wikiImageCache.has(key)) return _wikiImageCache.get(key);
+  const baseName = name.trim();
   try {
-    const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(name.trim())}`;
-    const resp = await fetch(url, {headers: {'User-Agent': 'rem-report/1.0 (https://flourishing-squirrel-92d50e.netlify.app)'}});
-    if (!resp.ok) { _wikiImageCache.set(key, null); return null; }
-    const data = await resp.json();
-    if (data.type === 'disambiguation') { _wikiImageCache.set(key, null); return null; }
-    const imageUrl = data.originalimage?.source || data.thumbnail?.source || null;
-    _wikiImageCache.set(key, imageUrl);
-    return imageUrl;
+    // Phase 1: try bare name + common qualifiers if disambig
+    for (const qualifier of _PERSON_DISAMBIG_QUALIFIERS) {
+      const candidate = qualifier ? `${baseName} ${qualifier}` : baseName;
+      const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(candidate)}`;
+      const resp = await fetch(url, {headers: {'User-Agent': 'rem-report/1.0 (https://flourishing-squirrel-92d50e.netlify.app)'}});
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      if (data.type === 'disambiguation') continue;
+      const imageUrl = data.originalimage?.source || data.thumbnail?.source || null;
+      if (imageUrl) {
+        if (qualifier) console.log(`[wiki] "${baseName}" → resolved via qualifier "${qualifier}"`);
+        _wikiImageCache.set(key, imageUrl);
+        return imageUrl;
+      }
+    }
+    // Phase 1 fully exhausted — Phase 2 era/context fallback is
+    // handler-side (sceneplan biased to setting, AI never fabricates).
+    console.log(`[wiki] "${baseName}" → NO portrait found in Phase 1 (will use era/context fallback; AI cannot generate face — forbiddenNames covers it)`);
+    _wikiImageCache.set(key, null);
+    return null;
   } catch (e) {
-    console.warn(`[wiki] ${name}: ${e.message}`);
+    console.warn(`[wiki] ${baseName}: ${e.message}`);
     _wikiImageCache.set(key, null);
     return null;
   }
