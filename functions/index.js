@@ -2951,12 +2951,70 @@ const AI_IMAGE_BUDGET_PER_VIDEO = 1.00; // USD
 const AI_IMAGE_COST_PER_GENERATION = 0.08; // USD per 1K image, fal.ai Nano Banana 2
 const FAL_AI_NANO_BANANA_URL = 'https://fal.run/fal-ai/nano-banana-2';
 const AI_IMAGE_STYLE_PREFIX = 'Award-winning editorial photography for financial news. Photorealistic. Cinematic lighting with dramatic side-light and subtle teal/orange color grading. Shallow depth of field. 16:9 widescreen composition. NO text, NO logos, NO watermarks, NO charts with fake numbers. Documentary realism, professional finance/business setting. Style of high-end financial news publications. ';
+// Phase 16D: appended AFTER user prompt for stronger aesthetic enforcement.
+// Counters the "obviously AI" look user complained about by drilling in
+// the editorial-news aesthetic at the END of the prompt where the model
+// weights recency more heavily.
+const AI_IMAGE_STYLE_SUFFIX = ' Cinematic news photography, professional editorial quality, dark moody lighting, finance industry aesthetic, shot on Phase One IQ4 medium format, natural film grain, NOT AI-generated look, NOT digital art, NOT 3D render.';
+
+// Phase 16D: deterministic sanitizer for un-imageable subjects. AI image
+// models cannot reliably render: text/logos/documents/abstract concepts.
+// When the scene plan asks for these, rewrite into a concrete imageable
+// scene that captures the same idea visually. Rules are DETERMINISTIC
+// (substring match → rewrite) so behavior is predictable + reviewable.
+const AI_PROMPT_SANITIZER_RULES = [
+  // Logos → institutional setting
+  {pattern: /\b(federal reserve|fed) logo\b/i, replace: 'Federal Reserve building marble columns Washington DC at dusk'},
+  {pattern: /\btreasury logo\b/i, replace: 'US Treasury Department building Washington DC aerial view'},
+  {pattern: /\bsec logo\b/i, replace: 'Securities and Exchange Commission building Washington DC'},
+  {pattern: /\bjpmorgan logo\b/i, replace: 'JPMorgan Chase tower glass facade reflections New York'},
+  {pattern: /\bgoldman sachs logo\b/i, replace: 'Goldman Sachs headquarters tower Manhattan financial district'},
+  {pattern: /\bblackstone logo\b/i, replace: 'Blackstone Group office tower New York corporate'},
+  {pattern: /\bblackrock logo\b/i, replace: 'BlackRock Manhattan tower glass facade'},
+  // Documents → setting
+  {pattern: /\btreasury document\b/i, replace: 'US Treasury Department aerial view Washington DC stone columns'},
+  {pattern: /\b(legal|legislation|bill|act) document\b/i, replace: 'Congress chamber empty marble columns desk gavel'},
+  {pattern: /\bfinancial document\b/i, replace: 'Wall Street office desk papers fountain pen briefcase'},
+  // Abstract protocols / systems → concrete representation
+  {pattern: /\bbitcoin protocol\b/i, replace: 'Bitcoin physical coin macro photography dark background orange glow'},
+  {pattern: /\bblockchain (protocol|network|technology)\b/i, replace: 'Data center server racks dark room blue glow cables'},
+  {pattern: /\b(crypto|cryptocurrency) (protocol|network)\b/i, replace: 'Cryptocurrency trading screen multiple monitors dark room'},
+  // Generic abstract concepts
+  {pattern: /\bmonetary policy\b/i, replace: 'Federal Reserve building Washington DC marble columns'},
+  {pattern: /\bregulatory framework\b/i, replace: 'Capitol Hill dome Washington DC dusk'},
+];
+function sanitizeAiPrompt(rawPrompt) {
+  let out = rawPrompt;
+  const rewrites = [];
+  for (const rule of AI_PROMPT_SANITIZER_RULES) {
+    if (rule.pattern.test(out)) {
+      const before = out;
+      out = out.replace(rule.pattern, rule.replace);
+      if (out !== before) rewrites.push({pattern: String(rule.pattern), replace: rule.replace});
+    }
+  }
+  return {prompt: out, rewrites};
+}
+
+// Phase 16D: forbiddenNames mechanism. Real-person face fabrication is
+// the #1 user complaint about AI images (random non-Powell appears
+// when scene says "Powell"). Collect all real people mentioned in the
+// script and pass to the AI prompt as explicit FORBIDDEN subjects.
+// Names should ALWAYS come from real photos (Wikipedia/archive) — see
+// Phase 16E two-phase portrait sourcing.
+function buildForbiddenNamesClause(forbiddenNames) {
+  if (!Array.isArray(forbiddenNames) || forbiddenNames.length === 0) return '';
+  // Cap at 20 names + dedupe + sort for prompt stability
+  const unique = Array.from(new Set(forbiddenNames.map((n) => String(n).trim()).filter(Boolean))).slice(0, 20);
+  if (unique.length === 0) return '';
+  return ` STRICTLY FORBIDDEN: do not generate the face, likeness, or portrait of any real person, including but not limited to: ${unique.join(', ')}. If a scene references one of these people, generate the SETTING/CONTEXT (their office building, their podium, their institution) — NO face.`;
+}
 
 function createAiImageBudgetTracker() {
   return {spent: 0, generated: 0, cacheHits: 0, skipped: 0, capUsd: AI_IMAGE_BUDGET_PER_VIDEO};
 }
 
-async function generateAiImage({prompt, falApiKey, budgetTracker}) {
+async function generateAiImage({prompt, falApiKey, budgetTracker, forbiddenNames = []}) {
   if (!prompt || typeof prompt !== 'string' || prompt.trim().length < 10) {
     console.warn('[ai-image] empty/short prompt — skipping');
     return null;
@@ -2965,8 +3023,15 @@ async function generateAiImage({prompt, falApiKey, budgetTracker}) {
     console.warn('[ai-image] FAL_AI_API_KEY not set — skipping (will fall back to stock_footage)');
     return null;
   }
-  // Locked style prefix for cross-scene consistency.
-  const fullPrompt = AI_IMAGE_STYLE_PREFIX + prompt.trim();
+  // Phase 16D: sanitize un-imageable subjects (logos/docs/abstract
+  // concepts → concrete scenes), append forbiddenNames clause,
+  // bookend with style prefix + suffix.
+  const {prompt: sanitized, rewrites} = sanitizeAiPrompt(prompt.trim());
+  if (rewrites.length) {
+    console.log(`[ai-image] sanitizer rewrote ${rewrites.length} pattern(s) — first: ${rewrites[0].pattern} → "${rewrites[0].replace.slice(0, 50)}..."`);
+  }
+  const forbiddenClause = buildForbiddenNamesClause(forbiddenNames);
+  const fullPrompt = AI_IMAGE_STYLE_PREFIX + sanitized + AI_IMAGE_STYLE_SUFFIX + forbiddenClause;
   // SHA256 cache key over the FULL prompt (style prefix included so a
   // future prefix change invalidates cleanly).
   const hash = crypto.createHash('sha256').update(fullPrompt).digest('hex');
@@ -5291,6 +5356,7 @@ async function handleAiGenerated(scene, ctx) {
     prompt: scene.aiPrompt,
     falApiKey: process.env.FAL_AI_API_KEY,
     budgetTracker: ctx.aiImageBudget,
+    forbiddenNames: ctx.forbiddenNames || [], // Phase 16D
   });
   if (aiUrl) {
     provenance.push({tried: 'fal-ai-image', ok: true});
@@ -5483,6 +5549,21 @@ function preAllocateAiBudget(scenes, aiImageBudget) {
 // overlays + sfx from constituent beats with scene-relative timestamps.
 // Skips AI hero video (Kling) pass entirely.
 async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blocklist, aiImageBudget, usedStockUrls, jobRef, baseProgress, span}) {
+  // Phase 16D: collect every real person named anywhere in the script.
+  // AI image generation receives this list as STRICTLY FORBIDDEN subjects
+  // — prevents the "random non-Powell appears when scene says Powell"
+  // failure mode. Names of people come from rawBeats[i].entities where
+  // entity.type === 'person'.
+  const forbiddenNames = [];
+  for (const b of rawBeats || []) {
+    if (!Array.isArray(b.entities)) continue;
+    for (const e of b.entities) {
+      if (e?.type === 'person' && e.name) forbiddenNames.push(e.name);
+    }
+  }
+  if (forbiddenNames.length) {
+    console.log(`[ai-image] forbiddenNames: ${forbiddenNames.slice(0, 5).join(', ')}${forbiddenNames.length > 5 ? ` … (+${forbiddenNames.length - 5} more)` : ''}`);
+  }
   const footage = [];
   for (let si = 0; si < scenes.length; si++) {
     const scene = scenes[si];
@@ -5501,7 +5582,8 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
     }).catch(() => {});
 
     // Phase 16C: HANDLERS dispatch with full provenance tracking
-    const ctx = {channelId, blocklist, aiImageBudget, usedStockUrls, sceneBeats};
+    // Phase 16D: forbiddenNames propagated for AI image generation
+    const ctx = {channelId, blocklist, aiImageBudget, usedStockUrls, sceneBeats, forbiddenNames};
     const handler = ASSET_HANDLERS[scene.assetType] || ASSET_HANDLERS.stock_footage;
     let url = null;
     let source = null;
