@@ -6467,10 +6467,12 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
 
   const perBeatSourcingMs = Date.now() - perBeatT0;
   // Tally where each beat's footage came from for transparency.
+  // Phase 17D: template:* scenes legitimately have url=null + source="template:stat-overlay"
+  // (etc.). Bucket by b.source directly — guarding on b.url miscounted templates as 'none'.
   const footageBySource = {pexels: 0, pixabay: 0, wikimedia: 0, 'wikimedia-image': 0, archive: 0, 'ai-video': 0, 'fal-ai-image': 0, 'mapbox-image': 0, none: 0};
   for (const b of footage) {
     if (!b) continue;
-    const k = b.url ? (b.source || 'none') : 'none';
+    const k = b.source || 'none';
     footageBySource[k] = (footageBySource[k] || 0) + 1;
   }
   await jobRef.update({
@@ -6562,10 +6564,11 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   // Recompute footageBySource AFTER the AI-video pass. The earlier snapshot
   // (line ~2976) captured pre-AI counts so ai-video always showed 0 even
   // when Kling clips replaced Pexels beats — diagnostic confusion.
+  // Phase 17D: bucket by source directly so template:* (url=null) is counted.
   const footageBySourceFinal = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'ai-video': 0, none: 0};
   for (const b of footage) {
     if (!b) continue;
-    const k = b.url ? (b.source || 'none') : 'none';
+    const k = b.source || 'none';
     footageBySourceFinal[k] = (footageBySourceFinal[k] || 0) + 1;
   }
   await jobRef.update({
@@ -6872,8 +6875,19 @@ async function renderOnLambda(inputProps, jobRef, {progressLabel = 'Rendering on
     // ~45 chunks vs 18. AWS default concurrent-Lambda quota is 1000 so
     // headroom is enormous; cost is unchanged (Lambda billed by total
     // duration, not invocation count).
-    framesPerLambda: 400,
-    concurrencyPerLambda: 2,
+    // Phase 17D: concurrency 2 → 1 + framesPerLambda 400 → 200 after
+    // c2XpokWY8oWHFZPGhoXx OOMed at 3008 MB rendering segment 2 chunk 5.
+    // The chunk Lambda was decoding 4 Pexels MP4s concurrently (one was
+    // 19.5 MB / ~30s @ 1080p) while a 106-Sequence React tree was
+    // mounted; concurrency=2 meant 2 frames in flight simultaneously
+    // doubling decoder + canvas memory. concurrency=1 roughly halves
+    // peak; smaller chunks (200) limit how many large MP4 sources a
+    // single Lambda has to keep resident. Wall-time per chunk roughly
+    // doubles but AWS concurrent-Lambda quota is 1000 so total render
+    // time is similar. If this still OOMs, next move is bumping the
+    // Lambda memory tier (3008 → 5120) via a new function deploy.
+    framesPerLambda: 200,
+    concurrencyPerLambda: 1,
     maxRetries: 5,
     // Per-asset fetch budget inside each Lambda's Chromium. Default 28s
     // killed renders when Pexels CDN was slow even on validated files.
