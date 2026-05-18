@@ -2919,6 +2919,60 @@ async function wikimediaImageSearchTop(query, n = 3) {
   return out;
 }
 
+// Phase 16F: Library of Congress photos API. Free, no API key, USA-
+// focused public-domain trove. STRONG for: 1920s-1980s financial/
+// political history, congressional photos, presidential addresses,
+// economic-era documentary photography. Use as PRIMARY archival
+// source for US finance topics; falls through to Wikimedia/Internet
+// Archive on miss.
+//
+// API endpoint: https://www.loc.gov/photos/?fo=json&q=QUERY
+// Returns: {results: [{image_url: [{...sizes}], item: {...}, rights_info: ...}]}
+// License: filter for "no known restrictions" (LOC's PD marker).
+async function locGovSearchTop(query, n = 3) {
+  const url = new URL('https://www.loc.gov/photos/');
+  url.searchParams.set('fo', 'json');
+  url.searchParams.set('q', query);
+  url.searchParams.set('c', '15'); // request up to 15 then filter
+  let resp;
+  try {
+    resp = await fetch(url, {
+      headers: {'User-Agent': 'rem-report-bot/1.0 (yt-automation; contact via channel owner)'},
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (e) {
+    console.warn(`[loc-gov] fetch threw for "${query}": ${e.message}`);
+    return [];
+  }
+  if (!resp.ok) {
+    console.warn(`[loc-gov] HTTP ${resp.status} for "${query}"`);
+    return [];
+  }
+  let data;
+  try { data = await resp.json(); }
+  catch (e) { console.warn(`[loc-gov] JSON parse threw: ${e.message}`); return []; }
+  const results = Array.isArray(data.results) ? data.results : [];
+  const out = [];
+  for (const item of results) {
+    if (out.length >= n) break;
+    // Filter to PD / no-known-restrictions
+    const rights = (item.rights_info || '').toLowerCase();
+    if (rights && !/no known restrictions|public domain|cc[\-\s]?by|cc[\-\s]?0/i.test(rights)) continue;
+    // image_url is an array of size variants; pick the largest reasonable
+    // size (typically the second or third — first is often a "default"
+    // thumbnail). Filter out tiny thumbnails (< 400px wide).
+    const imgs = Array.isArray(item.image_url) ? item.image_url : [];
+    if (imgs.length === 0) continue;
+    // LOC URLs include a size hint like "...#h=600&w=900". Pick the
+    // last one (usually the highest-resolution variant).
+    const pick = imgs[imgs.length - 1];
+    if (!pick || typeof pick !== 'string') continue;
+    out.push(pick);
+  }
+  if (out.length) console.log(`[loc-gov] ${out.length} hits for "${query.slice(0, 60)}"`);
+  return out;
+}
+
 // Day-15 Phase 15c: Wikimedia Commons VIDEO search. Same API as
 // wikimediaImageSearchTop but filemime:video. Commons is ~100% WebM in
 // 2026 (VP8/VP9), which Remotion's OffthreadVideo handles via FFmpeg.
@@ -3411,12 +3465,25 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
     } catch {/* keep fallback */}
   }
 
-  // Day-14 Phase 3 + Day-15 15b: archival_photo scenes try Wikimedia
-  // Commons IMAGES first (best for known figures/iconic moments), then
-  // Internet Archive movies (best for era/industry footage from the
-  // Prelinger collection — 1929 trading floors, 1970s gas lines, etc).
-  // On both empty, fall through to the usual Pexels-first ladder.
+  // Day-14 Phase 3 + Day-15 15b + Day-16 16F: archival_photo cascade.
+  // Order: Library of Congress (Phase 16F, primary for US finance) →
+  // Wikimedia Commons images (best for known figures/iconic moments) →
+  // Wikimedia Commons video (modern Fed/Powell speeches) →
+  // Internet Archive Prelinger (era/industry footage from 1920s-80s) →
+  // existing Pexels-first ladder fallback.
   if (assetTypeHint === 'archival_photo' && cfg.wikimedia) {
+    // Phase 16F: LOC.gov first — US-focused PD archive, strongest for
+    // US finance/political history. Cheap (no key, ~1s per call).
+    if (cfg.locGov !== false) {
+      let locUrls;
+      try { locUrls = await locGovSearchTop(query, n); }
+      catch (e) { console.warn(`[footage] loc-gov threw for "${query}": ${e.message}`); locUrls = []; }
+      if (locUrls && locUrls.length) {
+        const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'loc-gov-image': locUrls.length};
+        console.log(`[source-ladder] archival_photo "${query}" → loc-gov-image (${locUrls.length} candidates)`);
+        return {urls: locUrls, source: 'loc-gov-image', sourceCounts};
+      }
+    }
     let imageUrls;
     try { imageUrls = await wikimediaImageSearchTop(query, n); }
     catch (e) { console.warn(`[footage] wikimedia-image threw for "${query}": ${e.message}`); imageUrls = []; }
@@ -3854,6 +3921,7 @@ async function deepValidateBeat(url, opts = {}) {
 // image sources (they get a HEAD-probe instead for defense-in-depth).
 const PREFLIGHT_IMAGE_SOURCES = new Set([
   'fal-ai-image', 'wikimedia-image', 'mapbox-image', 'placeholder-black', 'flux',
+  'loc-gov-image', // Phase 16F — Library of Congress photos
 ]);
 
 async function preflightValidateFootage(footage, jobRef, {channelId} = {}) {
