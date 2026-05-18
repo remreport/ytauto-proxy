@@ -4001,6 +4001,8 @@ async function preflightValidateFootage(footage, jobRef, {channelId} = {}) {
     await Promise.all(footage.slice(i, end).map(async (beat, batchIdx) => {
       const idx = i + batchIdx;
       if (!beat || !beat.url) return;
+      // Phase 16I: code-rendered templates have no URL/no source to probe
+      if (beat.templateType) return;
       // Phase-6b CRITICAL fix: image-source beats use HEAD probe, NOT
       // ffprobe. Defense-in-depth confirms the image URL is reachable
       // + returns image/* content-type, without spawning ffprobe (which
@@ -5100,15 +5102,13 @@ function snapScenesToWordBoundaries(scenes, rawBeats, captions, voiceoverDuratio
 
 async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurationSec) {
   if (!Array.isArray(rawBeats) || rawBeats.length === 0) return [];
-  // Phase 15d: STRICT sentence-boundary cuts. Scenes close ONLY when
-  // the sentence changes (no more mid-sentence cuts). Soft target 5-8s,
-  // hard cap 15s emergency-break (single sentences >15s force a cut to
-  // prevent unwieldy scenes; rare in well-paced finance scripts). This
-  // produces natural flow at the cost of slightly uneven pacing —
-  // 15a+15e+15f variants will tune pacing within the sentence
-  // constraint.
-  const SCENE_SOFT_MIN = 4; // close at sentence-change once we're past this
-  const SCENE_HARD_MAX = 15; // emergency cut even mid-sentence
+  // Phase 15d + Phase 16I: STRICT sentence-boundary cuts at a denser
+  // pace. Phase 16I lowered SOFT_MIN 4→2.5s + HARD_MAX 15→12s to
+  // target ~3s avg scene (friend's pipeline produces ~280 scenes per
+  // 14-min video; this brings us closer without breaking the
+  // sentence-boundary rule).
+  const SCENE_SOFT_MIN = 2.5; // close at sentence-change once we're past this
+  const SCENE_HARD_MAX = 12;  // emergency cut even mid-sentence
   const scenes = [];
   let cur = {start: rawBeats[0].start || 0, beats: [0]};
   for (let i = 1; i < rawBeats.length; i++) {
@@ -5176,19 +5176,30 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
 
   const prompt = `You are planning visuals for ${sceneInputs.length} scenes of a YouTube finance/news short video. For EACH scene, output a JSON object with:
 - visualConcept: string, 5-15 words describing what should appear on screen
-- assetType: one of "stock_footage" | "archival_photo" | "ai_generated" | "map"
+- assetType: one of "stock_footage" | "archival_photo" | "ai_generated" | "map" | "stat_overlay" | "quote_card" | "comparison_split" | "timeline_bar"
+    * stat_overlay — full-screen code-rendered stat scene (use for KEY numbers/stats the viewer should remember; replaces generic stock when the moment is "remember THIS number")
+    * quote_card — full-screen code-rendered quote scene (use when voiceover quotes someone directly)
+    * comparison_split — full-screen code-rendered split scene with two competing values (use for "then vs now", "X vs Y" framings)
+    * timeline_bar — full-screen code-rendered timeline (use when scene walks through 3-5 chronological events)
+    * (stock_footage/archival_photo/ai_generated/map work as before — URL-based footage)
 - searchKeywords: array of 1-3 specific search terms (refined from the beat-level hints)
 - aiPrompt: vivid photorealistic prompt for AI image generation (ONLY when assetType="ai_generated"; else null)
 - mapContext: object (ONLY when assetType="map"; else null) with:
     - locations: array of {name: string, longitude: number, latitude: number} for the places mentioned (use real-world coords — Shanghai is 121.47/31.23, Berlin is 13.41/52.52, etc.)
     - mapStyle: "dark" (default — fits finance/news brand) | "satellite" | "streets"
     - zoom: 1-18 integer (continental=3, country=5, region=7, city=10) — only used when locations.length === 1, else auto-fit
-- fallbackChain: array of 1-3 assetTypes in fallback order (e.g., ["ai_generated", "stock_footage"])
+- templateParams: object (ONLY when assetType is one of stat_overlay/quote_card/comparison_split/timeline_bar; else null):
+    * For stat_overlay: {value: "$700B", label: "TARP bailout, October 2008", context: "approved 263-171 in Congress"}
+    * For quote_card: {quote: "Whatever it takes", name: "Mario Draghi", role: "ECB President", date: "July 2012"}
+    * For comparison_split: {header: "Then vs Now", leftLabel: "2008", leftValue: "\$700B", rightLabel: "2026", rightValue: "\$3T"}
+    * For timeline_bar: {header: "Fed crisis interventions", events: [{date: "1913", label: "Fed founded"}, {date: "1929", label: "Black Tuesday"}, {date: "2008", label: "TARP"}]}
+- fallbackChain: array of 1-3 assetTypes in fallback order (e.g., ["ai_generated", "stock_footage"]). Templates fall back to "stock_footage".
 - pacingHint (Phase 15e — optional, default "standard"): one of "rapid" | "standard" | "slow" | "hold"
     * "rapid" — for opening hooks, breaking-news moments, rapid-fire stat sequences, dramatic shock reveals
     * "standard" — default narrative pace (most scenes)
     * "slow" — for explanations of complex concepts, walking the viewer through cause and effect
     * "hold" — for climactic statements, key numbers, callout-worthy quotes that should sit on screen
+Phase 16I template guidance: aim for ~20-25% of scenes to use code-rendered templates (stat_overlay, quote_card, comparison_split, timeline_bar) when the scene's content fits — this creates visual variety and matches the editorial-news aesthetic. Don't force templates onto scenes that are purely narrative B-roll.
 
 Rules — pick the BEST type for EACH specific scene, NOT a default:
 
@@ -5250,8 +5261,9 @@ Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the
     return [];
   }
 
-  const validTypes = new Set(['stock_footage', 'archival_photo', 'ai_generated', 'map']);
-  const breakdown = {stock_footage: 0, archival_photo: 0, ai_generated: 0, map: 0};
+  // Phase 16I: validTypes now includes 4 code-rendered template types
+  const validTypes = new Set(['stock_footage', 'archival_photo', 'ai_generated', 'map', 'stat_overlay', 'quote_card', 'comparison_split', 'timeline_bar']);
+  const breakdown = {stock_footage: 0, archival_photo: 0, ai_generated: 0, map: 0, stat_overlay: 0, quote_card: 0, comparison_split: 0, timeline_bar: 0};
   const out = scenes.map((s, idx) => {
     const e = enriched[idx] || {};
     const at = validTypes.has(e.assetType) ? e.assetType : 'stock_footage';
@@ -5293,6 +5305,12 @@ Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the
       // future use (transitions, Ken Burns intensity). Defaults to
       // 'standard' when Claude omits or returns an invalid value.
       pacingHint: ['rapid', 'standard', 'slow', 'hold'].includes(e.pacingHint) ? e.pacingHint : 'standard',
+      // Phase 16I: templateParams (object) when assetType is a code-
+      // rendered template type. Captured raw — MainComp's template
+      // component will read what it needs and ignore unknown keys.
+      templateParams: (['stat_overlay', 'quote_card', 'comparison_split', 'timeline_bar'].includes(at) && e.templateParams && typeof e.templateParams === 'object')
+        ? e.templateParams
+        : null,
       resolvedSource: null,
       resolvedUrl: null,
     };
@@ -5475,6 +5493,7 @@ function applyScenesToBeats(rawBeats, scenes) {
         aiPrompt: scene.aiPrompt || null,
         mapContext: scene.mapContext || null,
         pacingHint: scene.pacingHint || 'standard',
+        templateParams: scene.templateParams || null, // Phase 16I
       };
       touched++;
     }
@@ -5639,8 +5658,36 @@ function handlePlaceholder() {
   };
 }
 
-// HANDLERS dispatch map. Keyed by assetType (Phase 16I will add visualType
-// keys alongside as we evolve the scene plan output schema).
+// Phase 16I: code-rendered template handler. Returns a SYNTHETIC
+// footage entry — no URL, just templateType + templateParams. MainComp
+// dispatches by templateType to render the React component instead of
+// fetching/displaying a clip. assetType→templateType map below.
+const ASSET_TYPE_TO_TEMPLATE_TYPE = {
+  stat_overlay: 'stat-overlay',
+  quote_card: 'quote-card',
+  comparison_split: 'comparison-split',
+  timeline_bar: 'timeline-bar',
+};
+
+async function handleTemplate(scene, ctx, assetType) {
+  const templateType = ASSET_TYPE_TO_TEMPLATE_TYPE[assetType];
+  if (!templateType) {
+    return {url: null, source: null, provenance: [{tried: 'template', ok: false, reason: `unknown assetType=${assetType}`}]};
+  }
+  if (!scene.templateParams) {
+    // Claude forgot params — fall through to stock by returning nothing.
+    return {url: null, source: null, provenance: [{tried: `template:${templateType}`, ok: false, reason: 'no templateParams'}]};
+  }
+  return {
+    url: null,
+    source: `template:${templateType}`,
+    templateType,
+    templateParams: scene.templateParams,
+    provenance: [{tried: `template:${templateType}`, ok: true}],
+  };
+}
+
+// HANDLERS dispatch map. Keyed by assetType.
 const ASSET_HANDLERS = {
   ai_generated: async (scene, ctx) => {
     const ai = await handleAiGenerated(scene, ctx);
@@ -5657,13 +5704,36 @@ const ASSET_HANDLERS = {
   },
   archival_photo: async (scene, ctx) => {
     // searchAllFootageSources's archival_photo path already chains
-    // Wikimedia image → Wikimedia video → Internet Archive internally.
+    // LOC → Wikimedia image → Wikimedia video → Internet Archive internally.
     const arch = await handleStockChain(scene, ctx, 'archival_photo');
     if (arch.url) return arch;
     const stock = await handleStockChain(scene, ctx, 'stock_footage');
     return {...stock, provenance: [...arch.provenance, ...stock.provenance]};
   },
   stock_footage: async (scene, ctx) => {
+    return await handleStockChain(scene, ctx, 'stock_footage');
+  },
+  // Phase 16I: code-rendered scene templates. Return synthetic entries
+  // (templateType set, url null). Falls back to stock if Claude failed
+  // to provide templateParams.
+  stat_overlay: async (scene, ctx) => {
+    const t = await handleTemplate(scene, ctx, 'stat_overlay');
+    if (t.templateType) return t;
+    return await handleStockChain(scene, ctx, 'stock_footage');
+  },
+  quote_card: async (scene, ctx) => {
+    const t = await handleTemplate(scene, ctx, 'quote_card');
+    if (t.templateType) return t;
+    return await handleStockChain(scene, ctx, 'stock_footage');
+  },
+  comparison_split: async (scene, ctx) => {
+    const t = await handleTemplate(scene, ctx, 'comparison_split');
+    if (t.templateType) return t;
+    return await handleStockChain(scene, ctx, 'stock_footage');
+  },
+  timeline_bar: async (scene, ctx) => {
+    const t = await handleTemplate(scene, ctx, 'timeline_bar');
+    if (t.templateType) return t;
     return await handleStockChain(scene, ctx, 'stock_footage');
   },
 };
@@ -5741,6 +5811,9 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
     let pexelsAlternates = [];
     const provenance = [];
     let genericFallbackUsed = false;
+    // Phase 16I: code-rendered templates skip URL sourcing
+    let templateType = null;
+    let templateParams = null;
 
     try {
       const primary = await handler(scene, ctx);
@@ -5748,13 +5821,19 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       source = primary.source;
       pexelsAlternates = primary.pexelsAlternates || [];
       provenance.push(...(primary.provenance || []));
+      // Capture template metadata if handler returned it
+      if (primary.templateType) {
+        templateType = primary.templateType;
+        templateParams = primary.templateParams || {};
+      }
     } catch (e) {
       provenance.push({tried: scene.assetType + '-handler', ok: false, reason: e.message});
       console.warn(`scene ${si + 1}: primary handler threw — ${e.message}`);
     }
 
-    // Generic stock cascade (last resort).
-    if (!url) {
+    // Generic stock cascade (last resort). Skipped if a template
+    // succeeded — templates render without a URL.
+    if (!url && !templateType) {
       const generic = await handleGenericStock(scene, ctx);
       url = generic.url;
       source = generic.source;
@@ -5763,8 +5842,8 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       if (url) console.log(`scene ${si + 1}: GENERIC fallback → ${url.split('/').pop().slice(0, 60)}`);
     }
 
-    // Archival fallback (separate-CDN safety net).
-    if (!url) {
+    // Archival fallback (separate-CDN safety net). Skipped for templates.
+    if (!url && !templateType) {
       const archFallback = await handleArchivalFallback(scene, ctx);
       url = archFallback.url;
       source = archFallback.source;
@@ -5773,8 +5852,8 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       if (url) console.log(`scene ${si + 1}: WIKIMEDIA-IMAGE fallback → ${url.split('/').pop().slice(0, 60)}`);
     }
 
-    // 1×1 PNG placeholder (absolute last resort).
-    if (!url) {
+    // 1×1 PNG placeholder (absolute last resort). Skipped for templates.
+    if (!url && !templateType) {
       const ph = handlePlaceholder();
       url = ph.url;
       source = ph.source;
@@ -5830,6 +5909,9 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       ...(genericFallbackUsed ? {genericFallback: true} : {}),
       // Phase 16C: full source-attempt audit trail
       ...(provenance.length ? {provenance} : {}),
+      // Phase 16I: code-rendered template metadata (when applicable).
+      // MainComp dispatches by templateType — see SCENE_TEMPLATES map.
+      ...(templateType ? {templateType, templateParams: templateParams || {}} : {}),
       // Scene metadata for diagnostics / future analysis
       assetType: scene.assetType,
       visualConcept: scene.visualConcept,
