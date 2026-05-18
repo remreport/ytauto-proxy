@@ -566,6 +566,32 @@ const MUSIC_TITLE_BLOCKLIST = new Set([
   'Sigmamusicart Epic Cinematic',
 ]);
 
+// Phase-16A: COPYRIGHT-CLAIMED blocklist. Distinct from
+// MUSIC_TITLE_BLOCKLIST so we can audit which removals were
+// quality-vs-actual-copyright-claim. Each entry MUST reference the
+// YouTube Content ID claim, DMCA notice, or other formal IP issue
+// that triggered the block. Match is case-insensitive substring
+// (catches title variants from different uploads of the same composer).
+//
+// To extend: add { titleSubstring, reason } objects. Track name from
+// the Firestore doc OR Pixabay metadata is matched (lowercased,
+// substring). Pick a SHORT distinctive substring — e.g., composer name
+// rather than full title — to catch re-uploads under variant titles.
+const MUSIC_COPYRIGHT_CLAIMED_BLOCKLIST = [
+  {
+    titleSubstring: 'Cyberwave Orchestra Dramatic Epic Trailer Tragic Orchestral',
+    reason: 'YouTube Content ID claim 2026-05',
+  },
+  // Defense-in-depth: block all "Cyberwave Orchestra" tracks since this
+  // composer's catalog appears to have active Content ID enforcement.
+  // Remove this entry if a specific Cyberwave Orchestra track is later
+  // verified safe.
+  {
+    titleSubstring: 'Cyberwave Orchestra',
+    reason: 'Defense-in-depth: same composer as claimed track',
+  },
+];
+
 // Substring keyword blocklist — case-insensitive match against the
 // track title. Catches variants like "Sigmamusicart Epic Cinematic" or
 // "Epic Cinematic Adventure" without requiring each title to be
@@ -588,7 +614,14 @@ function isMusicTrackUsable(t) {
     console.log(`[music] excluded "${titleOrName}" — matched MUSIC_TITLE_BLOCKLIST`);
     return false;
   }
+  // Phase-16A: copyright-claimed check (substring match)
   const lower = titleOrName.toLowerCase();
+  for (const entry of MUSIC_COPYRIGHT_CLAIMED_BLOCKLIST) {
+    if (lower.includes(entry.titleSubstring.toLowerCase())) {
+      console.log(`[music] excluded "${titleOrName}" — COPYRIGHT CLAIMED (${entry.reason})`);
+      return false;
+    }
+  }
   for (const kw of MUSIC_KEYWORD_BLOCKLIST) {
     if (lower.includes(kw)) {
       console.log(`[music] excluded "${titleOrName}" — matched keyword "${kw}"`);
