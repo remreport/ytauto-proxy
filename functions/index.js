@@ -2378,6 +2378,35 @@ function pairQuotesWithEntityPortraits(rawBeats) {
 // Claude writes "Source: Reuters" alongside an entity mention named
 // "Reuters". Word-boundary refinement deferred until false-drops show
 // up in renders.
+// Phase 17 — Issue 3: code-rendered scene templates render their OWN
+// visuals (orange numbers on burgundy bg) — putting bigStat/portrait
+// overlays on top creates visible double-rendering collision. Strip
+// ALL overlays from any beat whose source is a template OR whose
+// scenePlanContext flags assetType as one of the 4 template types.
+// SFX intentionally NOT stripped — sfx are audio cues, separate concern.
+function stripOverlaysFromTemplateBeats(rawBeats) {
+  if (!Array.isArray(rawBeats)) return {beats: 0, overlays: 0};
+  let beatsTouched = 0;
+  let overlaysStripped = 0;
+  const TEMPLATE_ASSET_TYPES = new Set(['stat_overlay', 'quote_card', 'comparison_split', 'timeline_bar']);
+  for (const beat of rawBeats) {
+    if (!beat) continue;
+    const isTemplate =
+      !!beat.templateType ||
+      (typeof beat.source === 'string' && beat.source.startsWith('template:')) ||
+      TEMPLATE_ASSET_TYPES.has(beat.scenePlanContext?.assetType);
+    if (isTemplate && Array.isArray(beat.overlays) && beat.overlays.length) {
+      overlaysStripped += beat.overlays.length;
+      beat.overlays = [];
+      beatsTouched++;
+    }
+  }
+  if (overlaysStripped > 0) {
+    console.log(`[overlay-strip] Phase 17: removed ${overlaysStripped} overlays from ${beatsTouched} template beats (templates render own visuals)`);
+  }
+  return {beats: beatsTouched, overlays: overlaysStripped};
+}
+
 // Phase 16H: hard whitelist. Keep ONLY bigStat (always) and
 // entityPortrait WHERE entityType === 'company' (logos). All other
 // overlay types get filtered: lowerThird, countUp, quote, Lottie,
@@ -2989,9 +3018,11 @@ async function locGovSearchTop(query, n = 3) {
   url.searchParams.set('c', '15'); // request up to 15 then filter
   let resp;
   try {
+    // Phase 17 Issue 4: bumped 5s → 12s. LOC API is slow on complex
+    // queries (8-15s typical) and 5s was timing out 80%+ of requests.
     resp = await fetch(url, {
       headers: {'User-Agent': 'rem-report-bot/1.0 (yt-automation; contact via channel owner)'},
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(12000),
     });
   } catch (e) {
     console.warn(`[loc-gov] fetch threw for "${query}": ${e.message}`);
@@ -5322,28 +5353,16 @@ Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the
   return out;
 }
 
-// ─── Phase 6b: coupled scene-plan + asset-availability probe ───────
-// User insight: "Scene plan and asset plan should work TOGETHER, not
-// sequentially. The system should KNOW these things beforehand."
-//
-// Problem with Phase 6a: Claude classified 51% of a script as
-// `ai_generated`, but fal.ai budget only allows 12 images → 47 scenes
-// silently fell back to Pexels generic queries → user saw 100% stock
-// despite scene plan saying otherwise. Same for Wikimedia (22 planned,
-// 1 hit) and Mapbox (3 planned, 0 hit).
-//
-// Phase 6b solution: probe asset availability for each scene BEFORE
-// committing to its assetType. Downgrade unavailable types through
-// fallbackChain → sourcing then trivially fetches the GUARANTEED type.
-//
-// Probe costs are tiny:
-//   - ai_generated:  budget arithmetic only (free)
-//   - map:           coordinate-object validation (free)
-//   - archival_photo: 1 Wikimedia API call per archival scene (~200ms)
-//   - stock_footage: 1 Pexels API call per stock scene (~200ms),
-//                    skipped because the existing cascade handles it.
+// ─── Phase 6b legacy probe REMOVED (Phase 17) ──────────────────────
+// The original Phase 6b finalizeScenePlanWithAvailability used to live
+// here. It has been superseded by the Phase 17 version further down
+// (it adds Library-of-Congress probing and upgrades archival misses to
+// ai_generated instead of stock). The function declaration below has
+// been deleted so module-load doesn't define two copies; the new one
+// at the Phase 17 section is the single source of truth.
 
-async function finalizeScenePlanWithAvailability(draftScenes, aiImageBudget) {
+// eslint-disable-next-line no-unused-vars
+async function _phase6bFinalizeRemoved(draftScenes, aiImageBudget) {
   if (!Array.isArray(draftScenes) || draftScenes.length === 0) return draftScenes;
   const t0 = Date.now();
 
@@ -5738,26 +5757,169 @@ const ASSET_HANDLERS = {
   },
 };
 
-// Phase 16C: AI budget pre-allocation (extracted from old Phase 6b probe).
-// Caps ai_generated scenes to budget-affordable count BEFORE sourcing
-// fires. Picks the longest-prompt candidates as winners (proxy for
-// richest visual concept); downgrades losers through fallbackChain.
+// Phase 17 Issue 4: re-introduced pre-flight probe (replaces the slim
+// Phase 16C preAllocateAiBudget). User feedback: "scen plan och asset
+// plan ska samarbeta INNAN video skapas". Probes asset availability
+// per scene BEFORE sourcing fires; downgrades:
+//   archival_photo → ai_generated when LOC + Wikimedia + IA all miss
+//                    (NEVER to stock — friend's principle: AI fills
+//                    archival gaps, generic stock is a last resort)
+//   ai_generated → stock_footage when budget exhausted (12 images cap)
+//   map → stock_footage when mapContext.locations invalid
+async function _probeLocGov(query) {
+  if (!query) return 0;
+  try {
+    const url = new URL('https://www.loc.gov/photos/');
+    url.searchParams.set('fo', 'json');
+    url.searchParams.set('q', query);
+    url.searchParams.set('c', '1');
+    const r = await fetch(url, {headers: {'User-Agent': 'rem-report-bot/1.0'}, signal: AbortSignal.timeout(12000)});
+    if (!r.ok) return 0;
+    const d = await r.json();
+    return Array.isArray(d.results) ? d.results.length : 0;
+  } catch { return 0; }
+}
+async function _probeWikimediaImage(query) {
+  if (!query) return 0;
+  try {
+    const url = new URL('https://commons.wikimedia.org/w/api.php');
+    url.searchParams.set('action', 'query');
+    url.searchParams.set('format', 'json');
+    url.searchParams.set('list', 'search');
+    url.searchParams.set('srsearch', query + ' filemime:image');
+    url.searchParams.set('srnamespace', '6');
+    url.searchParams.set('srlimit', '1');
+    url.searchParams.set('origin', '*');
+    const r = await fetch(url, {signal: AbortSignal.timeout(4000)});
+    if (!r.ok) return 0;
+    const d = await r.json();
+    return d?.query?.searchinfo?.totalhits || 0;
+  } catch { return 0; }
+}
+async function _probeArchiveOrg(query) {
+  if (!query) return 0;
+  try {
+    const url = new URL('https://archive.org/advancedsearch.php');
+    url.searchParams.set('q', `${query} AND mediatype:movies AND licenseurl:(*publicdomain*)`);
+    url.searchParams.set('rows', '1');
+    url.searchParams.set('output', 'json');
+    url.searchParams.append('fl[]', 'identifier');
+    const r = await fetch(url, {signal: AbortSignal.timeout(6000), headers: {'User-Agent': 'rem-report-bot/1.0'}});
+    if (!r.ok) return 0;
+    const d = await r.json();
+    return d.response?.numFound || 0;
+  } catch { return 0; }
+}
+
+async function finalizeScenePlanWithAvailability(scenes, aiImageBudget) {
+  if (!Array.isArray(scenes) || scenes.length === 0) return {};
+  const t0 = Date.now();
+
+  // Stage A: AI budget pre-allocation (existing logic from 16C)
+  const aiCapImages = Math.max(1, Math.floor((aiImageBudget?.capUsd || 1.0) / 0.08));
+  const aiCandidates = scenes
+    .map((s, idx) => ({idx, scene: s, promptLen: (s.aiPrompt || '').length}))
+    .filter((c) => c.scene.assetType === 'ai_generated' && c.scene.aiPrompt);
+  let aiBudgetDowngraded = 0;
+  if (aiCandidates.length > aiCapImages) {
+    aiCandidates.sort((a, b) => b.promptLen - a.promptLen);
+    const losers = aiCandidates.slice(aiCapImages);
+    for (const l of losers) {
+      l.scene._originalAssetType = l.scene.assetType;
+      // Phase 17 change: downgrade losers to stock_footage (existing behavior).
+      l.scene.assetType = (l.scene.fallbackChain || []).find((t) => t !== 'ai_generated') || 'stock_footage';
+      aiBudgetDowngraded++;
+    }
+    console.log(`[scene-plan] AI budget pre-alloc: ${aiCapImages} kept, ${aiBudgetDowngraded} downgraded (Claude requested ${aiCandidates.length} ai_generated)`);
+  }
+
+  // Stage B: parallel-probe archival_photo scenes across LOC, Wikimedia,
+  // Internet Archive. If ALL three miss → upgrade to ai_generated (NOT
+  // stock — friend's principle: AI fills archival gaps). The upgrade
+  // is subject to AI budget; if budget exhausted, falls to stock.
+  const archivalScenes = scenes.filter((s) => s.assetType === 'archival_photo');
+  let archivalUpgradedToAi = 0;
+  let archivalDowngradedToStock = 0;
+  if (archivalScenes.length) {
+    const stripDates = (q) => (q || '').replace(/\b(19|20)\d{2}\b/g, '').replace(/\s+/g, ' ').trim();
+    const probes = await Promise.all(archivalScenes.map(async (s) => {
+      const fullQ = (s.searchKeywords || []).join(' ').slice(0, 100);
+      const [loc, wiki, archive] = await Promise.all([
+        _probeLocGov(fullQ),
+        _probeWikimediaImage(fullQ),
+        _probeArchiveOrg(fullQ),
+      ]);
+      // Phase 17: stripped-date retry on Wikimedia if full query missed
+      let wikiHits = wiki;
+      if (wikiHits === 0) {
+        const stripped = stripDates(fullQ);
+        if (stripped && stripped !== fullQ) wikiHits = await _probeWikimediaImage(stripped);
+      }
+      return {scene: s, loc, wiki: wikiHits, archive};
+    }));
+    for (const {scene, loc, wiki, archive} of probes) {
+      if (loc === 0 && wiki === 0 && archive === 0) {
+        scene._originalAssetType = scene._originalAssetType || scene.assetType;
+        // Check if AI budget has room: spent + 0.08 ≤ cap, AND we haven't
+        // already pre-allocated all 12 images.
+        const usedSoFar = aiCandidates.filter((c) => c.scene.assetType === 'ai_generated').length;
+        const hasAiBudget = usedSoFar < aiCapImages && aiImageBudget && (aiImageBudget.spent + 0.08) <= aiImageBudget.capUsd;
+        if (hasAiBudget && scene.aiPrompt) {
+          // Already has aiPrompt → upgrade in place
+          scene.assetType = 'ai_generated';
+          archivalUpgradedToAi++;
+        } else if (hasAiBudget) {
+          // No aiPrompt yet — synthesize a minimal one from the visual
+          // concept; the AI handler will style + sanitize it.
+          scene.assetType = 'ai_generated';
+          scene.aiPrompt = `Photorealistic editorial scene: ${scene.visualConcept || (scene.searchKeywords || []).join(' ')}`;
+          archivalUpgradedToAi++;
+        } else {
+          // AI budget already full → must use stock
+          scene.assetType = 'stock_footage';
+          archivalDowngradedToStock++;
+        }
+      }
+    }
+  }
+
+  // Stage C: Map coord validation
+  const mapScenes = scenes.filter((s) => s.assetType === 'map');
+  let mapDowngraded = 0;
+  for (const s of mapScenes) {
+    const locs = s.mapContext?.locations || [];
+    const hasReal = locs.some((l) => typeof l.longitude === 'number' && typeof l.latitude === 'number' && !(l.longitude === 0 && l.latitude === 0));
+    if (!hasReal || !process.env.MAPBOX_ACCESS_TOKEN) {
+      s._originalAssetType = s._originalAssetType || s.assetType;
+      s.assetType = 'stock_footage';
+      mapDowngraded++;
+    }
+  }
+
+  const finalBreakdown = {};
+  for (const s of scenes) finalBreakdown[s.assetType] = (finalBreakdown[s.assetType] || 0) + 1;
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[probe] availability probe in ${elapsed}s — final types: ${JSON.stringify(finalBreakdown)} — downgrades: ai-budget=${aiBudgetDowngraded}, archival-upgraded-to-ai=${archivalUpgradedToAi}, archival-fell-to-stock=${archivalDowngradedToStock}, map-invalid=${mapDowngraded}`);
+  return {aiBudgetDowngraded, archivalUpgradedToAi, archivalDowngradedToStock, mapDowngraded};
+}
+
+// Phase 16C preAllocateAiBudget retained as a back-compat shim — it's
+// called by the older path that didn't have the full probe. New path
+// calls finalizeScenePlanWithAvailability instead.
 function preAllocateAiBudget(scenes, aiImageBudget) {
   if (!Array.isArray(scenes) || scenes.length === 0) return {kept: 0, downgraded: 0};
   const aiCapImages = Math.max(1, Math.floor((aiImageBudget?.capUsd || 1.0) / 0.08));
   const aiCandidates = scenes
     .map((s, idx) => ({idx, scene: s, promptLen: (s.aiPrompt || '').length}))
     .filter((c) => c.scene.assetType === 'ai_generated' && c.scene.aiPrompt);
-  if (aiCandidates.length <= aiCapImages) {
-    return {kept: aiCandidates.length, downgraded: 0};
-  }
+  if (aiCandidates.length <= aiCapImages) return {kept: aiCandidates.length, downgraded: 0};
   aiCandidates.sort((a, b) => b.promptLen - a.promptLen);
   const losers = aiCandidates.slice(aiCapImages);
   for (const l of losers) {
     l.scene._originalAssetType = l.scene.assetType;
     l.scene.assetType = (l.scene.fallbackChain || []).find((t) => t !== 'ai_generated') || 'stock_footage';
   }
-  console.log(`[scene-plan] AI budget pre-alloc: ${aiCapImages} kept, ${losers.length} downgraded (Claude requested ${aiCandidates.length} ai_generated)`);
+  console.log(`[scene-plan] AI budget pre-alloc: ${aiCapImages} kept, ${losers.length} downgraded`);
   return {kept: aiCapImages, downgraded: losers.length};
 }
 
@@ -5867,9 +6029,14 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
     // buildOverlayLayer / resolveSfxLayer add scene.start back.
     const aggregatedOverlays = [];
     const aggregatedSfx = [];
+    // Phase 17 Issue 3: when this scene rendered via a code-template,
+    // DO NOT aggregate overlays from its constituent beats — template
+    // renders its own visuals and overlays would visibly collide. SFX
+    // still aggregated (audio cues, separate channel).
+    const sceneIsTemplate = !!templateType;
     for (const beat of sceneBeats) {
       const beatStart = beat.start || 0;
-      if (Array.isArray(beat.overlays) && beat.overlays.length) {
+      if (!sceneIsTemplate && Array.isArray(beat.overlays) && beat.overlays.length) {
         for (const ov of beat.overlays) {
           aggregatedOverlays.push({
             ...ov,
@@ -5967,6 +6134,15 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   // 16E two-phase portraits (full Wikipedia photo, not corner overlay);
   // lowerThird/countUp/quote/Lottie removed entirely.
   filterOverlaysToBigStatAndLogos(rawBeats);
+  // Phase 17 Issue 3: strip overlays from template beats. Templates
+  // render their own visuals — overlays on top create visible
+  // double-rendering collision. Runs AFTER the type whitelist so the
+  // strip log only mentions overlays that would otherwise have rendered.
+  // Note: at this point in the pipeline scenePlanContext may not yet
+  // be set (it's set later in applyScenesToBeats); the strip also runs
+  // a second time inside sourceScenesAndBuildFootage after scene
+  // aggregation to catch overlays that survived this early pass.
+  stripOverlaysFromTemplateBeats(rawBeats);
   clampOverlayDurationsToBeat(rawBeats);
   enforceOverlaySpacing(rawBeats, 1.5);
   const beatsExtractMs = Date.now() - beatsT0;
@@ -6080,12 +6256,13 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       // Result: scene.assetType reflects what will ACTUALLY render,
       // not what Claude wished for. Eliminates the "scene plan said
       // archival, video shows Pexels" disconnect.
-      // Phase 16C: replaced upfront Wikimedia/Mapbox availability probe
-      // with HANDLERS dispatch + provenance tracking inside sourcing.
-      // Probes lied (returned hits that later failed validation); handlers
-      // are truth. We still pre-allocate AI budget here so excess
-      // ai_generated scenes downgrade cleanly before sourcing fires.
-      preAllocateAiBudget(draftScenes, aiImageBudget);
+      // Phase 17: re-introduce upfront availability probe — but only for
+      // archival_photo scenes (LOC + Wikimedia + IA in parallel). If all
+      // three miss, upgrade the scene to ai_generated (subject to AI
+      // budget) instead of letting it silently fall to Pexels. Same call
+      // also handles AI budget pre-allocation, so the older
+      // preAllocateAiBudget shim isn't needed on this path.
+      const probeStats = await finalizeScenePlanWithAvailability(draftScenes, aiImageBudget);
       scenes = draftScenes;
       const touched = applyScenesToBeats(rawBeats, scenes);
       const sceneMs = Date.now() - sceneT0;
@@ -6094,6 +6271,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
         'timings.sceneCount': scenes.length,
         'timings.sceneBeatsTouched': touched,
         'timings.sceneFinalTypes': scenes.reduce((acc, s) => { acc[s.assetType] = (acc[s.assetType] || 0) + 1; return acc; }, {}),
+        'timings.sceneProbeStats': probeStats || {},
       }).catch(() => {});
     } catch (e) {
       console.warn(`[scene-plan] EXCEPTION: ${e.message} — falling back to per-beat keywords`);
