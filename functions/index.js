@@ -73,17 +73,15 @@ const MAPBOX_ACCESS_TOKEN = defineSecret('MAPBOX_ACCESS_TOKEN');
 const AWS_REGION = 'us-east-1';
 const REMOTION_LAMBDA_FUNCTION_NAME =
   'remotion-render-4-0-456-mem3008mb-disk10240mb-900sec';
-// Dual Lambda sites — production stays stable on v6; staging
-// (rem-report-v7) is where new features get tested before promotion.
-// Selection is per-render via the job document's `useStagingRender`
-// boolean (default false → v6). See CONTRIBUTING.md for the workflow.
-const REMOTION_LAMBDA_SERVE_URL_PROD =
-  'https://remotionlambda-useast1-1zsfacnzw9.s3.us-east-1.amazonaws.com/sites/rem-report-v6/index.html';
-const REMOTION_LAMBDA_SERVE_URL_STAGING =
+// 2026-05-19: v7 promoted to canonical. Every render goes to
+// rem-report-v7 (the bundle with Phase 16/17 scene plan + templates +
+// brand.js #49181e). The v6 bundle is retained in S3 as a snapshot
+// but no traffic is routed there. `useStagingRender` is no longer
+// read on the render path; it still survives on autoPilot + editingJob
+// docs as a QA flag — when set, the upload step holds the video as
+// permanently UNLISTED instead of entering the publish schedule.
+const REMOTION_LAMBDA_SERVE_URL =
   'https://remotionlambda-useast1-1zsfacnzw9.s3.us-east-1.amazonaws.com/sites/rem-report-v7/index.html';
-function getRemotionServeUrl(useStagingRender) {
-  return useStagingRender === true ? REMOTION_LAMBDA_SERVE_URL_STAGING : REMOTION_LAMBDA_SERVE_URL_PROD;
-}
 // Music volume default. Per-channel UI override (channelMusicSettings.volume)
 // still wins. Phase-6b: bumped 0.05 → 0.08. At 0.05, ambient/suspense tracks
 // were near-inaudible under -14 LUFS voiceover (multiple "no music" reports);
@@ -100,8 +98,6 @@ function getDefaultMusicVolume() {
 // or the picked CDN URL is broken. Real production renders should rarely hit
 // this — when they do, the [music-fallback] log line is the signal.
 const FALLBACK_MUSIC_URL = 'https://storage.googleapis.com/ytauto-95f91.firebasestorage.app/globalMusic/1778202535455_24_Nastelbom_Inspirational_Inspirational_Music.mp3';
-// Back-compat alias for any code still referencing the old name.
-const REMOTION_LAMBDA_SERVE_URL = REMOTION_LAMBDA_SERVE_URL_PROD;
 // Render-hosted proxy — used by the auto-forensic scheduler to call
 // /youtube/analytics/refresh and /youtube/analytics/forensic on a cron.
 // Same URL the frontend uses; the proxy validates per-channel auth
@@ -1552,9 +1548,7 @@ function buildGeminiChunkBoundaries(captions, maxChunkSec) {
 
 // Chunked path: split the voiceover at sentence boundaries, send each
 // chunk to Gemini in parallel, offset returned timestamps back onto the
-// global timeline. Used for voiceovers > GEMINI_AUDIO_MAX_SEC. Gated
-// behind useStagingRender (day-12) until staging verifies long-video
-// behavior end-to-end.
+// global timeline. Used for voiceovers > GEMINI_AUDIO_MAX_SEC.
 async function getGeminiTimingTagsChunked(voiceoverUrl, captions, geminiKey, audioDurSec) {
   const fs = require('node:fs');
   const path = require('node:path');
@@ -1630,10 +1624,7 @@ async function getGeminiTimingTagsChunked(voiceoverUrl, captions, geminiKey, aud
   }
 }
 
-async function getGeminiTimingTags(voiceoverUrl, captions, geminiKey, opts = {}) {
-  // opts.useStagingRender is no longer read — chunking is now the default
-  // for any voiceover > GEMINI_AUDIO_MAX_SEC. Kept on the signature for
-  // back-compat with the caller that still passes it.
+async function getGeminiTimingTags(voiceoverUrl, captions, geminiKey) {
   // Production failure mode (2026-05-15): geminiTagCount: 0 in prod
   // logs with no explanation. Every code path now logs entry + exit so
   // we can audit why a 0-tag result happened.
@@ -1651,9 +1642,8 @@ async function getGeminiTimingTags(voiceoverUrl, captions, geminiKey, opts = {})
     return [];
   }
   if (audioDurSec > GEMINI_AUDIO_MAX_SEC) {
-    // Chunking is now the default (day-12 promoted from staging-only).
-    // Splits long voiceovers at sentence boundaries, parallel-calls
-    // Gemini per chunk, merges results. Both v6 prod and v7 staging use this.
+    // Long voiceovers are split at sentence boundaries; each chunk is
+    // sent to Gemini in parallel and the results are merged.
     try {
       return await getGeminiTimingTagsChunked(voiceoverUrl, captions, geminiKey, audioDurSec);
     } catch (e) {
@@ -5041,14 +5031,14 @@ async function runAiVideoGenerationPass(footage, beatIndices, channelId, cfg, jo
 }
 
 // ─── Beat-aware sourcing ────────────────────────────────────────────
-// Day-14 Phase 2: aggregates beats into 5-10s scenes, asks Claude to
-// classify each scene with a visual concept + assetType (stock_footage |
-// archival_photo | ai_generated | map) + refined searchKeywords. Output
-// is AUGMENTATIVE — beats stay the atomic unit, scenes are a thematic
-// view layered on top. The current per-beat sourcing loop reads
+// Aggregates beats into 5-10s scenes, asks Claude to classify each
+// scene with a visual concept + assetType (stock_footage |
+// archival_photo | ai_generated | map) + refined searchKeywords.
+// Output is AUGMENTATIVE — beats stay the atomic unit, scenes are a
+// thematic view layered on top. The per-beat sourcing loop reads
 // beat.keywords; applyScenesToBeats() overrides those with scene-level
-// keywords for cohesion. Phase 2 does NOT yet route by assetType —
-// that's Phases 3-5. Gated behind useStagingRender per CONTRIBUTING.md.
+// keywords for cohesion. assetType drives source routing in the
+// scene-driven branch of sourceBeatAwareFootage.
 // Phase 16B — word-boundary snap helpers.
 //
 // Problem: scene boundaries inherited from beat.end / sentence boundaries
@@ -6101,7 +6091,7 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
   return footage;
 }
 
-async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgress, span, {channelId, aiVideoOverride, timingTags, useStagingRender = false} = {}) {
+async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgress, span, {channelId, aiVideoOverride, timingTags} = {}) {
   await jobRef.update({
     currentStep: 'Breaking script into beats with Claude',
     progress: baseProgress,
@@ -6239,62 +6229,49 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     console.warn(`[hero-fallback] now ${finalHeroCount} hero beats: indices ${rawBeats.map((b, i) => b.heroMoment ? i : -1).filter((i) => i >= 0).join(', ')}`);
   }
 
-  // Day-14 Phase 2: scene plan generation (staging-only). Aggregates
-  // beats into 5-10s scenes, asks Claude for visual concept + assetType
-  // + refined keywords per scene, then overrides beat.keywords with the
-  // scene-level keywords so the existing per-beat sourcing loop benefits
-  // from scene cohesion. assetType is captured on beat.scenePlanContext
-  // but NOT yet routed to different sources — Phase 3+ will read it.
-  // v6 production skips this entire block: keywords stay per-beat as
-  // they were before day-14.
-  // Day-14: scenes are populated when scene plan succeeds and stays
-  // empty otherwise (graceful fall-through). Hoisted out of the try
-  // block so the Phase-6a scene-driven sourcing branch below can read it.
+  // Scene plan generation. Aggregates beats into 5-10s scenes, asks
+  // Claude for visual concept + assetType + refined keywords per scene,
+  // then overrides beat.keywords with the scene-level keywords so the
+  // per-beat sourcing loop benefits from scene cohesion. assetType is
+  // captured on beat.scenePlanContext for downstream source routing.
+  //
+  // scenes is populated when the plan succeeds and stays empty
+  // otherwise (graceful fall-through to per-beat sourcing). Hoisted
+  // out of the try block so the scene-driven branch below can read it.
   let scenes = [];
-  // Phase-6b: AI budget tracker hoisted out of sourcing so the scene-plan
+  // AI budget tracker hoisted out of sourcing so the scene-plan
   // availability probe can pre-allocate against it. Same instance is
   // reused inside sourceScenesAndBuildFootage — spend accumulates as
   // images are actually generated. Pre-allocation only marks which
   // scenes win the budget; it doesn't spend.
   const aiImageBudget = createAiImageBudgetTracker();
-  if (useStagingRender) {
-    try {
-      const sceneT0 = Date.now();
-      const voiceoverDurForScenePlan = (captions && captions.length)
-        ? Math.max(...captions.map((c) => c.end || 0))
-        : 0;
-      const draftScenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan);
-      // Phase-6b: probe asset availability + downgrade unavailable
-      // primary types through fallbackChain BEFORE applyScenesToBeats.
-      // Result: scene.assetType reflects what will ACTUALLY render,
-      // not what Claude wished for. Eliminates the "scene plan said
-      // archival, video shows Pexels" disconnect.
-      // Phase 17: re-introduce upfront availability probe — but only for
-      // archival_photo scenes (LOC + Wikimedia + IA in parallel). If all
-      // three miss, upgrade the scene to ai_generated (subject to AI
-      // budget) instead of letting it silently fall to Pexels. Same call
-      // also handles AI budget pre-allocation, so the older
-      // preAllocateAiBudget shim isn't needed on this path.
-      const probeStats = await finalizeScenePlanWithAvailability(draftScenes, aiImageBudget);
-      scenes = draftScenes;
-      const touched = applyScenesToBeats(rawBeats, scenes);
-      const sceneMs = Date.now() - sceneT0;
-      await jobRef.update({
-        'timings.scenePlanMs': sceneMs,
-        'timings.sceneCount': scenes.length,
-        'timings.sceneBeatsTouched': touched,
-        'timings.sceneFinalTypes': scenes.reduce((acc, s) => { acc[s.assetType] = (acc[s.assetType] || 0) + 1; return acc; }, {}),
-        'timings.sceneProbeStats': probeStats || {},
-      }).catch(() => {});
-    } catch (e) {
-      console.warn(`[scene-plan] EXCEPTION: ${e.message} — falling back to per-beat keywords`);
-      scenes = [];
-    }
+  // The per-beat fallback block below is the catch-arm for when scene
+  // plan throws or returns 0 scenes (very short voiceover, Claude failure).
+  try {
+    const sceneT0 = Date.now();
+    const voiceoverDurForScenePlan = (captions && captions.length)
+      ? Math.max(...captions.map((c) => c.end || 0))
+      : 0;
+    const draftScenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan);
+    const probeStats = await finalizeScenePlanWithAvailability(draftScenes, aiImageBudget);
+    scenes = draftScenes;
+    const touched = applyScenesToBeats(rawBeats, scenes);
+    const sceneMs = Date.now() - sceneT0;
+    await jobRef.update({
+      'timings.scenePlanMs': sceneMs,
+      'timings.sceneCount': scenes.length,
+      'timings.sceneBeatsTouched': touched,
+      'timings.sceneFinalTypes': scenes.reduce((acc, s) => { acc[s.assetType] = (acc[s.assetType] || 0) + 1; return acc; }, {}),
+      'timings.sceneProbeStats': probeStats || {},
+    }).catch(() => {});
+  } catch (e) {
+    console.warn(`[scene-plan] EXCEPTION: ${e.message} — falling back to per-beat keywords`);
+    scenes = [];
   }
-  // Phase 6a gate: when ON, the per-beat sourcing loop + Kling AI hero
-  // video pass are both SKIPPED in favor of one-asset-per-scene routing.
-  // v6 production never reaches this branch (useStagingRender=false).
-  const sceneDrivenActive = useStagingRender && scenes.length > 0;
+  // Scene-driven sourcing fires whenever the scene plan produced scenes.
+  // Empty scenes (rare: short voiceover or Claude failure) fall through
+  // to the per-beat loop below.
+  const sceneDrivenActive = scenes.length > 0;
 
   // No SFX heuristic fallback. We trust Claude's strict-trigger
   // placement per the rewritten STEP 3 prompt — fewer well-placed SFX
@@ -6850,11 +6827,10 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
   return {ok, errors, warnings, probesRun: probeResults.length, overlaysDropped: overlayDropIndices.length};
 }
 
-async function renderOnLambda(inputProps, jobRef, {progressLabel = 'Rendering on Lambda', useStagingRender = false} = {}) {
+async function renderOnLambda(inputProps, jobRef, {progressLabel = 'Rendering on Lambda'} = {}) {
   const {renderMediaOnLambda, getRenderProgress} = require('@remotion/lambda-client');
-  const serveUrl = getRemotionServeUrl(useStagingRender);
-  const siteName = useStagingRender ? 'rem-report-v7 (STAGING)' : 'rem-report-v6 (PROD)';
-  console.log(`[lambda] rendering to site=${siteName} (useStagingRender=${useStagingRender})`);
+  const serveUrl = REMOTION_LAMBDA_SERVE_URL;
+  console.log(`[lambda] rendering to site=rem-report-v7`);
 
   const renderArgs = {
     region: AWS_REGION,
@@ -7095,7 +7071,7 @@ function sliceSfxForSegment(sfxLayer, segStart, segEnd) {
 // AI fallback respects the channel's render + monthly budget. If
 // adding one more AI clip would exceed either cap, AI is skipped
 // for this beat (proceeds to drop).
-async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = null, label = 'render', maxAttempts = 5, useStagingRender = false} = {}) {
+async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = null, label = 'render', maxAttempts = 5} = {}) {
   const FOOTAGE_SEARCH_FNS = {
     pexels: pexelsSearchTop,
     pixabay: pixabaySearchTop,
@@ -7107,84 +7083,18 @@ async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = 
   const blocklist = await getChannelBlocklist(channelId);
   const aiCfg = await getChannelAiVideoConfig(channelId);
   let swapAiSpentUsd = 0;
-  let aiOnlyAttempted = false;
 
   let attempt = 0;
   while (true) {
     attempt++;
     try {
-      return await renderOnLambda(renderInput, jobRef, {progressLabel: label, useStagingRender});
+      return await renderOnLambda(renderInput, jobRef, {progressLabel: label});
     } catch (e) {
       if (e.code !== 'CORRUPT_SOURCE') throw e;
 
-      // FIX 4: AI-only emergency fallback. After maxAttempts of per-beat
-      // tier-walking, if we're still hitting CORRUPT_SOURCE, regenerate
-      // every non-AI beat as an AI clip and grant ONE bonus render
-      // attempt. Capped at ABSOLUTE_DOLLAR_CEILING_PER_RENDER (~$10),
-      // matching the user-promised "$5-10 but guaranteed completion"
-      // trade. Only fires once per render — if the AI-only retry still
-      // fails, the original CORRUPT_SOURCE error throws.
-      // Phase-6a-fix A: gate aiOnlyFallback on useStagingRender=false.
-      // v7 scene-driven path already has its own generic-stock cascade
-      // (Pexels generic queries → Wikimedia → 1×1 PNG placeholder) which
-      // guarantees every scene has a URL upfront. The Kling-based
-      // emergency fallback ($5-10/render) was v6's last-resort safety
-      // net; with v7's upfront cascade it's redundant + violates the
-      // "no Kling in scene-driven" intent + creates cost overruns.
-      if (attempt >= maxAttempts && useStagingRender) {
-        console.warn(`[${jobId}] ${label} hit ${maxAttempts} swap attempts — v7 scene-driven mode: skipping Kling AI-only fallback, throwing CORRUPT_SOURCE`);
-        throw e;
-      }
       if (attempt >= maxAttempts) {
-        if (aiOnlyAttempted) throw e;
-        aiOnlyAttempted = true;
-        console.warn(`[${jobId}] ${label} hit ${maxAttempts} swap attempts — invoking AI-only emergency fallback`);
-        await jobRef.update({
-          currentStep: `🎬 Switching to AI-only mode due to source failures (cost: $5-10)`,
-          aiOnlyFallbackInvoked: true,
-          updatedAt: FieldValue.serverTimestamp(),
-        });
-
-        const aiQueueIndices = renderInput.footage
-          .map((b, idx) => {
-            if (!b || b.source === 'ai-video') return -1;
-            const hasPrompt = (b.keywords && b.keywords.length) || b.sentence || b.fluxPrompt;
-            return hasPrompt ? idx : -1;
-          })
-          .filter((idx) => idx >= 0);
-
-        if (!aiQueueIndices.length) {
-          console.warn(`[${jobId}] AI-only fallback: no eligible beats to regen — throwing`);
-          throw e;
-        }
-
-        const emergencyAiCfg = {
-          ...aiCfg,
-          enabled: true,
-          perRenderBudgetUsd: ABSOLUTE_DOLLAR_CEILING_PER_RENDER,
-        };
-        const stats = await runAiVideoGenerationPass(
-          renderInput.footage,
-          aiQueueIndices,
-          channelId,
-          emergencyAiCfg,
-          jobRef,
-          {maxClipsOverride: renderInput.footage.length, label: 'ai-only-fallback'},
-        );
-        await jobRef.update({
-          'timings.aiOnlyFallbackClipsGenerated': stats.clipsGenerated,
-          'timings.aiOnlyFallbackCostUsd': stats.costUsd,
-          'timings.aiOnlyFallbackSkippedDueBudget': stats.skippedDueBudget,
-        }).catch(() => {});
-        console.log(`[${jobId}] AI-only fallback complete: ${stats.clipsGenerated} clips, $${stats.costUsd.toFixed(2)} spent, ${stats.skippedDueBudget} skipped (budget)`);
-
-        if (stats.clipsGenerated === 0) {
-          console.warn(`[${jobId}] AI-only fallback produced 0 clips — throwing`);
-          throw e;
-        }
-
-        maxAttempts++; // grant one bonus attempt for the AI-only render
-        continue;
+        console.warn(`[${jobId}] ${label} hit ${maxAttempts} swap attempts — throwing CORRUPT_SOURCE`);
+        throw e;
       }
 
       const failedUrls = e.failedUrls || [];
@@ -7572,9 +7482,7 @@ async function processJob(job) {
     currentStep: 'Analyzing voiceover timing with Gemini',
     updatedAt: FieldValue.serverTimestamp(),
   });
-  const timingTags = await getGeminiTimingTags(voiceoverUrl, captions, process.env.GEMINI_API_KEY, {
-    useStagingRender: !!job.useStagingRender,
-  });
+  const timingTags = await getGeminiTimingTags(voiceoverUrl, captions, process.env.GEMINI_API_KEY);
   const timingMs = Date.now() - timingT0;
   await jobRef.update({
     'timings.geminiTimingMs': timingMs,
@@ -7586,7 +7494,6 @@ async function processJob(job) {
     channelId: job.channelId,
     aiVideoOverride: job.aiVideoOverride,
     timingTags,
-    useStagingRender: !!job.useStagingRender,
   });
   const sourcingMs = Date.now() - sourcingT0;
   console.log(`[${job.id}] ⏱ sourcing: ${(sourcingMs / 1000).toFixed(1)}s`);
@@ -7780,7 +7687,6 @@ async function processJob(job) {
       jobId: job.id,
       channelId: job.channelId,
       label: 'Rendering on Lambda',
-      useStagingRender: !!job.useStagingRender,
     });
     const renderMs = Date.now() - renderStart;
     await jobRef.update({
@@ -7907,7 +7813,6 @@ async function processJob(job) {
           jobId: job.id,
           channelId: job.channelId,
           label,
-          useStagingRender: !!job.useStagingRender,
         });
       }));
       const segRenderMs = Date.now() - segRenderT0;
@@ -8384,8 +8289,51 @@ exports.zombieJobWatchdog = onSchedule(
       'discoveryJobs',
       ['pending', 'researching', 'proposing'],
     );
-    if (editingKilled || discoveryKilled) {
-      console.log(`[watchdog] swept editingJobs:${editingKilled}, discoveryJobs:${discoveryKilled}`);
+
+    // Autopilot stall sweep. autoPilotWorker is an onRequest function
+    // with a 3600s (60min) Cloud Run ceiling. If it dies mid-stage
+    // (cold-recycle, OOM, hung upload), autoPilot.status stays
+    // 'running' forever — nothing else flips it. The kicker won't
+    // re-fire because requestStart was cleared at lock acquisition.
+    // User-visible symptom (2026-05-19 report): 107-min silent stall
+    // at Stage 6→7 transition, required manual "Schedule" click to
+    // surface the failure.
+    //
+    // Threshold: 65min for 'running' (60min worker ceiling + 5min
+    // grace for the final heartbeat). 'awaiting-render' is NOT
+    // swept here — autoPilotRenderCompleteKicker re-arms it when
+    // editingFile.url lands. If the render itself died, the
+    // editingJobs sweep above already marks the job failed.
+    const AUTOPILOT_STALL_MS = 65 * 60 * 1000;
+    let autopilotKilled = 0;
+    try {
+      const apSnap = await db.collectionGroup('projects')
+        .where('autoPilot.status', '==', 'running')
+        .limit(100)
+        .get();
+      for (const doc of apSnap.docs) {
+        const d = doc.data();
+        const updatedMs = d.autoPilot?.updatedAt?.toMillis ? d.autoPilot.updatedAt.toMillis() : 0;
+        if (!updatedMs) continue;
+        if (Date.now() - updatedMs < AUTOPILOT_STALL_MS) continue;
+        const ageMin = Math.round((Date.now() - updatedMs) / 60000);
+        const stage = d.autoPilot?.currentStage || '?';
+        console.log(`[watchdog] autopilot ${doc.ref.path} stuck ${ageMin}min in stage ${stage} — marking failed`);
+        await doc.ref.update({
+          'autoPilot.status': 'failed',
+          'autoPilot.error': `Auto-pilot worker died at stage ${stage} (no heartbeat for ${ageMin}min — Cloud Run likely recycled). Click Resume to re-run from the last completed stage.`,
+          'autoPilot.failedAt': FieldValue.serverTimestamp(),
+          'autoPilot.updatedAt': FieldValue.serverTimestamp(),
+          'autoPilot.requestStart': false,
+        }).catch((e) => console.error(`[watchdog] could not mark autopilot ${doc.ref.path}:`, e));
+        autopilotKilled++;
+      }
+    } catch (e) {
+      console.warn('[watchdog] autopilot sweep failed:', e.message);
+    }
+
+    if (editingKilled || discoveryKilled || autopilotKilled) {
+      console.log(`[watchdog] swept editingJobs:${editingKilled}, discoveryJobs:${discoveryKilled}, autopilot:${autopilotKilled}`);
     }
   },
 );

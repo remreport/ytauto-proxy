@@ -3,6 +3,14 @@
 Production launched 2026-05-15. From now on we develop in parallel without
 breaking what's already shipping.
 
+> **2026-05-19 — model change.** v7 has been promoted to canonical. The
+> dual-Lambda-site / `useStagingRender` gating described below is no
+> longer active on the render path: every render goes to `rem-report-v7`.
+> `useStagingRender` survives only as a QA flag on autoPilot/editingJob
+> docs; when set, the upload step holds the video as permanently
+> UNLISTED instead of entering the publish schedule. The sections below
+> are kept for historical context and will be rewritten.
+
 ## Repos
 
 The project is **3 separate git repos**, NOT one monorepo:
