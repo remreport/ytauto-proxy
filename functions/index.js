@@ -82,11 +82,11 @@ const REMOTION_LAMBDA_FUNCTION_NAME =
 const REMOTION_LAMBDA_SERVE_URL =
   'https://remotionlambda-useast1-1zsfacnzw9.s3.us-east-1.amazonaws.com/sites/rem-report-v7/index.html';
 // Music volume default. Per-channel UI override (channelMusicSettings.volume)
-// still wins. Phase-6b: bumped 0.05 → 0.08. At 0.05, ambient/suspense tracks
-// were near-inaudible under -14 LUFS voiceover (multiple "no music" reports);
-// 0.08 is a small lift that makes quiet tracks perceptible without crowding
-// voice. Loud orchestral tracks are still well below voice at this level.
-const DEFAULT_MUSIC_VOLUME = 0.08;
+// still wins. Phase 19: lowered 0.08 → 0.04 (≈-18dB below voiceover) to
+// match the reference channel's much quieter music bed. At 0.08 several
+// users reported music competing with voice on the final mix; 0.04
+// preserves mood while clearly subordinating to the voiceover.
+const DEFAULT_MUSIC_VOLUME = 0.04;
 function getDefaultMusicVolume() {
   return DEFAULT_MUSIC_VOLUME;
 }
@@ -111,6 +111,91 @@ const RENDER_PROXY_URL = 'https://ytauto-proxy.onrender.com';
 const FORENSIC_RUN_COST_ESTIMATE_USD = 0.30;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ─── Wikipedia / Archive shared resilience helpers (Phase 18 Fix 3+4) ──
+// Both Wikimedia Commons and archive.org have a habit of:
+//   1. Choking on long queries (>~120 chars) — the API silently truncates
+//      mid-token and returns 0 hits even when shorter forms would match.
+//   2. Throwing transient 429 (rate-limit) or 5xx during high-traffic
+//      windows. Without retry these surface as "0 candidates" and the
+//      source-ladder falls through to stock footage prematurely.
+//   3. Hanging open sockets when their CDN is slow. Without an explicit
+//      AbortSignal, a stalled fetch can sit on Cloud Functions' default
+//      undici timeout (5 min) and burn the whole render window.
+// These helpers centralise the fix: cap query length, retry on 429/5xx
+// with Retry-After honoured, hard timeout via AbortSignal.
+
+// Trim a free-text query to a safe length without breaking mid-word.
+// Wikimedia's gsrsearch and archive.org's advancedsearch q both behave
+// best around 100-120 chars; longer strings increase the silent-truncate
+// risk without measurable recall gains.
+function capQuery(query, maxLen = 120) {
+  if (typeof query !== 'string') return '';
+  const trimmed = query.trim().replace(/\s+/g, ' ');
+  if (trimmed.length <= maxLen) return trimmed;
+  // Trim back to last whitespace so we don't cut a word in half.
+  const sliced = trimmed.slice(0, maxLen);
+  const lastSpace = sliced.lastIndexOf(' ');
+  return lastSpace > maxLen * 0.6 ? sliced.slice(0, lastSpace) : sliced;
+}
+
+// Fetch with timeout + retry. Retries on:
+//   - 429 (rate limit) — honours Retry-After header if present (sec or HTTP-date)
+//   - 502/503/504 (transient gateway/upstream errors)
+//   - network errors (ECONNRESET, fetch failed, AbortError on transient stall)
+// Does NOT retry: 400/401/403/404/4xx user errors — those won't change.
+// Returns the Response on success; throws after exhausting attempts.
+async function fetchWithRetry(url, opts = {}, retryOpts = {}) {
+  const {
+    timeoutMs = 8000,
+    maxAttempts = 3,
+    baseBackoffMs = 500,
+    label = 'fetch',
+  } = retryOpts;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, {...opts, signal: controller.signal});
+      clearTimeout(timer);
+      // Retry on 429 + transient 5xx
+      if (resp.status === 429 || resp.status === 502 || resp.status === 503 || resp.status === 504) {
+        if (attempt >= maxAttempts) return resp; // give up, caller handles non-ok
+        // Honour Retry-After if present (seconds or HTTP-date)
+        let waitMs = baseBackoffMs * Math.pow(2, attempt - 1); // 500ms, 1s, 2s
+        const ra = resp.headers.get('retry-after');
+        if (ra) {
+          const raSec = parseInt(ra, 10);
+          if (!Number.isNaN(raSec) && raSec > 0) {
+            waitMs = Math.min(raSec * 1000, 10_000); // cap at 10s
+          } else {
+            const raDate = Date.parse(ra);
+            if (!Number.isNaN(raDate)) waitMs = Math.min(Math.max(raDate - Date.now(), 0), 10_000);
+          }
+        }
+        // Add small jitter to spread retries from concurrent callers
+        waitMs += Math.floor(Math.random() * 250);
+        console.warn(`[${label}] HTTP ${resp.status} (attempt ${attempt}/${maxAttempts}) — retry in ${waitMs}ms`);
+        await sleep(waitMs);
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      // AbortError = timeout. ECONNRESET / fetch failed = transient network.
+      // Retry these; rethrow anything that looks structural.
+      const msg = e.message || String(e);
+      const isTransient = e.name === 'AbortError' || /fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(msg);
+      if (!isTransient || attempt >= maxAttempts) throw e;
+      const waitMs = baseBackoffMs * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 250);
+      console.warn(`[${label}] ${e.name || 'error'}: ${msg.slice(0, 100)} (attempt ${attempt}/${maxAttempts}) — retry in ${waitMs}ms`);
+      await sleep(waitMs);
+    }
+  }
+  throw lastErr || new Error(`${label}: exhausted ${maxAttempts} attempts`);
+}
 
 // ─── AssemblyAI ─────────────────────────────────────────────────────
 async function generateCaptionsFromAssemblyAI(audioUrl) {
@@ -1053,11 +1138,24 @@ async function fetchWikipediaImage(name) {
   if (_wikiImageCache.has(key)) return _wikiImageCache.get(key);
   const baseName = name.trim();
   try {
-    // Phase 1: try bare name + common qualifiers if disambig
+    // Phase 1: try bare name + common qualifiers if disambig.
+    // Wikipedia rate-limits aggressively (HTTP 429) when many entity
+    // lookups land at once on a fresh container; fetchWithRetry honours
+    // Retry-After and backs off so a burst doesn't poison the whole batch.
     for (const qualifier of _PERSON_DISAMBIG_QUALIFIERS) {
       const candidate = qualifier ? `${baseName} ${qualifier}` : baseName;
       const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(candidate)}`;
-      const resp = await fetch(url, {headers: {'User-Agent': 'rem-report/1.0 (https://flourishing-squirrel-92d50e.netlify.app)'}});
+      let resp;
+      try {
+        resp = await fetchWithRetry(
+          url,
+          {headers: {'User-Agent': 'rem-report/1.0 (https://flourishing-squirrel-92d50e.netlify.app)'}},
+          {timeoutMs: 6000, maxAttempts: 3, label: 'wiki-summary'},
+        );
+      } catch (e) {
+        console.warn(`[wiki] "${candidate}" fetch failed after retries: ${e.message}`);
+        continue;
+      }
       if (!resp.ok) continue;
       const data = await resp.json();
       if (data.type === 'disambiguation') continue;
@@ -2409,26 +2507,26 @@ function stripOverlaysFromTemplateBeats(rawBeats) {
 // reinforcers in the corner.
 function filterOverlaysToBigStatAndLogos(rawBeats) {
   if (!Array.isArray(rawBeats)) return 0;
+  // Phase 19: reverted the Phase 16H strip — lowerThird citations and
+  // person entityPortraits are BACK. Keep bigStat, ALL entityPortraits
+  // (company logos AND people), and lowerThird; still strip the other
+  // legacy types (quote handled via QuoteCard template + pairing,
+  // countUp/Lottie/etc. were removed earlier).
+  const ALLOWED = new Set(['bigStat', 'entityPortrait', 'lowerThird']);
   const droppedByType = {};
   let kept = 0;
   for (const beat of rawBeats) {
     if (!Array.isArray(beat?.overlays)) continue;
     beat.overlays = beat.overlays.filter((ov) => {
       if (!ov || !ov.type) return false;
-      if (ov.type === 'bigStat') { kept++; return true; }
-      if (ov.type === 'entityPortrait' && ov.entityType === 'company') { kept++; return true; }
-      // Anything else dropped — including entityPortrait for non-company.
+      if (ALLOWED.has(ov.type)) { kept++; return true; }
       droppedByType[ov.type] = (droppedByType[ov.type] || 0) + 1;
-      // Person-type entityPortrait gets a distinct counter for visibility
-      if (ov.type === 'entityPortrait') {
-        droppedByType[`entityPortrait(${ov.entityType || 'unknown'})`] = (droppedByType[`entityPortrait(${ov.entityType || 'unknown'})`] || 0) + 1;
-      }
       return false;
     });
   }
   const droppedTotal = Object.values(droppedByType).reduce((a, b) => a + b, 0);
   if (droppedTotal > 0) {
-    console.log(`[overlay-filter] Phase 16H: kept ${kept} (bigStat + company logos); dropped ${droppedTotal} (${JSON.stringify(droppedByType)})`);
+    console.log(`[overlay-filter] Phase 19: kept ${kept} (bigStat + entityPortrait + lowerThird); dropped ${droppedTotal} (${JSON.stringify(droppedByType)})`);
   }
   return droppedTotal;
 }
@@ -2942,13 +3040,15 @@ async function pixabaySearchTop(query, n = 3) {
 // URLs. Used by searchAllFootageSources when the scene plan emits
 // assetType="archival_photo".
 async function wikimediaImageSearchTop(query, n = 3) {
+  const q = capQuery(query, 120);
+  if (!q) return [];
   const url = new URL('https://commons.wikimedia.org/w/api.php');
   url.searchParams.set('action', 'query');
   url.searchParams.set('format', 'json');
   url.searchParams.set('generator', 'search');
   // filemime:image keeps results to image MIMEs (jpg/png/webp).
   // gsrsort=relevance is the default; explicit for clarity.
-  url.searchParams.set('gsrsearch', query + ' filemime:image');
+  url.searchParams.set('gsrsearch', q + ' filemime:image');
   url.searchParams.set('gsrnamespace', '6');
   url.searchParams.set('gsrlimit', '20');
   url.searchParams.set('prop', 'imageinfo');
@@ -2957,10 +3057,10 @@ async function wikimediaImageSearchTop(query, n = 3) {
   url.searchParams.set('iiextmetadatafilter', 'LicenseShortName|Restrictions');
   url.searchParams.set('origin', '*');
   let resp;
-  try { resp = await fetch(url); }
-  catch (e) { console.warn(`Wikimedia image search threw for "${query}": ${e.message}`); return []; }
+  try { resp = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 3, label: 'wikimedia-image'}); }
+  catch (e) { console.warn(`Wikimedia image search threw for "${q}": ${e.message}`); return []; }
   if (!resp.ok) {
-    console.warn(`Wikimedia image ${resp.status} for "${query}"`);
+    console.warn(`Wikimedia image ${resp.status} for "${q}"`);
     return [];
   }
   const data = await resp.json();
@@ -3054,11 +3154,13 @@ async function locGovSearchTop(query, n = 3) {
 // Bernanke/Powell/Yellen lectures, White House addresses, congressional
 // hearings, Occupy-era B-roll. Same license filter as images.
 async function wikimediaVideoSearchTop(query, n = 3) {
+  const q = capQuery(query, 120);
+  if (!q) return [];
   const url = new URL('https://commons.wikimedia.org/w/api.php');
   url.searchParams.set('action', 'query');
   url.searchParams.set('format', 'json');
   url.searchParams.set('generator', 'search');
-  url.searchParams.set('gsrsearch', query + ' filemime:video');
+  url.searchParams.set('gsrsearch', q + ' filemime:video');
   url.searchParams.set('gsrnamespace', '6');
   url.searchParams.set('gsrlimit', '15');
   url.searchParams.set('prop', 'imageinfo');
@@ -3066,10 +3168,10 @@ async function wikimediaVideoSearchTop(query, n = 3) {
   url.searchParams.set('iiextmetadatafilter', 'LicenseShortName|Restrictions');
   url.searchParams.set('origin', '*');
   let resp;
-  try { resp = await fetch(url, {signal: AbortSignal.timeout(4000)}); }
-  catch (e) { console.warn(`[wikimedia-video] search threw for "${query}": ${e.message}`); return []; }
+  try { resp = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 3, label: 'wikimedia-video'}); }
+  catch (e) { console.warn(`[wikimedia-video] search threw for "${q}": ${e.message}`); return []; }
   if (!resp.ok) {
-    console.warn(`[wikimedia-video] HTTP ${resp.status} for "${query}"`);
+    console.warn(`[wikimedia-video] HTTP ${resp.status} for "${q}"`);
     return [];
   }
   const data = await resp.json();
@@ -3445,11 +3547,13 @@ const _ARCHIVE_PUBLISHER_LICENSE_RE = /publicdomain|cc0|cc-by/i;
 const _ARCHIVE_MAX_RUNTIME_SEC = 600; // 10 min — Lambda caps + scene relevance
 
 async function archiveSearchTop(query, n = 3) {
+  const baseQ = capQuery(query, 100);
+  if (!baseQ) return [];
   // Two-pass query: first try Prelinger (best curated PD finance/news
   // footage), fall through to general movies search if no hits.
   const queries = [
-    `${query} AND collection:prelinger AND mediatype:movies`,
-    `${query} AND mediatype:movies AND licenseurl:(*publicdomain*)`,
+    `${baseQ} AND collection:prelinger AND mediatype:movies`,
+    `${baseQ} AND mediatype:movies AND licenseurl:(*publicdomain*)`,
   ];
   for (const q of queries) {
     const url = new URL('https://archive.org/advancedsearch.php');
@@ -3463,7 +3567,11 @@ async function archiveSearchTop(query, n = 3) {
     url.searchParams.set('sort[]', 'downloads desc');
     let resp;
     try {
-      resp = await fetch(url, {headers: {'User-Agent': _ARCHIVE_UA}});
+      resp = await fetchWithRetry(
+        url,
+        {headers: {'User-Agent': _ARCHIVE_UA}},
+        {timeoutMs: 10000, maxAttempts: 3, label: 'archive-search'},
+      );
     } catch (e) {
       console.warn(`[archive-org] fetch threw for "${q.slice(0, 60)}": ${e.message}`);
       continue;
@@ -3480,7 +3588,11 @@ async function archiveSearchTop(query, n = 3) {
     for (const d of docs) {
       if (out.length >= n) break;
       try {
-        const m = await fetch(`https://archive.org/metadata/${d.identifier}`, {headers: {'User-Agent': _ARCHIVE_UA}});
+        const m = await fetchWithRetry(
+          `https://archive.org/metadata/${d.identifier}`,
+          {headers: {'User-Agent': _ARCHIVE_UA}},
+          {timeoutMs: 8000, maxAttempts: 2, label: 'archive-meta'},
+        );
         if (!m.ok) continue;
         const meta = await m.json();
         const files = meta.files || [];
@@ -4318,22 +4430,27 @@ function splitIntoSegments(durationSec) {
 }
 
 // Clip a captions array to a [segStart, segEnd] window and remap
-// timestamps so the segment starts at 0. A caption straddling the
-// boundary stays with the segment that contains its start.
+// timestamps so the segment starts at 0. Phase 18 fix 5: captions that
+// straddle segStart are kept and trimmed to segStart (clamped to 0
+// after remap), so we don't drop a caption whose voiceover audibly
+// continues into this segment.
 function sliceCaptionsForSegment(captions, segStart, segEnd) {
   const out = [];
   for (const c of captions) {
     if (c.start >= segEnd || c.end <= segStart) continue;
-    if (c.start < segStart) continue; // caption belongs to prior segment
+    const clippedStart = Math.max(c.start, segStart);
+    const clippedEnd = Math.min(c.end, segEnd);
     out.push({
       ...c,
-      start: c.start - segStart,
-      end: Math.min(c.end, segEnd) - segStart,
-      words: (c.words || []).map((w) => ({
-        ...w,
-        start: w.start - segStart,
-        end: Math.min(w.end, segEnd) - segStart,
-      })),
+      start: clippedStart - segStart,
+      end: clippedEnd - segStart,
+      words: (c.words || [])
+        .filter((w) => w.start < segEnd && w.end > segStart)
+        .map((w) => ({
+          ...w,
+          start: Math.max(w.start, segStart) - segStart,
+          end: Math.min(w.end, segEnd) - segStart,
+        })),
     });
   }
   return out;
@@ -4413,17 +4530,20 @@ function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
   return result;
 }
 
-// Same shape for footage. Beats are kept by start-time ownership.
+// Same shape for footage. Phase 18 fix 5: beats that straddle segStart
+// (start before, end after) are kept and trimmed to segStart so footage
+// covers the splice instead of leaving a black gap at the segment boundary.
 function sliceFootageForSegment(footage, segStart, segEnd) {
   const out = [];
   for (const b of footage) {
     if (!b || b.start == null) continue;
     if (b.start >= segEnd || b.end <= segStart) continue;
-    if (b.start < segStart) continue;
+    const clippedStart = Math.max(b.start, segStart);
+    const clippedEnd = Math.min(b.end, segEnd);
     out.push({
       ...b,
-      start: b.start - segStart,
-      end: Math.min(b.end, segEnd) - segStart,
+      start: clippedStart - segStart,
+      end: clippedEnd - segStart,
     });
   }
   return out;
@@ -5133,8 +5253,10 @@ function snapScenesToWordBoundaries(scenes, rawBeats, captions, voiceoverDuratio
   return {snapped, dropped};
 }
 
-async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurationSec) {
-  if (!Array.isArray(rawBeats) || rawBeats.length === 0) return [];
+// Phase 19 Fix 8: prep helper — runs the sentence-boundary scene
+// aggregation + word-boundary snap, then produces the per-scene LLM
+// summary. Shared by buildScenePlan (Claude) and buildScenePlanGemini.
+function prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec) {
   // Phase 15d + Phase 16I: STRICT sentence-boundary cuts at a denser
   // pace. Phase 16I lowered SOFT_MIN 4→2.5s + HARD_MAX 15→12s to
   // target ~3s avg scene (friend's pipeline produces ~280 scenes per
@@ -5151,9 +5273,6 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
     const wouldDur = (b.end || prevEnd) - cur.start;
     const accumDur = prevEnd - cur.start;
     const sentenceChanged = (b.sentence || '') !== (prevBeat.sentence || '');
-    // Close conditions, in priority order:
-    //  1. Hard cap exceeded (emergency — cut even mid-sentence)
-    //  2. Sentence boundary AND we're past the soft minimum
     if (wouldDur > SCENE_HARD_MAX || (sentenceChanged && accumDur >= SCENE_SOFT_MIN)) {
       scenes.push(cur);
       cur = {start: b.start || prevEnd, beats: [i]};
@@ -5162,15 +5281,7 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
     }
   }
   scenes.push(cur);
-  // Phase-6a-fix: force first scene to start at t=0 so MainComp covers
-  // the opening frames even if AssemblyAI's first caption starts slightly
-  // after 0 (dead-air trim leaves ~0.05-0.2s of leading micro-silence).
-  // Without this, no <Sequence> covers [0, firstBeat.start) → black screen
-  // for those frames.
   if (scenes.length > 0) scenes[0].start = 0;
-  // Phase-6a-fix: extend last scene to cover full voiceover. Last
-  // AssemblyAI caption.end is sometimes 0.5-2s shy of actual voiceover
-  // duration; without this the trailing audio plays over black.
   if (scenes.length > 0 && typeof voiceoverDurationSec === 'number' && voiceoverDurationSec > 0) {
     const lastScene = scenes[scenes.length - 1];
     const lastBeatIdx = lastScene.beats[lastScene.beats.length - 1];
@@ -5179,20 +5290,11 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
       lastBeat._extendedEnd = voiceoverDurationSec;
     }
   }
-
-  // Phase 16B: snap every scene boundary to the nearest word-end after
-  // its natural end. Chain cursor enforces zero gaps + zero overlaps.
-  // Eliminates the mid-word audio cut at scene transitions that gave
-  // renders their "off timing" feel. Fail-loud assertion inside —
-  // refuses to ship a plan with end<=start.
   snapScenesToWordBoundaries(scenes, rawBeats, captions, voiceoverDurationSec);
-  // Re-assign scene.index (in case any scenes were dropped during snap)
   for (let i = 0; i < scenes.length; i++) scenes[i].index = i;
 
   const sceneInputs = scenes.map((s, idx) => {
     const sceneBeats = s.beats.map((bi) => rawBeats[bi]);
-    // Phase 16B: use snapped scene.end (set by snapScenesToWordBoundaries),
-    // not the original beat-end. This is the actual displayed boundary.
     const endSec = s.end;
     const sentenceTexts = Array.from(new Set(sceneBeats.map((b) => b.sentence).filter(Boolean)));
     const keywordHints = Array.from(new Set(sceneBeats.flatMap((b) => b.keywords || [])));
@@ -5206,8 +5308,73 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
       heroMoment: sceneBeats.some((b) => b.heroMoment === true),
     };
   });
+  return {scenes, sceneInputs};
+}
 
-  const prompt = `You are planning visuals for ${sceneInputs.length} scenes of a YouTube finance/news short video. For EACH scene, output a JSON object with:
+// Phase 19 Fix 8: assemble final scene-plan output from LLM response.
+// Identical post-processing for Claude and Gemini paths — both target
+// the exact same JSON shape per scene.
+function assembleScenePlan(rawBeats, scenes, sceneInputs, enriched, t0, providerLabel) {
+  const validTypes = new Set(['stock_footage', 'archival_photo', 'ai_generated', 'map', 'stat_overlay', 'quote_card', 'comparison_split', 'timeline_bar']);
+  const breakdown = {stock_footage: 0, archival_photo: 0, ai_generated: 0, map: 0, stat_overlay: 0, quote_card: 0, comparison_split: 0, timeline_bar: 0};
+  const out = scenes.map((s, idx) => {
+    const e = enriched[idx] || {};
+    const at = validTypes.has(e.assetType) ? e.assetType : 'stock_footage';
+    breakdown[at]++;
+    const endSec = s.end || rawBeats[s.beats[s.beats.length - 1]].end || s.start;
+    return {
+      index: idx,
+      beats: s.beats.slice(),
+      start: s.start,
+      end: endSec,
+      durationSec: +(endSec - s.start).toFixed(2),
+      voiceoverText: sceneInputs[idx].voiceoverText,
+      visualConcept: typeof e.visualConcept === 'string' ? e.visualConcept.slice(0, 200) : '',
+      assetType: at,
+      searchKeywords: Array.isArray(e.searchKeywords) && e.searchKeywords.length
+        ? e.searchKeywords.slice(0, 3).map((k) => {
+            const words = String(k).trim().split(/\s+/).slice(0, 4).join(' ');
+            return words.slice(0, 60);
+          }).filter(Boolean)
+        : sceneInputs[idx].beatKeywordHints.slice(0, 3),
+      aiPrompt: at === 'ai_generated' && typeof e.aiPrompt === 'string' ? e.aiPrompt.slice(0, 500) : null,
+      mapContext: at === 'map' && e.mapContext && Array.isArray(e.mapContext.locations) && e.mapContext.locations.length
+        ? {
+            locations: e.mapContext.locations
+              .filter((l) => l && typeof l.longitude === 'number' && typeof l.latitude === 'number')
+              .slice(0, 8)
+              .map((l) => ({
+                name: String(l.name || '').slice(0, 60),
+                longitude: Math.max(-180, Math.min(180, l.longitude)),
+                latitude: Math.max(-90, Math.min(90, l.latitude)),
+              })),
+            mapStyle: ['dark', 'satellite', 'streets'].includes(e.mapContext.mapStyle) ? e.mapContext.mapStyle : 'dark',
+            zoom: typeof e.mapContext.zoom === 'number' ? Math.max(0, Math.min(18, e.mapContext.zoom)) : null,
+          }
+        : null,
+      fallbackChain: Array.isArray(e.fallbackChain)
+        ? e.fallbackChain.filter((t) => validTypes.has(t)).slice(0, 3)
+        : ['stock_footage'],
+      pacingHint: ['rapid', 'standard', 'slow', 'hold'].includes(e.pacingHint) ? e.pacingHint : 'standard',
+      templateParams: (['stat_overlay', 'quote_card', 'comparison_split', 'timeline_bar'].includes(at) && e.templateParams && typeof e.templateParams === 'object')
+        ? e.templateParams
+        : null,
+      resolvedSource: null,
+      resolvedUrl: null,
+    };
+  });
+  const pacingBreakdown = out.reduce((acc, s) => { acc[s.pacingHint] = (acc[s.pacingHint] || 0) + 1; return acc; }, {});
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[scene-plan/${providerLabel}] generated ${out.length} scenes for ${rawBeats.length} beats in ${elapsed}s — types: ${JSON.stringify(breakdown)} — pacing: ${JSON.stringify(pacingBreakdown)}`);
+  return out;
+}
+
+// Phase 19 Fix 8: shared scene-plan prompt builder. `extraContext` is
+// prepended before the JSON input block — Gemini path uses it to inject
+// the full voiceover transcript for richer reasoning; Claude path
+// leaves it empty (back-compat with prior behavior).
+function buildScenePlanPrompt(sceneInputs, extraContext = '') {
+  return `You are planning visuals for ${sceneInputs.length} scenes of a YouTube finance/news short video. For EACH scene, output a JSON object with:
 - visualConcept: string, 5-15 words describing what should appear on screen
 - assetType: one of "stock_footage" | "archival_photo" | "ai_generated" | "map" | "stat_overlay" | "quote_card" | "comparison_split" | "timeline_bar"
     * stat_overlay — full-screen code-rendered stat scene (use for KEY numbers/stats the viewer should remember; replaces generic stock when the moment is "remember THIS number")
@@ -5215,7 +5382,7 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
     * comparison_split — full-screen code-rendered split scene with two competing values (use for "then vs now", "X vs Y" framings)
     * timeline_bar — full-screen code-rendered timeline (use when scene walks through 3-5 chronological events)
     * (stock_footage/archival_photo/ai_generated/map work as before — URL-based footage)
-- searchKeywords: array of 1-3 specific search terms (refined from the beat-level hints)
+- searchKeywords: array of 1-3 short queries (HARD LIMIT: MAX 3 items, MAX 4 words each — long noisy phrases cause stock APIs to return zero matches)
 - aiPrompt: vivid photorealistic prompt for AI image generation (ONLY when assetType="ai_generated"; else null)
 - mapContext: object (ONLY when assetType="map"; else null) with:
     - locations: array of {name: string, longitude: number, latitude: number} for the places mentioned (use real-world coords — Shanghai is 121.47/31.23, Berlin is 13.41/52.52, etc.)
@@ -5246,33 +5413,42 @@ Rules — pick the BEST type for EACH specific scene, NOT a default:
 
 Distribution targets (informational, not strict): aim for roughly archival 15-20%, ai_generated 20-25%, map 5-10%, stock 40-50%. The mix depends entirely on the script content — a historic script may be 80% archival, a geopolitics script 40% map, a market-psychology script 50% ai_generated. Pick the BEST type per scene, don't quota-fill.
 
-- searchKeywords RULES (Phase 15a — quality lift):
-  * At LEAST 2 keywords MUST contain a specific entity, year, or place
-    name. Generic adjectives like "dramatic", "intense", "scary",
+- searchKeywords RULES (Phase 15a + Phase 18 quality lift):
+  * HARD LIMIT: MAX 3 items, each MAX 4 words. Anything longer is
+    rejected by the server-side validator and falls back to beat hints
+    (stock APIs silently return [] on queries >4-5 words — keep them
+    tight or you get NO footage).
+  * At LEAST 2 of the 3 keywords MUST contain a specific entity, year,
+    or place name. Generic adjectives like "dramatic", "intense", "scary",
     "powerful", "epic" are BANNED — they don't help any search API
     return better results.
-  * For stat/number scenes: include the actual NUMBER in the keyword
-    ("$700 billion TARP bailout", "25 percent unemployment 1933").
-  * For person scenes: include FIRST + LAST + ROLE
-    ("Jerome Powell Federal Reserve chair", "Henry Paulson Treasury
-    Secretary 2008").
-  * For historic events: include YEAR + MONTH where possible
-    ("Lehman Brothers September 15 2008", "Black Tuesday October 29 1929").
-  * For places: include city/region + descriptor
-    ("Shanghai port container terminal", "Wall Street trading floor NYSE").
-  * Stock scene examples (GOOD): ["NYSE trading floor traders shouting",
-    "Federal Reserve building marble columns Washington", "container ship
-    Long Beach port aerial"]
-  * Stock scene examples (BAD): ["financial crisis", "dramatic markets",
-    "scary headlines"]
+  * For stat/number scenes: lead with the entity, not the number.
+    GOOD: ["TARP bailout 2008", "Congress vote bailout", "bank rescue"].
+  * For person scenes: bare name + role (≤4 words total).
+    GOOD: ["Jerome Powell Fed chair", "Powell press conference",
+    "Federal Reserve podium"]. BAD: ["Jerome Powell Federal Reserve
+    chair speaking at press conference 2024"].
+  * For historic events: name + year.
+    GOOD: ["Lehman collapse 2008", "Black Tuesday 1929",
+    "September 15 Lehman"].
+  * For places: city + thing (≤4 words).
+    GOOD: ["Shanghai port containers", "Wall Street traders",
+    "NYSE trading floor"].
+  * Stock scene examples (GOOD): ["NYSE trading floor", "Federal Reserve
+    building", "container ship aerial"]
+  * Stock scene examples (BAD — TOO LONG): ["NYSE trading floor traders
+    shouting", "Federal Reserve building marble columns Washington",
+    "container ship Long Beach port aerial"]
+  * Stock scene examples (BAD — TOO VAGUE): ["financial crisis",
+    "dramatic markets", "scary headlines"]
 - For archival_photo specifically: 2026 has BOTH Wikimedia Commons AND
   Internet Archive video as backing sources. Wikimedia is better for
   WELL-KNOWN named figures + iconic moments (FDR, Lincoln, Bernanke);
   Internet Archive (Prelinger collection) is better for ERA/INDUSTRY
   footage (1929 trading floors, 1950s factory lines, 1970s gas crisis).
   When the scene is a generic-era visual, lean Internet Archive — use
-  era + activity keywords ("1929 stock exchange floor", "1970s gas
-  station line", "great depression breadline 1933").
+  era + activity keywords ("1929 stock exchange", "1970s gas station",
+  "Great Depression breadline").
 - For map, the locations live in mapContext, so searchKeywords can be
   short descriptive labels.
 - searchKeywords must refine the beat hints with full scene context — better than the beat hints in isolation.
@@ -5282,77 +5458,113 @@ Input scenes (JSON):
 ${JSON.stringify(sceneInputs, null, 2)}
 
 Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the same order. No prose, no markdown fences.`;
+}
 
+// Phase 19 Fix 8: Claude scene-plan path. Uses the shared
+// prepareScenesForPlan + buildScenePlanPrompt + assembleScenePlan
+// helpers so the Claude and Gemini paths produce identical output
+// shape. Extra context is empty here — Claude already gets the
+// per-scene voiceoverText inside sceneInputs.
+async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurationSec) {
+  if (!Array.isArray(rawBeats) || rawBeats.length === 0) return [];
+  const {scenes, sceneInputs} = prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec);
+  if (scenes.length === 0) return [];
+  const prompt = buildScenePlanPrompt(sceneInputs, '');
   const t0 = Date.now();
   let enriched = [];
   try {
     const raw = await callAnthropicForJSON(anthropicKey, prompt, 32000);
     if (Array.isArray(raw)) enriched = raw;
-    else console.warn(`[scene-plan] Claude returned non-array (${typeof raw}) — keeping per-beat keywords`);
+    else console.warn(`[scene-plan/claude] non-array response (${typeof raw}) — keeping per-beat keywords`);
   } catch (e) {
-    console.warn(`[scene-plan] Claude call failed: ${e.message} — keeping per-beat keywords`);
+    console.warn(`[scene-plan/claude] call failed: ${e.message} — keeping per-beat keywords`);
     return [];
   }
+  return assembleScenePlan(rawBeats, scenes, sceneInputs, enriched, t0, 'claude');
+}
 
-  // Phase 16I: validTypes now includes 4 code-rendered template types
-  const validTypes = new Set(['stock_footage', 'archival_photo', 'ai_generated', 'map', 'stat_overlay', 'quote_card', 'comparison_split', 'timeline_bar']);
-  const breakdown = {stock_footage: 0, archival_photo: 0, ai_generated: 0, map: 0, stat_overlay: 0, quote_card: 0, comparison_split: 0, timeline_bar: 0};
-  const out = scenes.map((s, idx) => {
-    const e = enriched[idx] || {};
-    const at = validTypes.has(e.assetType) ? e.assetType : 'stock_footage';
-    breakdown[at]++;
-    // Phase 16B: use snapped scene.end set by snapScenesToWordBoundaries
-    // (originally was last beat's natural end — could fall mid-word).
-    const endSec = s.end || rawBeats[s.beats[s.beats.length - 1]].end || s.start;
-    return {
-      index: idx,
-      beats: s.beats.slice(),
-      start: s.start,
-      end: endSec,
-      durationSec: +(endSec - s.start).toFixed(2),
-      voiceoverText: sceneInputs[idx].voiceoverText,
-      visualConcept: typeof e.visualConcept === 'string' ? e.visualConcept.slice(0, 200) : '',
-      assetType: at,
-      searchKeywords: Array.isArray(e.searchKeywords) && e.searchKeywords.length
-        ? e.searchKeywords.slice(0, 3).map((k) => String(k).slice(0, 60))
-        : sceneInputs[idx].beatKeywordHints.slice(0, 3),
-      aiPrompt: at === 'ai_generated' && typeof e.aiPrompt === 'string' ? e.aiPrompt.slice(0, 500) : null,
-      mapContext: at === 'map' && e.mapContext && Array.isArray(e.mapContext.locations) && e.mapContext.locations.length
-        ? {
-            locations: e.mapContext.locations
-              .filter((l) => l && typeof l.longitude === 'number' && typeof l.latitude === 'number')
-              .slice(0, 8)
-              .map((l) => ({
-                name: String(l.name || '').slice(0, 60),
-                longitude: Math.max(-180, Math.min(180, l.longitude)),
-                latitude: Math.max(-90, Math.min(90, l.latitude)),
-              })),
-            mapStyle: ['dark', 'satellite', 'streets'].includes(e.mapContext.mapStyle) ? e.mapContext.mapStyle : 'dark',
-            zoom: typeof e.mapContext.zoom === 'number' ? Math.max(0, Math.min(18, e.mapContext.zoom)) : null,
-          }
-        : null,
-      fallbackChain: Array.isArray(e.fallbackChain)
-        ? e.fallbackChain.filter((t) => validTypes.has(t)).slice(0, 3)
-        : ['stock_footage'],
-      // Phase 15e: pacingHint (optional). Captured for downstream
-      // future use (transitions, Ken Burns intensity). Defaults to
-      // 'standard' when Claude omits or returns an invalid value.
-      pacingHint: ['rapid', 'standard', 'slow', 'hold'].includes(e.pacingHint) ? e.pacingHint : 'standard',
-      // Phase 16I: templateParams (object) when assetType is a code-
-      // rendered template type. Captured raw — MainComp's template
-      // component will read what it needs and ignore unknown keys.
-      templateParams: (['stat_overlay', 'quote_card', 'comparison_split', 'timeline_bar'].includes(at) && e.templateParams && typeof e.templateParams === 'object')
-        ? e.templateParams
-        : null,
-      resolvedSource: null,
-      resolvedUrl: null,
-    };
-  });
-  // Phase 15e: count pacingHint distribution for telemetry
-  const pacingBreakdown = out.reduce((acc, s) => { acc[s.pacingHint] = (acc[s.pacingHint] || 0) + 1; return acc; }, {});
-  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-  console.log(`[scene-plan] generated ${out.length} scenes for ${rawBeats.length} beats in ${elapsed}s — types: ${JSON.stringify(breakdown)} — pacing: ${JSON.stringify(pacingBreakdown)}`);
-  return out;
+// Phase 19 Fix 8: Gemini scene-plan path. Same shared helpers, plus
+// the full voiceover transcript appended as extraContext — gives
+// Gemini full-script awareness so it can plan visuals that reference
+// past/future scenes (callbacks, payoffs, contrast). Returns the same
+// shape as buildScenePlan; caller can swap providers freely.
+async function buildScenePlanGemini(rawBeats, captions, geminiKey, voiceoverDurationSec) {
+  if (!geminiKey) {
+    console.warn('[scene-plan/gemini] GEMINI_API_KEY not set — returning []');
+    return [];
+  }
+  if (!Array.isArray(rawBeats) || rawBeats.length === 0) return [];
+  const {scenes, sceneInputs} = prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec);
+  if (scenes.length === 0) return [];
+
+  // Full transcript as extra context — each line "[t.s] text" so Gemini
+  // can see absolute timing across the whole script. Cap at ~20K chars
+  // to stay well under the Gemini input window even on 30-min videos.
+  const transcriptLines = (captions || []).map((c) => {
+    const t = (c.start || 0).toFixed(1);
+    const txt = (c.text || c.sentence || '').replace(/\s+/g, ' ').trim();
+    return txt ? `[${t}s] ${txt}` : '';
+  }).filter(Boolean).join('\n').slice(0, 20000);
+  const extraContext = transcriptLines
+    ? `Full voiceover transcript (use to spot callbacks, payoffs, or scene-to-scene contrast):\n${transcriptLines}\n\n`
+    : '';
+
+  const prompt = buildScenePlanPrompt(sceneInputs, extraContext);
+  const t0 = Date.now();
+  const body = {
+    contents: [{role: 'user', parts: [{text: prompt}]}],
+    generationConfig: {
+      temperature: 0.4,
+      responseMimeType: 'application/json',
+      maxOutputTokens: 32768,
+    },
+  };
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`;
+  let enriched = [];
+  try {
+    const apiT0 = Date.now();
+    console.log(`[scene-plan/gemini] POST → ${GEMINI_MODEL} (scenes=${sceneInputs.length}, promptChars=${prompt.length})`);
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const apiMs = Date.now() - apiT0;
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.warn(`[scene-plan/gemini] HTTP ${resp.status} ${resp.statusText} after ${apiMs}ms — body: ${text.slice(0, 500)}`);
+      return [];
+    }
+    const data = await resp.json();
+    const usage = data?.usageMetadata;
+    if (usage) console.log(`[scene-plan/gemini] response in ${apiMs}ms — usage: prompt=${usage.promptTokenCount} response=${usage.candidatesTokenCount} total=${usage.totalTokenCount}`);
+    const finishReason = data?.candidates?.[0]?.finishReason;
+    if (finishReason && finishReason !== 'STOP') {
+      console.warn(`[scene-plan/gemini] non-STOP finishReason="${finishReason}" — returning []`);
+      return [];
+    }
+    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!raw) {
+      console.warn(`[scene-plan/gemini] empty response — full response: ${JSON.stringify(data).slice(0, 500)}`);
+      return [];
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(sanitizeJSON(raw));
+    } catch (e) {
+      console.warn(`[scene-plan/gemini] JSON parse failed: ${e.message} — body: ${raw.slice(0, 300)}`);
+      return [];
+    }
+    if (!Array.isArray(parsed)) {
+      console.warn(`[scene-plan/gemini] response is not an array (got ${typeof parsed})`);
+      return [];
+    }
+    enriched = parsed;
+  } catch (e) {
+    console.warn(`[scene-plan/gemini] EXCEPTION: ${e.message}`);
+    return [];
+  }
+  return assembleScenePlan(rawBeats, scenes, sceneInputs, enriched, t0, 'gemini');
 }
 
 // ─── Phase 6b legacy probe REMOVED (Phase 17) ──────────────────────
@@ -5444,13 +5656,31 @@ async function _phase6bFinalizeRemoved(draftScenes, aiImageBudget) {
         probeArchiveOrg(fullQ),
       ]);
       let wikiCount = wikiFull;
+      let finalArchive = archiveCount;
       if (wikiCount === 0) {
         const strippedQ = stripDates(fullQ);
         if (strippedQ && strippedQ !== fullQ) {
           wikiCount = await probeWikimedia(strippedQ);
         }
       }
-      return {scene: s, wikiCount, archiveCount};
+      // Phase 18: if BOTH catalogs missed the full query and we have
+      // multiple keywords, retry with just the first keyword (Claude
+      // lists them in priority order).
+      if (wikiCount === 0 && finalArchive === 0 &&
+          Array.isArray(s.searchKeywords) && s.searchKeywords.length > 1) {
+        const firstKw = String(s.searchKeywords[0] || '').trim().slice(0, 60);
+        if (firstKw && firstKw !== fullQ) {
+          const [w2, a2] = await Promise.all([
+            probeWikimedia(firstKw),
+            probeArchiveOrg(firstKw),
+          ]);
+          if (w2 || a2) {
+            console.log(`[scene-plan] scene ${s.index} archival miss → retry with first keyword "${firstKw}" found wiki=${w2} archive=${a2}`);
+            wikiCount = w2; finalArchive = a2;
+          }
+        }
+      }
+      return {scene: s, wikiCount, archiveCount: finalArchive};
     }));
     for (const {scene, wikiCount, archiveCount} of probes) {
       if (wikiCount === 0 && archiveCount === 0) {
@@ -5769,44 +5999,55 @@ const ASSET_HANDLERS = {
 //   ai_generated → stock_footage when budget exhausted (12 images cap)
 //   map → stock_footage when mapContext.locations invalid
 async function _probeLocGov(query) {
-  if (!query) return 0;
+  const q = capQuery(query, 120);
+  if (!q) return 0;
   try {
     const url = new URL('https://www.loc.gov/photos/');
     url.searchParams.set('fo', 'json');
-    url.searchParams.set('q', query);
+    url.searchParams.set('q', q);
     url.searchParams.set('c', '1');
-    const r = await fetch(url, {headers: {'User-Agent': 'rem-report-bot/1.0'}, signal: AbortSignal.timeout(12000)});
+    const r = await fetchWithRetry(
+      url,
+      {headers: {'User-Agent': 'rem-report-bot/1.0'}},
+      {timeoutMs: 12000, maxAttempts: 3, label: 'loc-probe'},
+    );
     if (!r.ok) return 0;
     const d = await r.json();
     return Array.isArray(d.results) ? d.results.length : 0;
   } catch { return 0; }
 }
 async function _probeWikimediaImage(query) {
-  if (!query) return 0;
+  const q = capQuery(query, 120);
+  if (!q) return 0;
   try {
     const url = new URL('https://commons.wikimedia.org/w/api.php');
     url.searchParams.set('action', 'query');
     url.searchParams.set('format', 'json');
     url.searchParams.set('list', 'search');
-    url.searchParams.set('srsearch', query + ' filemime:image');
+    url.searchParams.set('srsearch', q + ' filemime:image');
     url.searchParams.set('srnamespace', '6');
     url.searchParams.set('srlimit', '1');
     url.searchParams.set('origin', '*');
-    const r = await fetch(url, {signal: AbortSignal.timeout(4000)});
+    const r = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 3, label: 'wikimedia-probe'});
     if (!r.ok) return 0;
     const d = await r.json();
     return d?.query?.searchinfo?.totalhits || 0;
   } catch { return 0; }
 }
 async function _probeArchiveOrg(query) {
-  if (!query) return 0;
+  const q = capQuery(query, 120);
+  if (!q) return 0;
   try {
     const url = new URL('https://archive.org/advancedsearch.php');
-    url.searchParams.set('q', `${query} AND mediatype:movies AND licenseurl:(*publicdomain*)`);
+    url.searchParams.set('q', `${q} AND mediatype:movies AND licenseurl:(*publicdomain*)`);
     url.searchParams.set('rows', '1');
     url.searchParams.set('output', 'json');
     url.searchParams.append('fl[]', 'identifier');
-    const r = await fetch(url, {signal: AbortSignal.timeout(6000), headers: {'User-Agent': 'rem-report-bot/1.0'}});
+    const r = await fetchWithRetry(
+      url,
+      {headers: {'User-Agent': 'rem-report-bot/1.0'}},
+      {timeoutMs: 10000, maxAttempts: 3, label: 'archive-probe'},
+    );
     if (!r.ok) return 0;
     const d = await r.json();
     return d.response?.numFound || 0;
@@ -5857,7 +6098,29 @@ async function finalizeScenePlanWithAvailability(scenes, aiImageBudget) {
         const stripped = stripDates(fullQ);
         if (stripped && stripped !== fullQ) wikiHits = await _probeWikimediaImage(stripped);
       }
-      return {scene: s, loc, wiki: wikiHits, archive};
+      // Phase 18: if all three sources missed AND we have multiple
+      // keywords, retry probes with just the FIRST keyword (the most
+      // important — Claude lists keywords in priority order). This
+      // catches scenes where the joined 2-3 keyword phrase is too
+      // specific for any catalog but the leading concept exists.
+      let locHits = loc;
+      let archiveHits = archive;
+      if (locHits === 0 && wikiHits === 0 && archiveHits === 0 &&
+          Array.isArray(s.searchKeywords) && s.searchKeywords.length > 1) {
+        const firstKw = String(s.searchKeywords[0] || '').trim().slice(0, 60);
+        if (firstKw && firstKw !== fullQ) {
+          const [l2, w2, a2] = await Promise.all([
+            _probeLocGov(firstKw),
+            _probeWikimediaImage(firstKw),
+            _probeArchiveOrg(firstKw),
+          ]);
+          if (l2 || w2 || a2) {
+            console.log(`[probe] scene ${s.index} miss → retry with first keyword "${firstKw}" found loc=${l2} wiki=${w2} archive=${a2}`);
+            locHits = l2; wikiHits = w2; archiveHits = a2;
+          }
+        }
+      }
+      return {scene: s, loc: locHits, wiki: wikiHits, archive: archiveHits};
     }));
     for (const {scene, loc, wiki, archive} of probes) {
       if (loc === 0 && wiki === 0 && archive === 0) {
@@ -6059,11 +6322,26 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
     const sentence = Array.from(new Set(sceneBeats.map((b) => b.sentence).filter(Boolean))).join(' ').slice(0, 240);
     const musicMood = si === 0 ? sceneBeats[0]?.musicMood : null;
 
+    // Phase 18 fix 1A: cap template scene to max 4s of display. Templates
+    // are punchy moments — when natural scene duration > 4s, 70-87% of
+    // the scene was static template. Shift the footage `start` later so
+    // the template plays only the LAST 4s of the scene; prior footage
+    // stretches into the lead-in (stretchFootageToFillGaps reads nextStart
+    // from this entry and extends the previous beat automatically).
+    const TEMPLATE_MAX_DURATION = 4;
+    let footageStart = sceneStart;
+    let templateCapped = false;
+    if (templateType && (sceneEnd - sceneStart) > TEMPLATE_MAX_DURATION) {
+      footageStart = sceneEnd - TEMPLATE_MAX_DURATION;
+      templateCapped = true;
+    }
+
     footage.push({
       beatIndex: si, // kept as beatIndex for MainComp render-loop compat
       sceneIndex: si,
-      start: sceneStart,
+      start: footageStart,
       end: sceneEnd,
+      ...(templateCapped ? {templateCapped: true, originalSceneStart: sceneStart} : {}),
       sentence,
       keywords,
       fluxPrompt: scene.aiPrompt || sceneBeats[0]?.fluxPrompt || null,
@@ -6085,7 +6363,7 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       assetType: scene.assetType,
       visualConcept: scene.visualConcept,
     });
-    console.log(`scene ${si + 1}: ${source || 'NO MATCH'} (${scene.assetType}, ${(sceneEnd - sceneStart).toFixed(1)}s)${heroMoment ? ' [HERO]' : ''}${aggregatedOverlays.length ? ` [+${aggregatedOverlays.length} ovl]` : ''}${aggregatedSfx.length ? ` [+${aggregatedSfx.length} sfx]` : ''}`);
+    console.log(`scene ${si + 1}: ${source || 'NO MATCH'} (${scene.assetType}, ${(sceneEnd - sceneStart).toFixed(1)}s)${templateCapped ? ` [tpl-capped→${(sceneEnd - footageStart).toFixed(1)}s]` : ''}${heroMoment ? ' [HERO]' : ''}${aggregatedOverlays.length ? ` [+${aggregatedOverlays.length} ovl]` : ''}${aggregatedSfx.length ? ` [+${aggregatedSfx.length} sfx]` : ''}`);
   }
   return footage;
 }
@@ -6251,7 +6529,24 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     const voiceoverDurForScenePlan = (captions && captions.length)
       ? Math.max(...captions.map((c) => c.end || 0))
       : 0;
-    const draftScenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan);
+    // Phase 19 Fix 8: USE_GEMINI_SCENE_PLAN (default true) — try Gemini
+    // first for richer full-transcript reasoning, fall back to Claude
+    // on empty/failure. Either way the output shape is identical thanks
+    // to assembleScenePlan.
+    const USE_GEMINI_SCENE_PLAN = process.env.USE_GEMINI_SCENE_PLAN !== 'false';
+    let draftScenes = [];
+    let scenePlanProvider = 'claude';
+    if (USE_GEMINI_SCENE_PLAN && process.env.GEMINI_API_KEY) {
+      draftScenes = await buildScenePlanGemini(rawBeats, captions, process.env.GEMINI_API_KEY, voiceoverDurForScenePlan);
+      if (draftScenes.length > 0) {
+        scenePlanProvider = 'gemini';
+      } else {
+        console.warn('[scene-plan] Gemini returned 0 scenes — falling back to Claude');
+      }
+    }
+    if (draftScenes.length === 0) {
+      draftScenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan);
+    }
     const probeStats = await finalizeScenePlanWithAvailability(draftScenes, aiImageBudget);
     scenes = draftScenes;
     const touched = applyScenesToBeats(rawBeats, scenes);
@@ -6262,6 +6557,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       'timings.sceneBeatsTouched': touched,
       'timings.sceneFinalTypes': scenes.reduce((acc, s) => { acc[s.assetType] = (acc[s.assetType] || 0) + 1; return acc; }, {}),
       'timings.sceneProbeStats': probeStats || {},
+      'timings.scenePlanProvider': scenePlanProvider,
     }).catch(() => {});
   } catch (e) {
     console.warn(`[scene-plan] EXCEPTION: ${e.message} — falling back to per-beat keywords`);
@@ -10198,20 +10494,38 @@ function getExpressionForTopic(topic, idx) {
 // extracted. Every section degrades gracefully if its inputs are
 // missing — fresh channels still get a workable prompt from base
 // style alone.
+// Phase 18 Fix 6: thumbnail brand constants. Single source of truth so
+// the Pikzels prompt + any future thumbnail surface stays locked to the
+// same palette the in-video templates use (remotion/src/brand.js
+// BRAND.colors.bg = #49181e, BRAND.colors.accent = #ED6F32). Mirroring
+// them here keeps the click-through visual matched to the opening frame
+// the viewer sees, so "brand recognition" carries from grid to play.
+const THUMB_BRAND = {
+  bg: '#49181E',           // matches BRAND.colors.bg (video template bg)
+  bgVignetteEdge: '#2a0d10', // a darker burgundy purely for radial vignette
+  accent: '#ED6F32',       // matches BRAND.colors.accent (orange callout)
+  text: '#FFFFFF',
+  font: 'Anton',           // matches BRAND.fonts.display (Anton condensed)
+};
+
 function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFormula, globalPatterns}) {
-  // Day-13 F1: locked style template for cross-video consistency. Every
-  // thumbnail uses the same font (Anton), composition (subject right /
-  // text left), and palette so the channel reads as one brand at scroll
-  // speed. Pikzels' /v2/thumbnail/text endpoint caps usefully at ~600
-  // chars; we stay tight by stating each constraint once.
+  // Day-13 F1 + Phase 18 Fix 6: locked style template for cross-video
+  // consistency. Every thumbnail uses the same font (Anton), composition
+  // (subject right / text left), and palette as the in-video brand
+  // (remotion/src/brand.js) so the click-through visual flows seamlessly
+  // into the opening scene. Pikzels' /v2/thumbnail/text endpoint caps
+  // usefully at ~600 chars; we stay tight by stating each constraint once.
   const parts = [];
 
   parts.push('Dramatic high-contrast YouTube finance thumbnail, photorealistic, cinematic lighting.');
-  parts.push('Background: dark gradient #0a0a0a → #49181E burgundy with #ED6F32 orange rim-light, vignette edges.');
-  // Composition lock — subject right, text block left, channel badge bottom-right.
-  parts.push('Composition: subject occupies right 50% of frame; text block fills left 45%; channel badge bottom-right corner, small.');
-  // Font lock — Anton everywhere, white primary + orange accent.
-  parts.push('Text font: Anton (bold condensed sans-serif, UPPERCASE) — white primary, accent stat in #ED6F32 orange.');
+  // Phase 18 Fix 6: background + composition + font locked to the same
+  // brand the video opens on. Hex codes are unambiguous to the model, so
+  // descriptors like "burgundy"/"orange" are redundant — dropping them
+  // keeps the 4 brand blocks well under the 600-char Pikzels cap so the
+  // subject/entity/headline sections still have room.
+  parts.push(`Background: solid ${THUMB_BRAND.bg} with radial vignette to ${THUMB_BRAND.bgVignetteEdge} corners; ${THUMB_BRAND.accent} rim-light on subject.`);
+  parts.push(`Composition: subject right 50%, text block left 45%, channel badge bottom-right in ${THUMB_BRAND.accent}.`);
+  parts.push(`Text font: ${THUMB_BRAND.font} (bold condensed UPPERCASE) — ${THUMB_BRAND.text} primary, ${THUMB_BRAND.accent} accent stat.`);
 
   // Subject: title is the headline.
   parts.push(`Subject: ${(title || '').slice(0, 120)}.`);
@@ -10268,10 +10582,10 @@ function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFo
     parts.push('Right half: dramatic abstract finance imagery — trading screens with red/orange data, financial district skyline at dusk, or breaking-news graphic. NO human portraits.');
   }
 
-  // Text overlay — the headline number / hook. Anton white, with stat in Anton orange.
+  // Text overlay — the headline number / hook. Brand font primary, accent stat.
   const overlay = generateThumbnailText(title);
   if (overlay) {
-    parts.push(`Left text block: large Anton UPPERCASE headline "${overlay.slice(0, 30)}" in white; smaller Anton orange stat / subtitle below. Never over the subject's face.`);
+    parts.push(`Left text block: large ${THUMB_BRAND.font} UPPERCASE headline "${overlay.slice(0, 30)}" in ${THUMB_BRAND.text}; smaller ${THUMB_BRAND.font} ${THUMB_BRAND.accent} stat / subtitle below. Never over the subject's face.`);
   }
 
   parts.push('NOT cartoon, NOT generic stock, NOT 3D-render look. NO random/invented human portraits — model cannot render real-person likenesses, so use symbolic/institutional visuals instead.');
