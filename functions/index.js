@@ -5511,12 +5511,19 @@ async function buildScenePlanGemini(rawBeats, captions, geminiKey, voiceoverDura
 
   const prompt = buildScenePlanPrompt(sceneInputs, extraContext);
   const t0 = Date.now();
+  // Phase 19 Fix 8b: gemini-2.5-flash burns its output budget on internal
+  // thinking by default — observed: 31K of 32K maxOutputTokens went to
+  // reasoning, leaving 1.3K for the JSON answer → finishReason=MAX_TOKENS
+  // on a 112-scene script. Scene-plan is a structured-output task, not a
+  // reasoning task, so we disable thinking (thinkingBudget: 0) AND raise
+  // the output ceiling to 65536 to leave room for ~280-scene scripts.
   const body = {
     contents: [{role: 'user', parts: [{text: prompt}]}],
     generationConfig: {
       temperature: 0.4,
       responseMimeType: 'application/json',
-      maxOutputTokens: 32768,
+      maxOutputTokens: 65536,
+      thinkingConfig: {thinkingBudget: 0},
     },
   };
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`;
