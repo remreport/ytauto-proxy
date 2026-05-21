@@ -68,6 +68,18 @@ const FAL_AI_API_KEY = defineSecret('FAL_AI_API_KEY');
 // to 50K requests/month — no per-image cost concern at our render volume.
 // Bound on processEditingJobHttp. Falls back to stock if unset.
 const MAPBOX_ACCESS_TOKEN = defineSecret('MAPBOX_ACCESS_TOKEN');
+// Phase 21 Fix 3: YouTube Data API v3 key for stock-clip search. Free
+// 10K-units/day quota; search.list costs 100 units each (~100 searches
+// per day). Used by youtubeSearchTop → render proxy /youtube/clip-url
+// (yt-dlp) to mint direct mp4 URLs for source ladder. No-op if absent.
+const YOUTUBE_API_KEY = defineSecret('YOUTUBE_API_KEY');
+// Phase 21 Fix 4: Pixabay + Unsplash image fallbacks. PIXABAY_API_KEY
+// was previously read from env without a defineSecret binding, which
+// silently disabled the source on Cloud Functions v2 (env scoped per-
+// secret). Promoted to a first-class secret; Unsplash added as a new
+// public-domain image source. All three have no-op fallbacks if unset.
+const PIXABAY_API_KEY = defineSecret('PIXABAY_API_KEY');
+const UNSPLASH_ACCESS_KEY = defineSecret('UNSPLASH_ACCESS_KEY');
 
 // ─── Non-secret config ──────────────────────────────────────────────
 const AWS_REGION = 'us-east-1';
@@ -82,11 +94,11 @@ const REMOTION_LAMBDA_FUNCTION_NAME =
 const REMOTION_LAMBDA_SERVE_URL =
   'https://remotionlambda-useast1-1zsfacnzw9.s3.us-east-1.amazonaws.com/sites/rem-report-v7/index.html';
 // Music volume default. Per-channel UI override (channelMusicSettings.volume)
-// still wins. Phase 19: lowered 0.08 → 0.04 (≈-18dB below voiceover) to
-// match the reference channel's much quieter music bed. At 0.08 several
-// users reported music competing with voice on the final mix; 0.04
-// preserves mood while clearly subordinating to the voiceover.
-const DEFAULT_MUSIC_VOLUME = 0.04;
+// still wins, EXCEPT a stored value of exactly 0 is treated as "unset" and
+// the default is used — a stale 0 override was silencing music entirely.
+// Phase 20: 0.04 was too quiet (user reported NO music at all in latest
+// render). Bumped to 0.08 — still well under voiceover, but audible.
+const DEFAULT_MUSIC_VOLUME = 0.08;
 function getDefaultMusicVolume() {
   return DEFAULT_MUSIC_VOLUME;
 }
@@ -896,13 +908,21 @@ async function measurePeakDb(localPath) {
 }
 
 async function getChannelMusicSettings(channelId) {
-  // Default volume 0.06 (6%) — constant under voiceover. No ducking.
-  // Voiceover sits on top at 1.0 and music doesn't compete.
-  const fallback = {useGlobalLibrary: true, preferredMoods: [], volume: 0.06};
+  // Default volume aligned with DEFAULT_MUSIC_VOLUME (0.08). Constant
+  // under voiceover, no ducking. Voiceover sits on top at 1.0 and music
+  // doesn't compete. Phase 20: also coerce a stored volume of exactly 0
+  // back to the default — a stale 0 override silenced music entirely on
+  // the Bitcoin Loophole render.
+  const fallback = {useGlobalLibrary: true, preferredMoods: [], volume: DEFAULT_MUSIC_VOLUME};
   if (!channelId) return fallback;
   try {
     const doc = await db.collection('channels').doc(channelId).get();
-    return {...fallback, ...(doc.data()?.musicSettings || {})};
+    const merged = {...fallback, ...(doc.data()?.musicSettings || {})};
+    if (merged.volume === 0) {
+      console.warn(`[music] channel ${channelId} has musicSettings.volume=0 (likely stale) — using default ${DEFAULT_MUSIC_VOLUME}`);
+      merged.volume = DEFAULT_MUSIC_VOLUME;
+    }
+    return merged;
   } catch (e) {
     console.warn(`[music] failed to read musicSettings: ${e.message}`);
     return fallback;
@@ -1805,6 +1825,46 @@ function normalizeEntityName(s) {
   return (s || '').toLowerCase().replace(/[\s\-_.,'’]/g, '');
 }
 
+// Phase 20 fix 4: strict entity-name match for timing-tag snippets.
+// The earlier `snipNorm.includes(nameNorm) || nameNorm.includes(snipNorm)`
+// was too permissive — "apple" matched "pineapple", "trump" matched
+// "trumpet". This wrapper enforces:
+//   - both sides ≥4 chars after normalization (drops 1-3 char accidents)
+//   - shorter side ≥40% of the longer (so "Jerome" ↔ "Jerome Powell" still
+//     matches but "Apple" ↔ "Pineapple" does not — 5/9 = 55%, but those
+//     two are EXACTLY the kind of false positives the older code produced
+//     on raw substring) — combined with the suffix-stripped form via
+//     normalizeEntityForMatch, this catches "Goldman" ↔ "Goldman Sachs"
+//     and "JPMorgan" ↔ "JP Morgan Chase" while rejecting subword junk.
+//   - fuzzy levenshtein fallback for ≤2 edits (catches Gemini-typo
+//     snippets like "Powel" / "Goldman Sax").
+// Used by both anchorOverlaysToTimingTags and trimOverlayDurationsToNextAnchor
+// so a tag that anchors an overlay can never simultaneously be flagged
+// as the "next different" entity that ends it.
+function entityNameMatchesTagSnippet(overlayName, snippet) {
+  if (!overlayName || !snippet) return false;
+  // Tier 1: aggressive normalization (strip corporate suffixes too) — used
+  // for the "is this the same entity" decision. Mirrors caption matching.
+  const a = normalizeEntityForMatch(overlayName);
+  const b = normalizeEntityForMatch(snippet);
+  if (!a || !b) return false;
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  if (shorter.length < 4) return false;
+  if (!longer.includes(shorter)) {
+    // fuzzy fallback — only when lengths are close
+    if (Math.abs(a.length - b.length) <= 2 && levenshtein(a, b) <= 2) return true;
+    return false;
+  }
+  // Substring hit — require shorter to be ≥40% of longer to reject
+  // sub-word noise (e.g. "apple" in "pineapple" = 5/9 = 55% but real
+  // partial matches like "Goldman" in "GoldmanSachs" = 7/12 = 58%
+  // still pass; we keep the threshold low enough not to break legit
+  // last-name shortenings like "Powell" in "JeromePowell" = 6/12 = 50%).
+  if (shorter.length / longer.length < 0.4) return false;
+  return true;
+}
+
 function parseStatNumber(text) {
   const m = (text || '').match(/(-?\d{1,3}(?:,\d{3})*(?:\.\d+)?)/);
   if (!m) return null;
@@ -2077,12 +2137,9 @@ function anchorOverlaysToTimingTags(rawBeats, timingTags) {
     for (const ov of beat.overlays) {
       let match = null;
       if (ov.type === 'entityPortrait' && ov.name) {
-        const nameNorm = normalizeEntityName(ov.name);
         match = beatTags.find((t) => {
           if (t.tag !== 'entity-mention' || !t.snippet) return false;
-          const snipNorm = normalizeEntityName(t.snippet);
-          if (!nameNorm || !snipNorm) return false;
-          return snipNorm.includes(nameNorm) || nameNorm.includes(snipNorm);
+          return entityNameMatchesTagSnippet(ov.name, t.snippet);
         });
       } else if (ov.type === 'bigStat' && ov.text) {
         const ovNum = parseStatNumber(ov.text);
@@ -2304,10 +2361,8 @@ function trimOverlayDurationsToNextAnchor(rawBeats, timingTags) {
         if (t.tag !== 'entity-mention' && t.tag !== 'stat-emphasis') return false;
         if (ov.type === 'entityPortrait') {
           if (t.tag === 'stat-emphasis') return true;
-          const ovNameNorm = normalizeEntityName(ov.name);
-          const snipNorm = normalizeEntityName(t.snippet);
-          if (!ovNameNorm || !snipNorm) return true;
-          return !(snipNorm.includes(ovNameNorm) || ovNameNorm.includes(snipNorm));
+          // Same entity → not "different", so DON'T trim on this tag.
+          return !entityNameMatchesTagSnippet(ov.name, t.snippet);
         }
         // bigStat
         if (t.tag === 'entity-mention') return true;
@@ -3198,6 +3253,203 @@ async function wikimediaVideoSearchTop(query, n = 3) {
   return out;
 }
 
+// Phase 21 Fix 3: YouTube Data API v3 search for stock clips. Two-step
+// resolve — search.list (returns video IDs by relevance), then a
+// proxy round-trip per ID through /youtube/clip-url which runs yt-dlp
+// (residential-proxied via Decodo) to mint a direct mp4 URL Lambda
+// can fetch. Returns up to N validated direct-mp4 URLs.
+//
+// Filters:
+//   - videoDuration: short (<4 min) — too-long clips waste yt-dlp time
+//   - videoLicense: creativeCommon — only CC-BY-3.0 reuseable clips
+//   - safeSearch: strict
+//
+// Cost: 100 quota units per search.list call. Default 10K/day quota
+// = 100 searches/day, comfortably above our render volume.
+//
+// Returns [] silently when YOUTUBE_API_KEY is unbound — keeps the
+// source ladder degrade-gracefully invariant.
+async function youtubeSearchTop(query, n = 3) {
+  if (!process.env.YOUTUBE_API_KEY) return [];
+  const q = capQuery(query, 100);
+  if (!q) return [];
+  const searchUrl = new URL('https://www.googleapis.com/youtube/v3/search');
+  searchUrl.searchParams.set('key', process.env.YOUTUBE_API_KEY);
+  searchUrl.searchParams.set('part', 'snippet');
+  searchUrl.searchParams.set('type', 'video');
+  searchUrl.searchParams.set('q', q);
+  searchUrl.searchParams.set('maxResults', '10');
+  searchUrl.searchParams.set('videoDuration', 'short');
+  searchUrl.searchParams.set('videoLicense', 'creativeCommon');
+  searchUrl.searchParams.set('videoEmbeddable', 'true');
+  searchUrl.searchParams.set('safeSearch', 'strict');
+  searchUrl.searchParams.set('order', 'relevance');
+  let resp;
+  try {
+    resp = await fetchWithRetry(searchUrl, {}, {timeoutMs: 10000, maxAttempts: 3, label: 'youtube-search'});
+  } catch (e) {
+    console.warn(`[youtube] search threw for "${q}": ${e.message}`);
+    return [];
+  }
+  if (!resp.ok) {
+    // 403 = quota exhausted; 400 = API key issue. Either way, return [] —
+    // the ladder will fall through to the next source.
+    console.warn(`[youtube] search HTTP ${resp.status} for "${q}"`);
+    return [];
+  }
+  const data = await resp.json();
+  const items = Array.isArray(data.items) ? data.items : [];
+  if (items.length === 0) {
+    console.log(`[youtube] zero hits for "${q.slice(0, 60)}"`);
+    return [];
+  }
+  // Resolve each videoId → direct mp4 via the Render proxy. Sequential
+  // (not Promise.all) because Decodo per-request residential IP costs
+  // money and the source ladder usually only needs 1-3 candidates total.
+  // Bail as soon as we have N.
+  const out = [];
+  for (const item of items) {
+    if (out.length >= n) break;
+    const videoId = item.id?.videoId;
+    if (!videoId) continue;
+    let clipUrl;
+    try { clipUrl = await youtubeFetchClipUrl(videoId); }
+    catch (e) { console.warn(`[youtube] clip-url fetch threw for ${videoId}: ${e.message}`); continue; }
+    if (clipUrl) out.push(clipUrl);
+  }
+  if (out.length) console.log(`[youtube] ${out.length}/${items.length} clips minted for "${q.slice(0, 60)}"`);
+  return out;
+}
+
+// Phase 21 Fix 3: companion to youtubeSearchTop. Calls the Render
+// proxy's /youtube/clip-url endpoint, which runs yt-dlp (--get-url)
+// behind a residential proxy to extract a direct mp4 progressive
+// download URL for a given videoId. Returns null on any failure —
+// caller skips and tries the next video.
+async function youtubeFetchClipUrl(videoId) {
+  if (!videoId) return null;
+  let resp;
+  try {
+    resp = await fetchWithRetry(
+      `${RENDER_PROXY_URL}/youtube/clip-url`,
+      {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({videoId, maxDuration: 240}),
+      },
+      {timeoutMs: 30000, maxAttempts: 2, label: 'youtube-clip-url'},
+    );
+  } catch (e) {
+    console.warn(`[youtube] clip-url proxy threw for ${videoId}: ${e.message}`);
+    return null;
+  }
+  if (!resp.ok) {
+    console.warn(`[youtube] clip-url proxy HTTP ${resp.status} for ${videoId}`);
+    return null;
+  }
+  let data;
+  try { data = await resp.json(); }
+  catch (e) { console.warn(`[youtube] clip-url JSON parse threw for ${videoId}: ${e.message}`); return null; }
+  if (!data?.url || typeof data.url !== 'string') return null;
+  return data.url;
+}
+
+// ─── Phase 21 Fix 4: Pexels Photos / Pixabay Photos / Unsplash ──────
+// Image-shaped fallbacks for when video sources miss. Pexels has 1M+
+// free photos; Pixabay 2M+; Unsplash 3M+ — all CC0 / royalty-free for
+// commercial use. Pulled in after the video chain returns empty so a
+// missed Pexels/Pixabay video query still produces relevant imagery
+// (Ken Burns + still photo > black frame).
+async function pexelsPhotoSearchTop(query, n = 3) {
+  if (!process.env.PEXELS_API_KEY) return [];
+  const url = new URL('https://api.pexels.com/v1/search');
+  url.searchParams.set('query', query);
+  url.searchParams.set('per_page', '15');
+  url.searchParams.set('orientation', 'landscape');
+  url.searchParams.set('size', 'large');
+  let resp;
+  try { resp = await fetchWithRetry(url, {headers: {Authorization: process.env.PEXELS_API_KEY}}, {timeoutMs: 8000, maxAttempts: 3, label: 'pexels-photo'}); }
+  catch (e) { console.warn(`[pexels-photo] threw for "${query}": ${e.message}`); return []; }
+  if (!resp.ok) {
+    console.warn(`[pexels-photo] HTTP ${resp.status} for "${query}"`);
+    return [];
+  }
+  const data = await resp.json();
+  const out = [];
+  for (const photo of (data.photos || [])) {
+    // Pexels src dict: original, large2x, large, medium, small, portrait,
+    // landscape, tiny. Prefer large2x (≈ 1880px wide) then large.
+    const pick = photo.src?.large2x || photo.src?.large || photo.src?.original;
+    if (pick) out.push(pick);
+    if (out.length >= n) break;
+  }
+  if (out.length) console.log(`[pexels-photo] ${out.length} hits for "${query.slice(0, 60)}"`);
+  return out;
+}
+
+async function pixabayPhotoSearchTop(query, n = 3) {
+  if (!process.env.PIXABAY_API_KEY) return [];
+  const url = new URL('https://pixabay.com/api/');
+  url.searchParams.set('key', process.env.PIXABAY_API_KEY);
+  url.searchParams.set('q', query);
+  url.searchParams.set('image_type', 'photo');
+  url.searchParams.set('orientation', 'horizontal');
+  url.searchParams.set('safesearch', 'true');
+  url.searchParams.set('per_page', '15');
+  let resp;
+  try { resp = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 3, label: 'pixabay-photo'}); }
+  catch (e) { console.warn(`[pixabay-photo] threw for "${query}": ${e.message}`); return []; }
+  if (!resp.ok) {
+    console.warn(`[pixabay-photo] HTTP ${resp.status} for "${query}"`);
+    return [];
+  }
+  const data = await resp.json();
+  const out = [];
+  for (const hit of (data.hits || [])) {
+    // Pixabay photo URLs: largeImageURL (1280px+), webformatURL (640px).
+    // largeImageURL requires API attribution but is the only one with
+    // commercial-quality resolution.
+    const pick = hit.largeImageURL || hit.webformatURL;
+    if (pick) out.push(pick);
+    if (out.length >= n) break;
+  }
+  if (out.length) console.log(`[pixabay-photo] ${out.length} hits for "${query.slice(0, 60)}"`);
+  return out;
+}
+
+async function unsplashSearchTop(query, n = 3) {
+  if (!process.env.UNSPLASH_ACCESS_KEY) return [];
+  const url = new URL('https://api.unsplash.com/search/photos');
+  url.searchParams.set('query', query);
+  url.searchParams.set('per_page', '15');
+  url.searchParams.set('orientation', 'landscape');
+  url.searchParams.set('content_filter', 'high');
+  let resp;
+  try {
+    resp = await fetchWithRetry(
+      url,
+      {headers: {Authorization: `Client-ID ${process.env.UNSPLASH_ACCESS_KEY}`}},
+      {timeoutMs: 8000, maxAttempts: 3, label: 'unsplash'},
+    );
+  } catch (e) { console.warn(`[unsplash] threw for "${query}": ${e.message}`); return []; }
+  if (!resp.ok) {
+    console.warn(`[unsplash] HTTP ${resp.status} for "${query}"`);
+    return [];
+  }
+  const data = await resp.json();
+  const out = [];
+  for (const photo of (data.results || [])) {
+    // urls.regular is ≈1080px wide, ample for 1920px-wide render with
+    // Ken Burns crop. urls.full is original (often 4K+) — too big for
+    // Lambda /tmp on a 60-scene render.
+    const pick = photo.urls?.regular || photo.urls?.small;
+    if (pick) out.push(pick);
+    if (out.length >= n) break;
+  }
+  if (out.length) console.log(`[unsplash] ${out.length} hits for "${query.slice(0, 60)}"`);
+  return out;
+}
+
 // Day-14 Phase 4 (tweak): fal.ai Nano Banana 2 for ai_generated scenes.
 // Upgraded from original Nano Banana ($0.039) → Nano Banana 2 ($0.08) for
 // higher quality + native 16:9 aspect ratio (matches YouTube widescreen
@@ -3641,7 +3893,19 @@ async function archiveSearchTop(query, n = 3) {
 async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = null) {
   // Read channel's footageSources toggles from settings doc, default
   // to the broad set if missing. Same pattern as musicSettings.
-  const fallback = {pexels: true, pixabay: true, wikimedia: true, archive: false};
+  // Phase 21 Fix 3/4: youtube, pexelsPhoto, pixabayPhoto, unsplash
+  // default ON — gracefully no-op when their keys are unbound, so
+  // existing channels without these flags still get the wider net.
+  const fallback = {
+    pexels: true,
+    pixabay: true,
+    wikimedia: true,
+    archive: false,
+    youtube: true,
+    pexelsPhoto: true,
+    pixabayPhoto: true,
+    unsplash: true,
+  };
   let cfg = fallback;
   if (channelId) {
     try {
@@ -3701,17 +3965,44 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
         return {urls: archiveUrls, source: 'archive-org-video', sourceCounts};
       }
     }
-    console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image + wikimedia-video + archive-org-video all empty, falling through to stock ladder`);
+    // Phase 21 Fix 4: before falling all the way through to the
+    // video ladder, try the photo APIs — for archival_photo a high-
+    // quality stock photo (Ken Burns) is a much better visual than
+    // a generic Pexels b-roll clip.
+    const photoSources = [
+      cfg.unsplash && {name: 'unsplash', fn: unsplashSearchTop},
+      cfg.pexelsPhoto && {name: 'pexels-photo', fn: pexelsPhotoSearchTop},
+      cfg.pixabayPhoto && {name: 'pixabay-photo', fn: pixabayPhotoSearchTop},
+    ].filter(Boolean);
+    for (const src of photoSources) {
+      let urls;
+      try { urls = await src.fn(query, n); }
+      catch (e) { console.warn(`[footage] ${src.name} threw for "${query}": ${e.message}`); continue; }
+      if (!urls || urls.length === 0) continue;
+      const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, [src.name]: urls.length};
+      console.log(`[source-ladder] archival_photo "${query}" → ${src.name} (${urls.length} candidates, archival chain empty)`);
+      return {urls, source: src.name, sourceCounts};
+    }
+    console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image + wikimedia-video + archive-org-video + photo APIs all empty, falling through to stock ladder`);
   }
 
+  // Phase 21 Fix 3/4: video-first ladder, then YouTube CC clips, then
+  // photo fallbacks (better-than-nothing imagery via Ken Burns when no
+  // video matches at all). YouTube sits after Pexels/Pixabay because
+  // it's the slowest source (per-video yt-dlp round-trip through the
+  // Render proxy) and the cheapest sources should drain first.
   const order = [
     cfg.pexels && {name: 'pexels', fn: pexelsSearchTop},
     cfg.pixabay && {name: 'pixabay', fn: pixabaySearchTop},
+    cfg.youtube && {name: 'youtube', fn: youtubeSearchTop},
     cfg.wikimedia && {name: 'wikimedia', fn: wikimediaSearchTop},
     cfg.archive && {name: 'archive', fn: archiveSearchTop},
+    cfg.unsplash && {name: 'unsplash', fn: unsplashSearchTop},
+    cfg.pexelsPhoto && {name: 'pexels-photo', fn: pexelsPhotoSearchTop},
+    cfg.pixabayPhoto && {name: 'pixabay-photo', fn: pixabayPhotoSearchTop},
   ].filter(Boolean);
 
-  const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0};
+  const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, youtube: 0, unsplash: 0, 'pexels-photo': 0, 'pixabay-photo': 0};
   for (const src of order) {
     let urls;
     try { urls = await src.fn(query, n); }
@@ -5403,7 +5694,7 @@ Phase 16I template guidance: aim for ~20-25% of scenes to use code-rendered temp
 
 Rules — pick the BEST type for EACH specific scene, NOT a default:
 
-- archival_photo (free, NO CAP — use liberally): ANY mention of a historic event, historic figure, or pre-2010 era. Examples: "FDR's New Deal", "2008 Lehman collapse", "1929 crash", "Cold War", "dot-com bubble", "Volcker era", "Carter administration", "Reagan tax cuts". When a scene references the PAST in any way, this is the right choice.
+- archival_photo (free, NO CAP — but STRICT eligibility): ONLY for PRE-2000 historic events, figures, or eras where Library of Congress / Wikimedia Commons / Internet Archive actually have catalogued material. Examples that qualify: "1929 crash", "FDR's New Deal", "Bretton Woods 1944", "Volcker Fed era 1979-87", "1973 oil shock", "1987 Black Monday", "gold standard", "Glass-Steagall", "Reagan tax cuts 1981". Examples that DO NOT qualify (use stock_footage / ai_generated / map / templates instead): "2008 Lehman" (modern enough that wires + stock have it — but borderline OK if pre-2010 archival is clearly available), any post-2000 event ("Trump tariffs", "2020 pandemic", "ChatGPT launch", "2024 election", "Powell rate hikes 2022", "FTX collapse", "SVB"). Heuristic: if the year mentioned is ≥ 2000, do NOT pick archival_photo — the archival sources almost always return 0 for modern queries. Pick stock_footage, ai_generated, map, or a code-rendered template instead.
 
 - ai_generated (BUDGET-CAPPED at $1/video ≈ 12 images, HARD LIMIT 25% of scenes): use liberally for ABSTRACT concepts, METAPHORS, FUTURE projections, HYPOTHETICAL scenarios, EMOTIONAL/conceptual moments. Examples: "the system collapsing", "shadow economy", "monetary tide", "policy machine", "the cycle repeating", "what if the dollar fell", "imagine a world without", "the looming crisis", "a generation's wealth evaporating". When a scene describes a CONCEPT rather than a physical thing, this is the right choice. Within the 25% cap, prefer ai_generated over stock for these.
 
@@ -5488,6 +5779,114 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
 // Gemini full-script awareness so it can plan visuals that reference
 // past/future scenes (callbacks, payoffs, contrast). Returns the same
 // shape as buildScenePlan; caller can swap providers freely.
+// Phase 21 Fix 2: one Gemini POST attempt with retry. Used by
+// buildScenePlanGemini either single-pass or per-batch. Returns the
+// parsed scene array (length === batch.length on success) or [] on
+// exhaust/parse failure. Logs every attempt with batch label.
+async function _geminiScenePlanPass(batchInputs, extraContext, geminiKey, batchLabel) {
+  const prompt = buildScenePlanPrompt(batchInputs, extraContext);
+  const body = {
+    contents: [{role: 'user', parts: [{text: prompt}]}],
+    generationConfig: {
+      temperature: 0.4,
+      responseMimeType: 'application/json',
+      maxOutputTokens: 65536,
+      thinkingConfig: {thinkingBudget: 0},
+    },
+  };
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`;
+  const RETRY_STATUS = new Set([429, 500, 502, 503, 504]);
+  const BACKOFFS_MS = [2000, 5000, 12000];
+  const MAX_ATTEMPTS = 3;
+  let lastErrDesc = null;
+  const passT0 = Date.now();
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const apiT0 = Date.now();
+    if (attempt === 1) {
+      console.log(`[scene-plan/gemini]${batchLabel} starting (scenes=${batchInputs.length}, attempts=${MAX_ATTEMPTS}, promptChars=${prompt.length})`);
+    }
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+    } catch (e) {
+      const apiMs = Date.now() - apiT0;
+      const isTransient = e.name === 'AbortError' || /fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(e.message || '');
+      lastErrDesc = `fetch threw "${e.message}" after ${apiMs}ms`;
+      if (!isTransient || attempt >= MAX_ATTEMPTS) {
+        console.warn(`[scene-plan/gemini]${batchLabel} EXHAUSTED ${attempt} attempt(s), fallback to Claude. Last error: ${lastErrDesc}`);
+        return [];
+      }
+      const waitMs = BACKOFFS_MS[attempt - 1] + Math.floor(Math.random() * 500);
+      console.warn(`[scene-plan/gemini]${batchLabel} attempt ${attempt + 1}/${MAX_ATTEMPTS} after fetch error "${e.message}" (waited ${(waitMs / 1000).toFixed(1)}s)`);
+      await sleep(waitMs);
+      continue;
+    }
+    const apiMs = Date.now() - apiT0;
+    if (!resp.ok) {
+      const text = await resp.text();
+      const truncBody = text.slice(0, 300);
+      lastErrDesc = `HTTP ${resp.status} ${resp.statusText} — ${truncBody}`;
+      if (!RETRY_STATUS.has(resp.status) || attempt >= MAX_ATTEMPTS) {
+        console.warn(`[scene-plan/gemini]${batchLabel} EXHAUSTED ${attempt} attempt(s), fallback to Claude. Last error: ${lastErrDesc}`);
+        return [];
+      }
+      let waitMs = BACKOFFS_MS[attempt - 1];
+      const ra = resp.headers.get('retry-after');
+      if (ra) {
+        const raSec = parseInt(ra, 10);
+        if (!Number.isNaN(raSec) && raSec > 0) waitMs = Math.min(raSec * 1000, 30_000);
+        else {
+          const raDate = Date.parse(ra);
+          if (!Number.isNaN(raDate)) waitMs = Math.min(Math.max(raDate - Date.now(), 0), 30_000);
+        }
+      }
+      waitMs += Math.floor(Math.random() * 500);
+      console.warn(`[scene-plan/gemini]${batchLabel} attempt ${attempt + 1}/${MAX_ATTEMPTS} after HTTP-${resp.status} (waited ${(waitMs / 1000).toFixed(1)}s)`);
+      await sleep(waitMs);
+      continue;
+    }
+    // 2xx — parse
+    const data = await resp.json();
+    const usage = data?.usageMetadata;
+    if (usage) console.log(`[scene-plan/gemini]${batchLabel} response in ${apiMs}ms — usage: prompt=${usage.promptTokenCount} response=${usage.candidatesTokenCount} total=${usage.totalTokenCount}`);
+    const finishReason = data?.candidates?.[0]?.finishReason;
+    if (finishReason && finishReason !== 'STOP') {
+      console.warn(`[scene-plan/gemini]${batchLabel} EXHAUSTED ${attempt} attempt(s), fallback to Claude. Last error: non-STOP finishReason="${finishReason}"`);
+      return [];
+    }
+    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!raw) {
+      console.warn(`[scene-plan/gemini]${batchLabel} EXHAUSTED ${attempt} attempt(s), fallback to Claude. Last error: empty response`);
+      return [];
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(sanitizeJSON(raw));
+    } catch (e) {
+      console.warn(`[scene-plan/gemini]${batchLabel} EXHAUSTED ${attempt} attempt(s), fallback to Claude. Last error: JSON parse failed (${e.message})`);
+      return [];
+    }
+    if (!Array.isArray(parsed)) {
+      console.warn(`[scene-plan/gemini]${batchLabel} EXHAUSTED ${attempt} attempt(s), fallback to Claude. Last error: non-array response (got ${typeof parsed})`);
+      return [];
+    }
+    const totalMs = Date.now() - passT0;
+    console.log(`[scene-plan/gemini]${batchLabel} SUCCESS attempt ${attempt}/${MAX_ATTEMPTS} → parsed ${parsed.length} scenes in ${totalMs}ms`);
+    return parsed;
+  }
+  return [];
+}
+
+// Phase 19 Fix 8: Gemini scene-plan path. Phase 21 Fix 2: scene-batching
+// for scripts > 60 scenes (50-scene chunks via Promise.all). Same shared
+// helpers, plus the full voiceover transcript appended as extraContext —
+// gives Gemini full-script awareness so it can plan visuals that
+// reference past/future scenes. Returns the same shape as buildScenePlan;
+// caller can swap providers freely.
 async function buildScenePlanGemini(rawBeats, captions, geminiKey, voiceoverDurationSec) {
   if (!geminiKey) {
     console.warn('[scene-plan/gemini] GEMINI_API_KEY not set — returning []');
@@ -5509,67 +5908,36 @@ async function buildScenePlanGemini(rawBeats, captions, geminiKey, voiceoverDura
     ? `Full voiceover transcript (use to spot callbacks, payoffs, or scene-to-scene contrast):\n${transcriptLines}\n\n`
     : '';
 
-  const prompt = buildScenePlanPrompt(sceneInputs, extraContext);
   const t0 = Date.now();
-  // Phase 19 Fix 8b: gemini-2.5-flash burns its output budget on internal
-  // thinking by default — observed: 31K of 32K maxOutputTokens went to
-  // reasoning, leaving 1.3K for the JSON answer → finishReason=MAX_TOKENS
-  // on a 112-scene script. Scene-plan is a structured-output task, not a
-  // reasoning task, so we disable thinking (thinkingBudget: 0) AND raise
-  // the output ceiling to 65536 to leave room for ~280-scene scripts.
-  const body = {
-    contents: [{role: 'user', parts: [{text: prompt}]}],
-    generationConfig: {
-      temperature: 0.4,
-      responseMimeType: 'application/json',
-      maxOutputTokens: 65536,
-      thinkingConfig: {thinkingBudget: 0},
-    },
-  };
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(geminiKey)}`;
   let enriched = [];
-  try {
-    const apiT0 = Date.now();
-    console.log(`[scene-plan/gemini] POST → ${GEMINI_MODEL} (scenes=${sceneInputs.length}, promptChars=${prompt.length})`);
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body),
-    });
-    const apiMs = Date.now() - apiT0;
-    if (!resp.ok) {
-      const text = await resp.text();
-      console.warn(`[scene-plan/gemini] HTTP ${resp.status} ${resp.statusText} after ${apiMs}ms — body: ${text.slice(0, 500)}`);
+  const BATCH_THRESHOLD = 60;
+  const BATCH_SIZE = 50;
+  if (sceneInputs.length > BATCH_THRESHOLD) {
+    const batchCount = Math.ceil(sceneInputs.length / BATCH_SIZE);
+    console.log(`[scene-plan/gemini] batching ${sceneInputs.length} scenes into ${batchCount} batches of ≤${BATCH_SIZE}`);
+    const batches = [];
+    for (let i = 0; i < sceneInputs.length; i += BATCH_SIZE) {
+      batches.push(sceneInputs.slice(i, i + BATCH_SIZE));
+    }
+    const results = await Promise.all(batches.map((batch, idx) =>
+      _geminiScenePlanPass(batch, extraContext, geminiKey, ` [batch ${idx + 1}/${batchCount}]`),
+    ));
+    // Any failed batch aborts — return [] so caller falls back to Claude
+    // for the whole script. (Mixing partial Gemini + partial Claude in
+    // one render gets messy with style consistency.)
+    if (results.some((r) => r.length === 0)) {
+      console.warn(`[scene-plan/gemini] one or more batches failed — falling back to Claude for whole script`);
       return [];
     }
-    const data = await resp.json();
-    const usage = data?.usageMetadata;
-    if (usage) console.log(`[scene-plan/gemini] response in ${apiMs}ms — usage: prompt=${usage.promptTokenCount} response=${usage.candidatesTokenCount} total=${usage.totalTokenCount}`);
-    const finishReason = data?.candidates?.[0]?.finishReason;
-    if (finishReason && finishReason !== 'STOP') {
-      console.warn(`[scene-plan/gemini] non-STOP finishReason="${finishReason}" — returning []`);
+    // Merge in batch order — sceneInputs order is preserved by construction
+    enriched = results.flat();
+    if (enriched.length !== sceneInputs.length) {
+      console.warn(`[scene-plan/gemini] merged length ${enriched.length} ≠ expected ${sceneInputs.length} — falling back to Claude`);
       return [];
     }
-    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!raw) {
-      console.warn(`[scene-plan/gemini] empty response — full response: ${JSON.stringify(data).slice(0, 500)}`);
-      return [];
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(sanitizeJSON(raw));
-    } catch (e) {
-      console.warn(`[scene-plan/gemini] JSON parse failed: ${e.message} — body: ${raw.slice(0, 300)}`);
-      return [];
-    }
-    if (!Array.isArray(parsed)) {
-      console.warn(`[scene-plan/gemini] response is not an array (got ${typeof parsed})`);
-      return [];
-    }
-    enriched = parsed;
-  } catch (e) {
-    console.warn(`[scene-plan/gemini] EXCEPTION: ${e.message}`);
-    return [];
+  } else {
+    enriched = await _geminiScenePlanPass(sceneInputs, extraContext, geminiKey, '');
+    if (enriched.length === 0) return [];
   }
   return assembleScenePlan(rawBeats, scenes, sceneInputs, enriched, t0, 'gemini');
 }
@@ -6132,24 +6500,23 @@ async function finalizeScenePlanWithAvailability(scenes, aiImageBudget) {
     for (const {scene, loc, wiki, archive} of probes) {
       if (loc === 0 && wiki === 0 && archive === 0) {
         scene._originalAssetType = scene._originalAssetType || scene.assetType;
-        // Check if AI budget has room: spent + 0.08 ≤ cap, AND we haven't
-        // already pre-allocated all 12 images.
+        // Phase 21 Fix 1: first try AI with a vintage-photograph prefix so
+        // the upgrade still feels archival; last resort stock. Same budget
+        // gating as before (skip AI if budget exhausted).
         const usedSoFar = aiCandidates.filter((c) => c.scene.assetType === 'ai_generated').length;
         const hasAiBudget = usedSoFar < aiCapImages && aiImageBudget && (aiImageBudget.spent + 0.08) <= aiImageBudget.capUsd;
-        if (hasAiBudget && scene.aiPrompt) {
-          // Already has aiPrompt → upgrade in place
+        const VINTAGE_PREFIX = 'vintage photograph, black and white, archival style: ';
+        if (hasAiBudget) {
           scene.assetType = 'ai_generated';
+          const base = scene.aiPrompt || `Editorial scene: ${scene.visualConcept || (scene.searchKeywords || []).join(' ')}`;
+          // Avoid double-prefixing on repeat passes.
+          scene.aiPrompt = base.toLowerCase().startsWith('vintage photograph') ? base : VINTAGE_PREFIX + base;
           archivalUpgradedToAi++;
-        } else if (hasAiBudget) {
-          // No aiPrompt yet — synthesize a minimal one from the visual
-          // concept; the AI handler will style + sanitize it.
-          scene.assetType = 'ai_generated';
-          scene.aiPrompt = `Photorealistic editorial scene: ${scene.visualConcept || (scene.searchKeywords || []).join(' ')}`;
-          archivalUpgradedToAi++;
+          console.log(`[probe] archival miss → AI (vintage style) for scene ${scene.index}: "${(scene.visualConcept || '').slice(0, 60)}"`);
         } else {
-          // AI budget already full → must use stock
           scene.assetType = 'stock_footage';
           archivalDowngradedToStock++;
+          console.log(`[probe] archival miss → stock (AI budget full) for scene ${scene.index}: "${(scene.visualConcept || '').slice(0, 60)}"`);
         }
       }
     }
@@ -11789,6 +12156,9 @@ exports.processEditingJobHttp = onRequest(
       LOGO_DEV_API_KEY,
       FAL_AI_API_KEY,
       MAPBOX_ACCESS_TOKEN,
+      YOUTUBE_API_KEY,
+      PIXABAY_API_KEY,
+      UNSPLASH_ACCESS_KEY,
     ],
   },
   async (req, res) => {
