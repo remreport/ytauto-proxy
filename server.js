@@ -1922,6 +1922,77 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // POST /youtube/clip-url  body: { videoId, maxDuration? }
+  // Returns: { url } — a direct mp4 progressive download URL extracted
+  // via yt-dlp behind the Decodo residential proxy (same plumbing as
+  // fetchCaptionsViaYtdlp). Used by the Cloud Function's source ladder
+  // (functions/index.js → youtubeFetchClipUrl) to convert a YouTube
+  // videoId into a fetchable mp4 URL that Lambda can pull.
+  //
+  // Format selector: progressive mp4 (audio+video in one file), <=720p,
+  // duration <= maxDuration. Progressive prevents needing to mux on the
+  // render side. The duration filter rejects clips longer than the
+  // beat slot will use.
+  if (req.method === 'POST' && pathname === '/youtube/clip-url') {
+    try {
+      const body = await readBody(req);
+      const { videoId, maxDuration } = JSON.parse(body);
+      if (!videoId || typeof videoId !== 'string') {
+        return sendJSON(res, 400, { error: 'videoId required' });
+      }
+      if (!YT_DLP_PATH) {
+        return sendJSON(res, 500, { error: 'yt-dlp not available on host' });
+      }
+      const maxDur = Math.max(10, Math.min(600, parseInt(maxDuration, 10) || 240));
+      const url = `https://www.youtube.com/watch?v=${videoId}`;
+
+      const fmt = `best[ext=mp4][height<=720][protocol^=http][acodec!=none][vcodec!=none][duration<=${maxDur}]/best[ext=mp4][height<=720][protocol^=http][duration<=${maxDur}]/best[ext=mp4][duration<=${maxDur}]`;
+
+      const args = [
+        '--get-url',
+        '-f', fmt,
+        '--no-warnings',
+        '--no-playlist',
+        '--no-progress',
+        '--socket-timeout', '20',
+        '--retries', '2',
+      ];
+      if (process.env.DECODO_USER && process.env.DECODO_PASS && process.env.DECODO_ENDPOINT) {
+        const u = encodeURIComponent(process.env.DECODO_USER);
+        const p = encodeURIComponent(process.env.DECODO_PASS);
+        args.push('--proxy', `http://${u}:${p}@${process.env.DECODO_ENDPOINT}`);
+      }
+      args.push(url);
+
+      const result = await new Promise((resolve) => {
+        const proc = spawn(YT_DLP_PATH, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '';
+        let stderr = '';
+        proc.stdout.on('data', (c) => { stdout += c.toString(); });
+        proc.stderr.on('data', (c) => { stderr += c.toString(); });
+        const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 25000);
+        proc.on('close', (code) => {
+          clearTimeout(timer);
+          resolve({ code, stdout, stderr });
+        });
+      });
+
+      if (result.code !== 0) {
+        const firstErr = (result.stderr || '').split('\n')[0].slice(0, 200);
+        console.warn(`[clip-url] ${videoId} exit=${result.code}: ${firstErr}`);
+        return sendJSON(res, 404, { error: 'no playable format', detail: firstErr });
+      }
+      const directUrl = (result.stdout || '').trim().split('\n')[0];
+      if (!directUrl || !/^https?:\/\//.test(directUrl)) {
+        return sendJSON(res, 404, { error: 'yt-dlp returned no URL' });
+      }
+      return sendJSON(res, 200, { url: directUrl });
+    } catch (e) {
+      console.error('[clip-url] error:', e.message);
+      return sendJSON(res, 500, { error: e.message || 'clip-url failed' });
+    }
+  }
+
   // ── Everything else requires POST with body ───────────────────
   if (req.method !== 'POST') {
     return sendText(res, 404, 'Not found');
