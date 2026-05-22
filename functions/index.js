@@ -3051,7 +3051,7 @@ async function pexelsSearchTop(query, n = 3) {
     const files = (video.video_files || []).filter((f) => f.file_type === 'video/mp4');
     if (!files.length) continue;
     files.sort((a, b) => Math.abs((a.height || 0) - 1080) - Math.abs((b.height || 0) - 1080));
-    out.push(files[0].link);
+    out.push({url: files[0].link, creator: video.user?.name || null});
     if (out.length >= n) break;
   }
   return out;
@@ -3079,7 +3079,7 @@ async function pixabaySearchTop(query, n = 3) {
     // Prefer 1080p (large) → 720p (medium) → 360p (small) — match the
     // resolution tier we want for our composition.
     const file = videos.large?.url || videos.medium?.url || videos.small?.url;
-    if (file) out.push(file);
+    if (file) out.push({url: file, creator: hit.user || null});
     if (out.length >= n) break;
   }
   return out;
@@ -3109,7 +3109,7 @@ async function wikimediaImageSearchTop(query, n = 3) {
   url.searchParams.set('prop', 'imageinfo');
   // extmetadata gives us LicenseShortName + Restrictions for filtering.
   url.searchParams.set('iiprop', 'url|mime|size|extmetadata');
-  url.searchParams.set('iiextmetadatafilter', 'LicenseShortName|Restrictions');
+  url.searchParams.set('iiextmetadatafilter', 'LicenseShortName|Restrictions|Artist');
   url.searchParams.set('origin', '*');
   let resp;
   try { resp = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 3, label: 'wikimedia-image'}); }
@@ -3139,10 +3139,19 @@ async function wikimediaImageSearchTop(query, n = 3) {
     // Some images are huge SVG/large bitmaps. Skip >25MB to keep Lambda
     // download budget reasonable.
     if (info.size && info.size > 25 * 1024 * 1024) continue;
-    out.push(info.url);
+    out.push({url: info.url, creator: stripWikimediaArtist(info.extmetadata?.Artist?.value)});
     if (out.length >= n) break;
   }
   return out;
+}
+
+// Wikimedia's Artist extmetadata field is HTML (e.g. `<a href="...">User:Foo</a>`
+// or `<bdi>Foo Bar</bdi>`). Strip tags + collapse whitespace so we get
+// something readable for the on-screen attribution badge.
+function stripWikimediaArtist(html) {
+  if (!html || typeof html !== 'string') return null;
+  const text = html.replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
+  return text.length ? text.slice(0, 80) : null;
 }
 
 // Phase 16F: Library of Congress photos API. Free, no API key, USA-
@@ -3195,7 +3204,7 @@ async function locGovSearchTop(query, n = 3) {
     // last one (usually the highest-resolution variant).
     const pick = imgs[imgs.length - 1];
     if (!pick || typeof pick !== 'string') continue;
-    out.push(pick);
+    out.push({url: pick, creator: null});
   }
   if (out.length) console.log(`[loc-gov] ${out.length} hits for "${query.slice(0, 60)}"`);
   return out;
@@ -3220,7 +3229,7 @@ async function wikimediaVideoSearchTop(query, n = 3) {
   url.searchParams.set('gsrlimit', '15');
   url.searchParams.set('prop', 'imageinfo');
   url.searchParams.set('iiprop', 'url|mime|size|extmetadata');
-  url.searchParams.set('iiextmetadatafilter', 'LicenseShortName|Restrictions');
+  url.searchParams.set('iiextmetadatafilter', 'LicenseShortName|Restrictions|Artist');
   url.searchParams.set('origin', '*');
   let resp;
   try { resp = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 3, label: 'wikimedia-video'}); }
@@ -3246,7 +3255,7 @@ async function wikimediaVideoSearchTop(query, n = 3) {
     if (license && !allowedLicenseRe.test(String(license))) continue;
     // Size cap: 100 MB (Commons videos can be large; Lambda /tmp is 512 MB)
     if (info.size && info.size > 100 * 1024 * 1024) continue;
-    out.push(info.url);
+    out.push({url: info.url, creator: stripWikimediaArtist(info.extmetadata?.Artist?.value)});
     if (out.length >= n) break;
   }
   if (out.length) console.log(`[wikimedia-video] ${out.length} hits for "${query.slice(0, 60)}"`);
@@ -3315,7 +3324,7 @@ async function youtubeSearchTop(query, n = 3) {
     let clipUrl;
     try { clipUrl = await youtubeFetchClipUrl(videoId); }
     catch (e) { console.warn(`[youtube] clip-url fetch threw for ${videoId}: ${e.message}`); continue; }
-    if (clipUrl) out.push(clipUrl);
+    if (clipUrl) out.push({url: clipUrl, creator: item.snippet?.channelTitle || null});
   }
   if (out.length) console.log(`[youtube] ${out.length}/${items.length} clips minted for "${q.slice(0, 60)}"`);
   return out;
@@ -3380,7 +3389,7 @@ async function pexelsPhotoSearchTop(query, n = 3) {
     // Pexels src dict: original, large2x, large, medium, small, portrait,
     // landscape, tiny. Prefer large2x (≈ 1880px wide) then large.
     const pick = photo.src?.large2x || photo.src?.large || photo.src?.original;
-    if (pick) out.push(pick);
+    if (pick) out.push({url: pick, creator: photo.photographer || null});
     if (out.length >= n) break;
   }
   if (out.length) console.log(`[pexels-photo] ${out.length} hits for "${query.slice(0, 60)}"`);
@@ -3410,7 +3419,7 @@ async function pixabayPhotoSearchTop(query, n = 3) {
     // largeImageURL requires API attribution but is the only one with
     // commercial-quality resolution.
     const pick = hit.largeImageURL || hit.webformatURL;
-    if (pick) out.push(pick);
+    if (pick) out.push({url: pick, creator: hit.user || null});
     if (out.length >= n) break;
   }
   if (out.length) console.log(`[pixabay-photo] ${out.length} hits for "${query.slice(0, 60)}"`);
@@ -3443,7 +3452,7 @@ async function unsplashSearchTop(query, n = 3) {
     // Ken Burns crop. urls.full is original (often 4K+) — too big for
     // Lambda /tmp on a 60-scene render.
     const pick = photo.urls?.regular || photo.urls?.small;
-    if (pick) out.push(pick);
+    if (pick) out.push({url: pick, creator: photo.user?.name || null});
     if (out.length >= n) break;
   }
   if (out.length) console.log(`[unsplash] ${out.length} hits for "${query.slice(0, 60)}"`);
@@ -3763,7 +3772,8 @@ async function wikimediaSearchTop(query, n = 3) {
   url.searchParams.set('gsrnamespace', '6');
   url.searchParams.set('gsrlimit', '15');
   url.searchParams.set('prop', 'imageinfo');
-  url.searchParams.set('iiprop', 'url|mime|size');
+  url.searchParams.set('iiprop', 'url|mime|size|extmetadata');
+  url.searchParams.set('iiextmetadatafilter', 'Artist');
   url.searchParams.set('origin', '*');
   const resp = await fetch(url);
   if (!resp.ok) {
@@ -3781,7 +3791,7 @@ async function wikimediaSearchTop(query, n = 3) {
     // decode webm; ogv is hit-or-miss. Prefer mp4 when available, accept
     // webm. Skip ogv.
     if (/ogg|ogv/i.test(info.url)) continue;
-    out.push(info.url);
+    out.push({url: info.url, creator: stripWikimediaArtist(info.extmetadata?.Artist?.value)});
     if (out.length >= n) break;
   }
   return out;
@@ -3870,7 +3880,11 @@ async function archiveSearchTop(query, n = 3) {
           console.log(`[archive-org] skip ${d.identifier} — runtime ${lenSec}s > ${_ARCHIVE_MAX_RUNTIME_SEC}s cap`);
           continue;
         }
-        out.push(`https://archive.org/download/${d.identifier}/${encodeURIComponent(pick.name)}`);
+        const archiveCreator = Array.isArray(meta.metadata?.creator) ? meta.metadata.creator[0] : meta.metadata?.creator;
+        out.push({
+          url: `https://archive.org/download/${d.identifier}/${encodeURIComponent(pick.name)}`,
+          creator: typeof archiveCreator === 'string' && archiveCreator.length ? archiveCreator.slice(0, 80) : null,
+        });
       } catch (e) {
         console.warn(`[archive-org] metadata fetch threw for ${d.identifier}: ${e.message}`);
       }
@@ -3880,8 +3894,24 @@ async function archiveSearchTop(query, n = 3) {
   return [];
 }
 
+// Each search function now returns `[{url, creator}]`. This helper
+// splits a result into the legacy `urls` string-array shape that
+// downstream code (validators, blocklist, alternates) operates on,
+// plus a `creators` map so we can stamp footage[i].creator for the
+// SourceAttribution overlay (Phase 19 fix 6).
+function _splitUrlsAndCreators(results) {
+  const urls = [];
+  const creators = {};
+  for (const r of results || []) {
+    if (!r || !r.url) continue;
+    urls.push(r.url);
+    if (r.creator) creators[r.url] = r.creator;
+  }
+  return {urls, creators};
+}
+
 // Channel-aware footage source chain. Tries enabled sources in order
-// until N validated candidates land. Returns {urls, sourceCounts}.
+// until N validated candidates land. Returns {urls, sourceCounts, creators}.
 //
 // Default sources (when channel has no footageSources field):
 //   pexels: true, pixabay: true, wikimedia: true, archive: false.
@@ -3924,45 +3954,49 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
     // Phase 16F: LOC.gov first — US-focused PD archive, strongest for
     // US finance/political history. Cheap (no key, ~1s per call).
     if (cfg.locGov !== false) {
-      let locUrls;
-      try { locUrls = await locGovSearchTop(query, n); }
-      catch (e) { console.warn(`[footage] loc-gov threw for "${query}": ${e.message}`); locUrls = []; }
-      if (locUrls && locUrls.length) {
+      let locResults;
+      try { locResults = await locGovSearchTop(query, n); }
+      catch (e) { console.warn(`[footage] loc-gov threw for "${query}": ${e.message}`); locResults = []; }
+      if (locResults && locResults.length) {
+        const {urls: locUrls, creators} = _splitUrlsAndCreators(locResults);
         const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'loc-gov-image': locUrls.length};
         console.log(`[source-ladder] archival_photo "${query}" → loc-gov-image (${locUrls.length} candidates)`);
-        return {urls: locUrls, source: 'loc-gov-image', sourceCounts};
+        return {urls: locUrls, source: 'loc-gov-image', sourceCounts, creators};
       }
     }
-    let imageUrls;
-    try { imageUrls = await wikimediaImageSearchTop(query, n); }
-    catch (e) { console.warn(`[footage] wikimedia-image threw for "${query}": ${e.message}`); imageUrls = []; }
-    if (imageUrls && imageUrls.length) {
+    let imageResults;
+    try { imageResults = await wikimediaImageSearchTop(query, n); }
+    catch (e) { console.warn(`[footage] wikimedia-image threw for "${query}": ${e.message}`); imageResults = []; }
+    if (imageResults && imageResults.length) {
+      const {urls: imageUrls, creators} = _splitUrlsAndCreators(imageResults);
       const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'wikimedia-image': imageUrls.length};
       console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image (${imageUrls.length} candidates)`);
-      return {urls: imageUrls, source: 'wikimedia-image', sourceCounts};
+      return {urls: imageUrls, source: 'wikimedia-image', sourceCounts, creators};
     }
     // Phase 15c: Wikimedia image missed → try Wikimedia video (good
     // for modern Fed/Powell speeches, congressional hearings).
     if (cfg.wikimediaVideo !== false) {
-      let videoUrls;
-      try { videoUrls = await wikimediaVideoSearchTop(query, n); }
-      catch (e) { console.warn(`[footage] wikimedia-video threw for "${query}": ${e.message}`); videoUrls = []; }
-      if (videoUrls && videoUrls.length) {
+      let videoResults;
+      try { videoResults = await wikimediaVideoSearchTop(query, n); }
+      catch (e) { console.warn(`[footage] wikimedia-video threw for "${query}": ${e.message}`); videoResults = []; }
+      if (videoResults && videoResults.length) {
+        const {urls: videoUrls, creators} = _splitUrlsAndCreators(videoResults);
         const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'wikimedia-video': videoUrls.length};
         console.log(`[source-ladder] archival_photo "${query}" → wikimedia-video (${videoUrls.length} candidates, image empty)`);
-        return {urls: videoUrls, source: 'wikimedia-video', sourceCounts};
+        return {urls: videoUrls, source: 'wikimedia-video', sourceCounts, creators};
       }
     }
     // Phase 15b: Wikimedia (both image + video) missed → try Internet
     // Archive (Prelinger first, then general PD movies).
     if (cfg.archiveOrgVideo !== false) {
-      let archiveUrls;
-      try { archiveUrls = await archiveSearchTop(query, n); }
-      catch (e) { console.warn(`[footage] archive-org-video threw for "${query}": ${e.message}`); archiveUrls = []; }
-      if (archiveUrls && archiveUrls.length) {
+      let archiveResults;
+      try { archiveResults = await archiveSearchTop(query, n); }
+      catch (e) { console.warn(`[footage] archive-org-video threw for "${query}": ${e.message}`); archiveResults = []; }
+      if (archiveResults && archiveResults.length) {
+        const {urls: archiveUrls, creators} = _splitUrlsAndCreators(archiveResults);
         const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'archive-org-video': archiveUrls.length};
         console.log(`[source-ladder] archival_photo "${query}" → archive-org-video (${archiveUrls.length} candidates, Wikimedia empty)`);
-        return {urls: archiveUrls, source: 'archive-org-video', sourceCounts};
+        return {urls: archiveUrls, source: 'archive-org-video', sourceCounts, creators};
       }
     }
     // Phase 21 Fix 4: before falling all the way through to the
@@ -3975,13 +4009,14 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
       cfg.pixabayPhoto && {name: 'pixabay-photo', fn: pixabayPhotoSearchTop},
     ].filter(Boolean);
     for (const src of photoSources) {
-      let urls;
-      try { urls = await src.fn(query, n); }
+      let results;
+      try { results = await src.fn(query, n); }
       catch (e) { console.warn(`[footage] ${src.name} threw for "${query}": ${e.message}`); continue; }
-      if (!urls || urls.length === 0) continue;
+      if (!results || results.length === 0) continue;
+      const {urls, creators} = _splitUrlsAndCreators(results);
       const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, [src.name]: urls.length};
       console.log(`[source-ladder] archival_photo "${query}" → ${src.name} (${urls.length} candidates, archival chain empty)`);
-      return {urls, source: src.name, sourceCounts};
+      return {urls, source: src.name, sourceCounts, creators};
     }
     console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image + wikimedia-video + archive-org-video + photo APIs all empty, falling through to stock ladder`);
   }
@@ -4004,14 +4039,15 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
 
   const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, youtube: 0, unsplash: 0, 'pexels-photo': 0, 'pixabay-photo': 0};
   for (const src of order) {
-    let urls;
-    try { urls = await src.fn(query, n); }
+    let results;
+    try { results = await src.fn(query, n); }
     catch (e) { console.warn(`[footage] ${src.name} threw for "${query}": ${e.message}`); continue; }
-    if (!urls || urls.length === 0) continue;
+    if (!results || results.length === 0) continue;
+    const {urls, creators} = _splitUrlsAndCreators(results);
     sourceCounts[src.name] = urls.length;
-    return {urls, source: src.name, sourceCounts};
+    return {urls, source: src.name, sourceCounts, creators};
   }
-  return {urls: [], source: null, sourceCounts};
+  return {urls: [], source: null, sourceCounts, creators: {}};
 }
 
 // Validate a Pexels mp4 URL before committing it to render. Catches
@@ -6195,7 +6231,7 @@ async function handleStockChain(scene, ctx, assetTypeHint) {
     provenance.push({tried: 'stock-chain', ok: false, reason: 'no query'});
     return {url: null, source: null, provenance, pexelsAlternates: []};
   }
-  const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(ctx.channelId, query, 3, assetTypeHint);
+  const {urls: rawCandidates, source: pickedSource, creators = {}} = await searchAllFootageSources(ctx.channelId, query, 3, assetTypeHint);
   const candidates = rawCandidates.filter((c) => !ctx.blocklist.has(c));
   const validator = pickedSource === 'wikimedia-image' ? validateImageUrl : validatePexelsVideo;
   for (let ci = 0; ci < candidates.length; ci++) {
@@ -6206,7 +6242,7 @@ async function handleStockChain(scene, ctx, assetTypeHint) {
       ctx.usedStockUrls.add(cand);
       const alternates = candidates.slice(ci + 1).filter((c) => !ctx.usedStockUrls.has(c));
       provenance.push({tried: pickedSource, ok: true});
-      return {url: cand, source: pickedSource, provenance, pexelsAlternates: alternates};
+      return {url: cand, source: pickedSource, provenance, pexelsAlternates: alternates, creator: creators[cand] || null};
     }
   }
   provenance.push({tried: pickedSource || 'stock', ok: false, reason: `${candidates.length} candidates, none validated`});
@@ -6230,7 +6266,7 @@ async function handleGenericStock(scene, ctx) {
     'aerial city economic activity',
   ];
   for (const gq of GENERIC_QUERIES) {
-    const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(ctx.channelId, gq, 5, 'stock_footage');
+    const {urls: rawCandidates, source: pickedSource, creators = {}} = await searchAllFootageSources(ctx.channelId, gq, 5, 'stock_footage');
     const candidates = rawCandidates.filter((c) => !ctx.blocklist.has(c) && !ctx.usedStockUrls.has(c));
     for (const cand of candidates) {
       const v = await validatePexelsVideo(cand);
@@ -6243,7 +6279,7 @@ async function handleGenericStock(scene, ctx) {
       if (!reachable) continue;
       ctx.usedStockUrls.add(cand);
       provenance.push({tried: 'generic-stock', ok: true, reason: `query="${gq}"`});
-      return {url: cand, source: pickedSource, provenance, genericFallback: true};
+      return {url: cand, source: pickedSource, provenance, genericFallback: true, creator: creators[cand] || null};
     }
   }
   provenance.push({tried: 'generic-stock', ok: false, reason: '10 queries exhausted'});
@@ -6257,14 +6293,14 @@ async function handleArchivalFallback(scene, ctx) {
     ? scene.searchKeywords.join(' ')
     : 'financial history');
   try {
-    const {urls: rawCandidates} = await searchAllFootageSources(ctx.channelId, query, 3, 'archival_photo');
+    const {urls: rawCandidates, creators = {}} = await searchAllFootageSources(ctx.channelId, query, 3, 'archival_photo');
     for (const cand of rawCandidates) {
       if (ctx.blocklist.has(cand) || ctx.usedStockUrls.has(cand)) continue;
       const v = await validateImageUrl(cand);
       if (v.ok) {
         ctx.usedStockUrls.add(cand);
         provenance.push({tried: 'wikimedia-image-fallback', ok: true});
-        return {url: cand, source: 'wikimedia-image', provenance, genericFallback: true};
+        return {url: cand, source: 'wikimedia-image', provenance, genericFallback: true, creator: creators[cand] || null};
       }
     }
   } catch (e) {
@@ -6427,6 +6463,239 @@ async function _probeArchiveOrg(query) {
     const d = await r.json();
     return d.response?.numFound || 0;
   } catch { return 0; }
+}
+
+// Phase 1 pre-probe helpers. Hit each source's lightweight search endpoint
+// and return ONLY the result count — no URL extraction, no validation.
+// Caller decides what to do with the numbers (Phase 2+ will thread them
+// into the scene-plan prompt as availability hints; Phase 1 only logs).
+async function _probePexelsCount(query) {
+  if (!process.env.PEXELS_API_KEY) return 0;
+  const q = capQuery(query, 120);
+  if (!q) return 0;
+  try {
+    const url = new URL('https://api.pexels.com/videos/search');
+    url.searchParams.set('query', q);
+    url.searchParams.set('per_page', '1');
+    url.searchParams.set('orientation', 'landscape');
+    url.searchParams.set('size', 'large');
+    const r = await fetchWithRetry(
+      url,
+      {headers: {Authorization: process.env.PEXELS_API_KEY}},
+      {timeoutMs: 6000, maxAttempts: 2, label: 'pexels-probe'},
+    );
+    if (!r.ok) return 0;
+    const d = await r.json();
+    return typeof d.total_results === 'number' ? d.total_results : (Array.isArray(d.videos) ? d.videos.length : 0);
+  } catch { return 0; }
+}
+async function _probePixabayCount(query) {
+  if (!process.env.PIXABAY_API_KEY) return 0;
+  const q = capQuery(query, 120);
+  if (!q) return 0;
+  try {
+    const url = new URL('https://pixabay.com/api/videos/');
+    url.searchParams.set('key', process.env.PIXABAY_API_KEY);
+    url.searchParams.set('q', q);
+    url.searchParams.set('per_page', '3');
+    url.searchParams.set('safesearch', 'true');
+    const r = await fetchWithRetry(url, {}, {timeoutMs: 6000, maxAttempts: 2, label: 'pixabay-probe'});
+    if (!r.ok) return 0;
+    const d = await r.json();
+    return typeof d.totalHits === 'number' ? d.totalHits : (Array.isArray(d.hits) ? d.hits.length : 0);
+  } catch { return 0; }
+}
+// Mapbox geocoding probe — returns 1 if at least one feature matches the
+// place name, 0 otherwise. Mapbox geocoding is FREE for the first 100k
+// requests/month, so this is cheap to fire per location candidate.
+async function _probeMapboxGeocode(name) {
+  if (!process.env.MAPBOX_ACCESS_TOKEN) return 0;
+  const q = capQuery(name, 80);
+  if (!q) return 0;
+  try {
+    const url = new URL(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(q)}.json`);
+    url.searchParams.set('access_token', process.env.MAPBOX_ACCESS_TOKEN);
+    url.searchParams.set('limit', '1');
+    url.searchParams.set('types', 'country,region,place,locality,district');
+    const r = await fetchWithRetry(url, {}, {timeoutMs: 5000, maxAttempts: 2, label: 'mapbox-probe'});
+    if (!r.ok) return 0;
+    const d = await r.json();
+    return Array.isArray(d.features) && d.features.length > 0 ? 1 : 0;
+  } catch { return 0; }
+}
+
+// Quick heuristic: does this scene look like it mentions a real-world
+// place? Used to skip Mapbox probes for scenes that have nothing
+// place-like to geocode. Captialised multi-word phrases in voiceoverText
+// or any beat keyword hint that looks like a proper noun are enough to
+// trigger a probe — false positives waste one geocoding call but the
+// quota is huge, so favour recall over precision here.
+function shouldProbeMap(sceneInput) {
+  if (!sceneInput) return false;
+  const text = `${sceneInput.voiceoverText || ''} ${(sceneInput.beatKeywordHints || []).join(' ')}`;
+  if (!text.trim()) return false;
+  // Two or more consecutive capitalised words OR a single capitalised
+  // token that isn't sentence-initial (after lowercasing the first char
+  // of each sentence). Cheap regex — generous on recall.
+  const properNounRun = /\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+\b/;
+  if (properNounRun.test(text)) return true;
+  // Also catch lone city/country names in beat keyword hints (e.g.
+  // "Shanghai", "Berlin"). The hints don't carry sentence context, so
+  // any capitalised token there is a plausible place name.
+  for (const kw of (sceneInput.beatKeywordHints || [])) {
+    if (typeof kw === 'string' && /^[A-Z][a-zA-Z]+$/.test(kw.trim())) return true;
+  }
+  return false;
+}
+
+// Phase 1: pre-probe asset availability ACROSS ALL scenes before the
+// scene-plan LLM call. Runs LoC, Wikimedia, Archive.org, Pexels, Pixabay
+// in parallel for every scene's primary keyword query, plus Mapbox for
+// scenes that look place-shaped. In Phase 1 this runs in SHADOW MODE —
+// the result is logged and stashed in firestore but NOT threaded into
+// the scene-plan prompt yet (Phase 2 will do that). Output is byte-
+// identical to a pre-Phase-1 render.
+//
+// In-memory keyword→count cache resolves the "multiple scenes share
+// keywords" case: if scene 0 and scene 12 both have ["Wall Street"], we
+// probe each source ONCE for that string.
+//
+// Concurrency is bounded by MAX_PROBE_CONCURRENCY (25). Each scene
+// fires 5-6 probes; capping at 25 in-flight keeps us well under
+// per-source rate limits (Pexels: 200/hour; Pixabay: 100/min).
+const MAX_PROBE_CONCURRENCY = 25;
+async function preProbeSceneAvailability(sceneInputs, opts = {}) {
+  if (!Array.isArray(sceneInputs) || sceneInputs.length === 0) {
+    return {perScene: [], totals: {}, elapsedMs: 0, cacheHitRatio: 0};
+  }
+  const t0 = Date.now();
+
+  // Cache shape: Map<source, Map<query, count>>. One entry per source so
+  // the same query across sources doesn't collide. Sentinel value -1
+  // marks "probe in flight" — concurrent callers await the same promise
+  // instead of double-firing.
+  const cache = new Map();
+  for (const src of ['loc', 'wikimedia', 'archive', 'pexels', 'pixabay', 'mapbox']) cache.set(src, new Map());
+  let cacheHits = 0;
+  let cacheMisses = 0;
+
+  // Bounded concurrency runner: at most MAX_PROBE_CONCURRENCY probes
+  // in flight simultaneously across all scenes + sources.
+  let inFlight = 0;
+  const waitQueue = [];
+  const acquireSlot = () => {
+    if (inFlight < MAX_PROBE_CONCURRENCY) {
+      inFlight++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => waitQueue.push(resolve));
+  };
+  const releaseSlot = () => {
+    inFlight--;
+    if (waitQueue.length) {
+      inFlight++;
+      const next = waitQueue.shift();
+      next();
+    }
+  };
+
+  const cachedProbe = async (source, query, fn) => {
+    const key = (query || '').trim().toLowerCase();
+    if (!key) return 0;
+    const map = cache.get(source);
+    const existing = map.get(key);
+    if (existing !== undefined) {
+      // Either a finished number OR a pending promise — both are reusable.
+      cacheHits++;
+      return await existing;
+    }
+    cacheMisses++;
+    const p = (async () => {
+      await acquireSlot();
+      try {
+        return await fn(query);
+      } finally {
+        releaseSlot();
+      }
+    })();
+    map.set(key, p);
+    const result = await p;
+    map.set(key, result); // replace promise with concrete number
+    return result;
+  };
+
+  const perScene = await Promise.all(sceneInputs.map(async (sc) => {
+    // Primary query = first beat keyword hint, or the first 4 words of
+    // voiceoverText if no hints. Mirrors what assembleScenePlan would
+    // emit when the LLM doesn't supply its own keywords.
+    const primaryKw = (Array.isArray(sc.beatKeywordHints) && sc.beatKeywordHints[0])
+      ? String(sc.beatKeywordHints[0]).trim().slice(0, 60)
+      : String(sc.voiceoverText || '').split(/\s+/).slice(0, 4).join(' ');
+
+    // Fire 5 source probes in parallel; Mapbox conditional on shouldProbeMap.
+    const [loc, wiki, archive, pexels, pixabay] = await Promise.all([
+      cachedProbe('loc', primaryKw, _probeLocGov),
+      cachedProbe('wikimedia', primaryKw, _probeWikimediaImage),
+      cachedProbe('archive', primaryKw, _probeArchiveOrg),
+      cachedProbe('pexels', primaryKw, _probePexelsCount),
+      cachedProbe('pixabay', primaryKw, _probePixabayCount),
+    ]);
+    let mapbox = null;
+    if (shouldProbeMap(sc)) {
+      // Probe ALL multi-word capitalised phrases in the voiceoverText;
+      // take the max hit count. Falls back to the primary keyword if no
+      // phrase pattern matches (rare — properNounRun in shouldProbeMap
+      // would have returned false).
+      const candidates = [];
+      const text = sc.voiceoverText || '';
+      const re = /\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+\b/g;
+      let m;
+      while ((m = re.exec(text)) !== null) candidates.push(m[0]);
+      // Also probe any standalone capitalised beat keyword hint.
+      for (const kw of (sc.beatKeywordHints || [])) {
+        if (typeof kw === 'string' && /^[A-Z][a-zA-Z]+$/.test(kw.trim())) candidates.push(kw.trim());
+      }
+      if (candidates.length === 0) candidates.push(primaryKw);
+      const counts = await Promise.all(
+        candidates.slice(0, 4).map((c) => cachedProbe('mapbox', c, _probeMapboxGeocode)),
+      );
+      mapbox = counts.reduce((a, b) => Math.max(a, b), 0);
+    }
+    return {
+      index: sc.index,
+      primaryKw,
+      loc, wiki, archive, pexels, pixabay,
+      mapbox, // null if not probed (scene doesn't look place-shaped)
+    };
+  }));
+
+  // Aggregate counters for the [probe-pre] summary log.
+  const totals = {
+    locHits: 0, wikiHits: 0, archiveHits: 0, pexelsHits: 0, pixabayHits: 0, mapboxHits: 0,
+    archivalEligible: 0,   // scenes with at least one of LoC/Wikimedia/Archive > 0
+    stockEligible: 0,      // scenes with at least one of Pexels/Pixabay > 0
+    mapEligible: 0,        // scenes probed AND mapbox > 0
+    mapProbed: 0,          // scenes where shouldProbeMap returned true
+    allMiss: 0,            // scenes where every probed source returned 0
+  };
+  for (const r of perScene) {
+    if (r.loc > 0) totals.locHits++;
+    if (r.wiki > 0) totals.wikiHits++;
+    if (r.archive > 0) totals.archiveHits++;
+    if (r.pexels > 0) totals.pexelsHits++;
+    if (r.pixabay > 0) totals.pixabayHits++;
+    if (r.mapbox != null) totals.mapProbed++;
+    if (r.mapbox != null && r.mapbox > 0) totals.mapboxHits++;
+    if (r.loc > 0 || r.wiki > 0 || r.archive > 0) totals.archivalEligible++;
+    if (r.pexels > 0 || r.pixabay > 0) totals.stockEligible++;
+    if (r.mapbox != null && r.mapbox > 0) totals.mapEligible++;
+    if (r.loc === 0 && r.wiki === 0 && r.archive === 0 && r.pexels === 0 && r.pixabay === 0 && !(r.mapbox > 0)) {
+      totals.allMiss++;
+    }
+  }
+  const elapsedMs = Date.now() - t0;
+  const cacheHitRatio = (cacheHits + cacheMisses) > 0 ? +(cacheHits / (cacheHits + cacheMisses)).toFixed(3) : 0;
+  return {perScene, totals, elapsedMs, cacheHits, cacheMisses, cacheHitRatio};
 }
 
 async function finalizeScenePlanWithAvailability(scenes, aiImageBudget) {
@@ -6612,6 +6881,7 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
     let pexelsAlternates = [];
     const provenance = [];
     let genericFallbackUsed = false;
+    let creator = null; // Phase 19 fix 6: bottom-left attribution overlay
     // Phase 16I: code-rendered templates skip URL sourcing
     let templateType = null;
     let templateParams = null;
@@ -6622,6 +6892,7 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       source = primary.source;
       pexelsAlternates = primary.pexelsAlternates || [];
       provenance.push(...(primary.provenance || []));
+      if (primary.creator) creator = primary.creator;
       // Capture template metadata if handler returned it
       if (primary.templateType) {
         templateType = primary.templateType;
@@ -6640,6 +6911,7 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       source = generic.source;
       genericFallbackUsed = !!generic.genericFallback;
       provenance.push(...generic.provenance);
+      if (generic.creator) creator = generic.creator;
       if (url) console.log(`scene ${si + 1}: GENERIC fallback → ${url.split('/').pop().slice(0, 60)}`);
     }
 
@@ -6650,6 +6922,7 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       source = archFallback.source;
       if (url) genericFallbackUsed = true;
       provenance.push(...archFallback.provenance);
+      if (archFallback.creator) creator = archFallback.creator;
       if (url) console.log(`scene ${si + 1}: WIKIMEDIA-IMAGE fallback → ${url.split('/').pop().slice(0, 60)}`);
     }
 
@@ -6723,6 +6996,7 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       kenBurnsIntensity: heroMoment ? 'aggressive' : 'medium',
       source,
       url,
+      ...(creator ? {creator} : {}),
       pexelsAlternates,
       ...(aggregatedSfx.length ? {sfxRequested: aggregatedSfx} : {}),
       ...(aggregatedOverlays.length ? {overlays: aggregatedOverlays} : {}),
@@ -6903,6 +7177,46 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     const voiceoverDurForScenePlan = (captions && captions.length)
       ? Math.max(...captions.map((c) => c.end || 0))
       : 0;
+    // Phase 1: shadow-mode pre-probe. Runs LoC/Wikimedia/Archive/Pexels/
+    // Pixabay/Mapbox in parallel for every scene BEFORE the scene-plan
+    // LLM call. Result is logged + persisted but NOT threaded into the
+    // prompt yet (Phase 2 will). Behind ENABLE_SCENE_PRE_PROBE (default
+    // off) so we can ship the layer without changing any render output.
+    // prepareScenesForPlan is pure-ish (only side effect on rawBeats is
+    // idempotent `_extendedEnd` mutation), so calling it here for the
+    // probe AND again inside buildScenePlanGemini/buildScenePlan
+    // produces identical inputs to the LLM.
+    let scenePrePrebeStats = null;
+    if (process.env.ENABLE_SCENE_PRE_PROBE === 'true') {
+      try {
+        const probeT0 = Date.now();
+        const {sceneInputs: preProbeInputs} = prepareScenesForPlan(rawBeats, captions, voiceoverDurForScenePlan);
+        const probeResult = await preProbeSceneAvailability(preProbeInputs);
+        const totals = probeResult.totals || {};
+        console.log(`[probe-pre] ${preProbeInputs.length} scenes probed in ${probeResult.elapsedMs}ms — ` +
+          `archival-eligible=${totals.archivalEligible}, stock-eligible=${totals.stockEligible}, ` +
+          `map-probed=${totals.mapProbed} map-eligible=${totals.mapEligible}, all-miss=${totals.allMiss}; ` +
+          `hits: loc=${totals.locHits} wiki=${totals.wikiHits} archive=${totals.archiveHits} ` +
+          `pexels=${totals.pexelsHits} pixabay=${totals.pixabayHits} mapbox=${totals.mapboxHits}; ` +
+          `cache hit ratio=${probeResult.cacheHitRatio} (${probeResult.cacheHits}/${probeResult.cacheHits + probeResult.cacheMisses})`);
+        // Shadow mode: store but DO NOT pass into buildScenePlan*. Phase 2
+        // will thread `probeResult.perScene` into the prompt as
+        // availability hints.
+        scenePrePrebeStats = {
+          ...totals,
+          elapsedMs: probeResult.elapsedMs,
+          cacheHits: probeResult.cacheHits,
+          cacheMisses: probeResult.cacheMisses,
+          cacheHitRatio: probeResult.cacheHitRatio,
+          totalProbeMs: Date.now() - probeT0,
+          sceneCount: preProbeInputs.length,
+        };
+      } catch (e) {
+        // Pre-probe failures must NEVER break the render — log and move on.
+        console.warn(`[probe-pre] EXCEPTION: ${e.message} — continuing without pre-probe data`);
+        scenePrePrebeStats = {error: e.message};
+      }
+    }
     // Phase 19 Fix 8: USE_GEMINI_SCENE_PLAN (default true) — try Gemini
     // first for richer full-transcript reasoning, fall back to Claude
     // on empty/failure. Either way the output shape is identical thanks
@@ -6932,6 +7246,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       'timings.sceneFinalTypes': scenes.reduce((acc, s) => { acc[s.assetType] = (acc[s.assetType] || 0) + 1; return acc; }, {}),
       'timings.sceneProbeStats': probeStats || {},
       'timings.scenePlanProvider': scenePlanProvider,
+      'timings.scenePrePrebeStats': scenePrePrebeStats || null,
     }).catch(() => {});
   } catch (e) {
     console.warn(`[scene-plan] EXCEPTION: ${e.message} — falling back to per-beat keywords`);
@@ -6994,6 +7309,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     let url = null;
     let source = null;
     let pexelsAlternates = [];
+    let creator = null; // Phase 19 fix 6: SourceAttribution
     const validationFailures = [];
     // Day-14 Phase 4: ai_generated scenes try fal.ai Nano Banana first.
     // On success (or budget exceeded / API failure) URL is set or we
@@ -7030,7 +7346,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       // Day-14 Phase 3: pass scene-plan assetType so archival_photo
       // scenes try Wikimedia Commons images FIRST (free, public domain).
       const assetTypeHint = beat.scenePlanContext?.assetType || null;
-      const {urls: rawCandidates, source: pickedSource} = await searchAllFootageSources(channelId, query, 3, assetTypeHint);
+      const {urls: rawCandidates, source: pickedSource, creators: candCreators = {}} = await searchAllFootageSources(channelId, query, 3, assetTypeHint);
       const candidates = rawCandidates.filter((c) => !blocklist.has(c));
       if (candidates.length < rawCandidates.length) {
         console.log(`beat ${i + 1}: skipped ${rawCandidates.length - candidates.length} blocklisted candidate(s)`);
@@ -7050,6 +7366,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
         if (v.ok) {
           url = cand;
           source = pickedSource;
+          creator = candCreators[cand] || null;
           usedStockUrls.add(cand);
           // Alternates are saved for the swap loop / preflight repair.
           // Field name kept as `pexelsAlternates` for backward compat —
@@ -7076,6 +7393,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
           if (v.ok) {
             url = cand;
             source = pickedSource;
+            creator = candCreators[cand] || null;
             pexelsAlternates = candidates.slice(ci + 1);
             stockDedupForcedRepeats++;
             console.log(`beat ${i + 1}: dedup forced repeat (all candidates already used this render)`);
@@ -7099,6 +7417,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       heroMoment: !!beat.heroMoment,
       source,
       url,
+      ...(creator ? {creator} : {}),
       pexelsAlternates,
       // Pass-through fields for sound design — resolved into URLs later
       // after the loop so we can batch the Firestore reads.
@@ -7801,6 +8120,7 @@ async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = 
       let replacementSource = null;
       let replacementOriginal = null;
       let replacementAi = null;
+      let replacementCreator = null;
 
       // Tier 1: same-source alternates. Free, no API calls — these were
       // pre-fetched at sourcing time. Skip the failed original and any
@@ -7845,11 +8165,11 @@ async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = 
             triedSources.add(srcName);
             continue;
           }
-          const filtered = (candidates || []).filter((c) => !blocklist.has(c));
+          const filtered = (candidates || []).filter((c) => !blocklist.has(c.url));
           let picked = null;
           for (const cand of filtered) {
             try {
-              const v = await validatePexelsVideo(cand);
+              const v = await validatePexelsVideo(cand.url);
               if (v.ok) { picked = cand; break; }
               console.log(`[${jobId}] beat ${beatIdx + 1} ${srcName} cand failed: ${v.reason}`);
             } catch { continue; }
@@ -7859,14 +8179,15 @@ async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = 
             console.log(`[${jobId}] beat ${beatIdx + 1} ${srcName}: ${filtered.length} candidates, none validated`);
             continue;
           }
-          let cachedUrl = picked;
+          let cachedUrl = picked.url;
           try {
-            const c = await cacheRemoteToFirebase(picked, {prefix: 'cache/footage', defaultExt: 'mp4'});
+            const c = await cacheRemoteToFirebase(picked.url, {prefix: 'cache/footage', defaultExt: 'mp4'});
             cachedUrl = c.url;
           } catch { /* fall through with raw URL */ }
           replacementUrl = cachedUrl;
           replacementSource = srcName;
-          replacementOriginal = picked;
+          replacementOriginal = picked.url;
+          replacementCreator = picked.creator || null;
           console.log(`[${jobId}] beat ${beatIdx + 1} → Tier 2 cross-source swap (${srcName})`);
           break;
         }
@@ -7929,6 +8250,11 @@ async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = 
           replacedReason: `render-time failure → ${replacementSource}`,
           pexelsAlternates: (failedBeat.pexelsAlternates || []).filter((u) => u !== replacementOriginal),
           triedSources: [...triedSources],
+          // Tier 2/3 captures a new creator; Tier 1 alt re-uses failedBeat.creator
+          // (already present on the spread). Strip stale creator when we have a
+          // new one explicitly (even if null, so SourceAttribution doesn't show
+          // the prior beat's name).
+          ...(replacementCreator !== null ? {creator: replacementCreator} : (replacementSource === 'ai-video' ? {creator: null} : {})),
           ...(replacementAi ? {aiVideo: replacementAi} : {}),
         };
       } else {
