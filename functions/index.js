@@ -5583,7 +5583,14 @@ function snapScenesToWordBoundaries(scenes, rawBeats, captions, voiceoverDuratio
 // Phase 19 Fix 8: prep helper — runs the sentence-boundary scene
 // aggregation + word-boundary snap, then produces the per-scene LLM
 // summary. Shared by buildScenePlan (Claude) and buildScenePlanGemini.
-function prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec) {
+// Phase 2: opts.availability is the perScene array returned by
+// preProbeSceneAvailability — when present, each sceneInput gains an
+// `availability` object {archival, map}. opts.aiBudgetRemaining, when
+// present, is attached to each sceneInput. Both default to null so
+// existing callers keep their pre-Phase-2 inputs unchanged.
+function prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec, opts = {}) {
+  const availabilityArr = Array.isArray(opts.availability) ? opts.availability : null;
+  const aiBudgetRemaining = Number.isFinite(opts.aiBudgetRemaining) ? opts.aiBudgetRemaining : null;
   // Phase 15d + Phase 16I: STRICT sentence-boundary cuts at a denser
   // pace. Phase 16I lowered SOFT_MIN 4→2.5s + HARD_MAX 15→12s to
   // target ~3s avg scene (friend's pipeline produces ~280 scenes per
@@ -5625,7 +5632,7 @@ function prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec) {
     const endSec = s.end;
     const sentenceTexts = Array.from(new Set(sceneBeats.map((b) => b.sentence).filter(Boolean)));
     const keywordHints = Array.from(new Set(sceneBeats.flatMap((b) => b.keywords || [])));
-    return {
+    const out = {
       index: idx,
       start: +s.start.toFixed(2),
       end: +endSec.toFixed(2),
@@ -5634,6 +5641,19 @@ function prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec) {
       beatKeywordHints: keywordHints.slice(0, 6),
       heroMoment: sceneBeats.some((b) => b.heroMoment === true),
     };
+    if (availabilityArr) {
+      const probe = availabilityArr.find((p) => p && p.index === idx);
+      if (probe) {
+        out.availability = {
+          archival: (probe.loc > 0 || probe.wiki > 0 || probe.archive > 0),
+          map: probe.mapbox == null ? null : (probe.mapbox > 0),
+        };
+      }
+    }
+    if (aiBudgetRemaining != null) {
+      out.aiBudgetRemaining = aiBudgetRemaining;
+    }
+    return out;
   });
   return {scenes, sceneInputs};
 }
@@ -5700,7 +5720,39 @@ function assembleScenePlan(rawBeats, scenes, sceneInputs, enriched, t0, provider
 // prepended before the JSON input block — Gemini path uses it to inject
 // the full voiceover transcript for richer reasoning; Claude path
 // leaves it empty (back-compat with prior behavior).
-function buildScenePlanPrompt(sceneInputs, extraContext = '') {
+// Phase 2: opts.availabilityMode controls per-scene availability hints:
+//   - 'omit' (default) — current behavior; no availability info injected.
+//   - 'inline' — each sceneInput carries an `availability` object from
+//     the pre-probe + a global AI budget. Adds AVAILABILITY-DRIVEN
+//     PICKING block as hard constraints. Caller must pre-augment
+//     sceneInputs and pass opts.aiBudgetImages.
+function buildScenePlanPrompt(sceneInputs, extraContext = '', opts = {}) {
+  const availabilityMode = opts.availabilityMode === 'inline' ? 'inline' : 'omit';
+  const aiBudgetImages = Number.isFinite(opts.aiBudgetImages) ? opts.aiBudgetImages : null;
+  const availabilityBlock = availabilityMode === 'inline' ? `
+- AVAILABILITY-DRIVEN PICKING (HARD CONSTRAINTS — override Distribution targets below):
+  Each scene input below has an "availability" object from a real-time
+  catalog probe (LoC + Wikimedia Commons + Internet Archive for archival;
+  Pexels for stock; Mapbox geocode for map). Treat it as ground truth —
+  the catalog already told you what it has for this scene's keywords.
+  * availability.archival === false → DO NOT pick archival_photo. All
+    three archival sources returned 0 hits. Even if the topic feels
+    historic, the catalog has nothing for those keywords.
+  * availability.archival === true → strong signal to pick archival_photo
+    when the scene is PRE-2000 content. The catalog has actual matching
+    material; this is exactly the gap where archival outperforms stock.
+  * availability.map === false → DO NOT pick map. Mapbox geocode found
+    no place feature, so a map render would just be empty terrain.
+  * availability.map === null → scene didn't look place-shaped to the
+    probe heuristic; you may still pick map if you see a clear named
+    place the heuristic missed.
+  * AI BUDGET: ~${aiBudgetImages != null ? aiBudgetImages : 12} ai_generated images can be used TOTAL across all
+    ${sceneInputs.length} scenes. Prioritise ai_generated for ABSTRACT/conceptual
+    scenes where availability.archival === false AND stock would only
+    return generic filler. Don't burn AI budget on scenes where
+    availability.archival === true (catalog has the real thing) or
+    where literal-action stock_footage already fits the moment.
+` : '';
   return `You are planning visuals for ${sceneInputs.length} scenes of a YouTube finance/news short video. For EACH scene, output a JSON object with:
 - visualConcept: string, 5-15 words describing what should appear on screen
 - assetType: one of "stock_footage" | "archival_photo" | "ai_generated" | "map" | "stat_overlay" | "quote_card" | "comparison_split" | "timeline_bar"
@@ -5819,8 +5871,8 @@ async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voic
 // buildScenePlanGemini either single-pass or per-batch. Returns the
 // parsed scene array (length === batch.length on success) or [] on
 // exhaust/parse failure. Logs every attempt with batch label.
-async function _geminiScenePlanPass(batchInputs, extraContext, geminiKey, batchLabel) {
-  const prompt = buildScenePlanPrompt(batchInputs, extraContext);
+async function _geminiScenePlanPass(batchInputs, extraContext, geminiKey, batchLabel, promptOpts = {}) {
+  const prompt = buildScenePlanPrompt(batchInputs, extraContext, promptOpts);
   const body = {
     contents: [{role: 'user', parts: [{text: prompt}]}],
     generationConfig: {
@@ -5929,8 +5981,39 @@ async function buildScenePlanGemini(rawBeats, captions, geminiKey, voiceoverDura
     return [];
   }
   if (!Array.isArray(rawBeats) || rawBeats.length === 0) return [];
-  const {scenes, sceneInputs} = prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec);
+  let {scenes, sceneInputs} = prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec);
   if (scenes.length === 0) return [];
+
+  // Phase 2: USE_SINGLEPASS_SCENE_PLAN — run the catalog pre-probe and
+  // thread per-scene availability + AI budget hints into the prompt so
+  // Gemini picks types the catalog can actually fulfil (instead of
+  // emitting archival_photo for modern topics and watching
+  // finalizeScenePlanWithAvailability rescue-downgrade them after).
+  // Defaults OFF; finalizeScenePlanWithAvailability still runs as a
+  // safety net regardless.
+  let promptOpts = {};
+  if (process.env.USE_SINGLEPASS_SCENE_PLAN === 'true') {
+    try {
+      const probeT0 = Date.now();
+      const probeResult = await preProbeSceneAvailability(sceneInputs);
+      const aiBudgetImages = Math.max(1, Math.floor(AI_IMAGE_BUDGET_PER_VIDEO / AI_IMAGE_COST_PER_GENERATION));
+      const reprep = prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec, {
+        availability: probeResult.perScene,
+        aiBudgetRemaining: aiBudgetImages,
+      });
+      sceneInputs = reprep.sceneInputs;
+      scenes = reprep.scenes;
+      promptOpts = {availabilityMode: 'inline', aiBudgetImages};
+      const t = probeResult.totals || {};
+      console.log(`[scene-plan/gemini] singlepass pre-probe in ${Date.now() - probeT0}ms — ` +
+        `archival-eligible=${t.archivalEligible}/${sceneInputs.length}, ` +
+        `map-eligible=${t.mapEligible}/${t.mapProbed}, ` +
+        `aiBudgetImages=${aiBudgetImages}, cache=${probeResult.cacheHitRatio}`);
+    } catch (e) {
+      console.warn(`[scene-plan/gemini] singlepass pre-probe failed: ${e.message} — proceeding without availability hints`);
+      promptOpts = {};
+    }
+  }
 
   // Full transcript as extra context — each line "[t.s] text" so Gemini
   // can see absolute timing across the whole script. Cap at ~20K chars
@@ -5956,7 +6039,7 @@ async function buildScenePlanGemini(rawBeats, captions, geminiKey, voiceoverDura
       batches.push(sceneInputs.slice(i, i + BATCH_SIZE));
     }
     const results = await Promise.all(batches.map((batch, idx) =>
-      _geminiScenePlanPass(batch, extraContext, geminiKey, ` [batch ${idx + 1}/${batchCount}]`),
+      _geminiScenePlanPass(batch, extraContext, geminiKey, ` [batch ${idx + 1}/${batchCount}]`, promptOpts),
     ));
     // Any failed batch aborts — return [] so caller falls back to Claude
     // for the whole script. (Mixing partial Gemini + partial Claude in
@@ -5972,7 +6055,7 @@ async function buildScenePlanGemini(rawBeats, captions, geminiKey, voiceoverDura
       return [];
     }
   } else {
-    enriched = await _geminiScenePlanPass(sceneInputs, extraContext, geminiKey, '');
+    enriched = await _geminiScenePlanPass(sceneInputs, extraContext, geminiKey, '', promptOpts);
     if (enriched.length === 0) return [];
   }
   return assembleScenePlan(rawBeats, scenes, sceneInputs, enriched, t0, 'gemini');
@@ -6417,10 +6500,15 @@ async function _probeLocGov(query) {
     url.searchParams.set('fo', 'json');
     url.searchParams.set('q', q);
     url.searchParams.set('c', '1');
+    // Phase 2: maxAttempts 3 → 1. LoC rate-limits aggressively (HTTP
+    // 429 dominates retry log); retrying the same query into a 429
+    // window just makes the limit worse and burns 1-3s per scene.
+    // Probe is shadow data — a missed hit just means slightly less
+    // prompt signal, not a render-blocking error.
     const r = await fetchWithRetry(
       url,
       {headers: {'User-Agent': 'rem-report-bot/1.0'}},
-      {timeoutMs: 12000, maxAttempts: 3, label: 'loc-probe'},
+      {timeoutMs: 12000, maxAttempts: 1, label: 'loc-probe'},
     );
     if (!r.ok) return 0;
     const d = await r.json();
@@ -6454,10 +6542,13 @@ async function _probeArchiveOrg(query) {
     url.searchParams.set('rows', '1');
     url.searchParams.set('output', 'json');
     url.searchParams.append('fl[]', 'identifier');
+    // Phase 2: maxAttempts 3 → 1. archive.org is slow + flaky (AbortError
+    // dominates retry log); 10s × 3 attempts = up to 30s per query worst
+    // case. Same shadow-data rationale as loc-probe above.
     const r = await fetchWithRetry(
       url,
       {headers: {'User-Agent': 'rem-report-bot/1.0'}},
-      {timeoutMs: 10000, maxAttempts: 3, label: 'archive-probe'},
+      {timeoutMs: 10000, maxAttempts: 1, label: 'archive-probe'},
     );
     if (!r.ok) return 0;
     const d = await r.json();
@@ -6569,6 +6660,11 @@ async function preProbeSceneAvailability(sceneInputs, opts = {}) {
     return {perScene: [], totals: {}, elapsedMs: 0, cacheHitRatio: 0};
   }
   const t0 = Date.now();
+  // Pixabay handling: secret is in PENDING_SIGNUP state — no key
+  // actually bound. Without a key the probe silently returns 0 for
+  // every scene, which made "pixabay=0" look meaningful when it
+  // really means "never called". Skip the probe + flag it instead.
+  const pixabayDisabled = !process.env.PIXABAY_API_KEY;
 
   // Cache shape: Map<source, Map<query, count>>. One entry per source so
   // the same query across sources doesn't collide. Sentinel value -1
@@ -6632,13 +6728,14 @@ async function preProbeSceneAvailability(sceneInputs, opts = {}) {
       ? String(sc.beatKeywordHints[0]).trim().slice(0, 60)
       : String(sc.voiceoverText || '').split(/\s+/).slice(0, 4).join(' ');
 
-    // Fire 5 source probes in parallel; Mapbox conditional on shouldProbeMap.
+    // Fire source probes in parallel; Mapbox conditional on shouldProbeMap.
+    // Pixabay skipped entirely when key missing (returns null, not 0).
     const [loc, wiki, archive, pexels, pixabay] = await Promise.all([
       cachedProbe('loc', primaryKw, _probeLocGov),
       cachedProbe('wikimedia', primaryKw, _probeWikimediaImage),
       cachedProbe('archive', primaryKw, _probeArchiveOrg),
       cachedProbe('pexels', primaryKw, _probePexelsCount),
-      cachedProbe('pixabay', primaryKw, _probePixabayCount),
+      pixabayDisabled ? Promise.resolve(null) : cachedProbe('pixabay', primaryKw, _probePixabayCount),
     ]);
     let mapbox = null;
     if (shouldProbeMap(sc)) {
@@ -6677,19 +6774,23 @@ async function preProbeSceneAvailability(sceneInputs, opts = {}) {
     mapEligible: 0,        // scenes probed AND mapbox > 0
     mapProbed: 0,          // scenes where shouldProbeMap returned true
     allMiss: 0,            // scenes where every probed source returned 0
+    pixabayDisabled,       // surfaces missing-key state to the prompt + Firestore
   };
   for (const r of perScene) {
     if (r.loc > 0) totals.locHits++;
     if (r.wiki > 0) totals.wikiHits++;
     if (r.archive > 0) totals.archiveHits++;
     if (r.pexels > 0) totals.pexelsHits++;
-    if (r.pixabay > 0) totals.pixabayHits++;
+    if (r.pixabay != null && r.pixabay > 0) totals.pixabayHits++;
     if (r.mapbox != null) totals.mapProbed++;
     if (r.mapbox != null && r.mapbox > 0) totals.mapboxHits++;
     if (r.loc > 0 || r.wiki > 0 || r.archive > 0) totals.archivalEligible++;
-    if (r.pexels > 0 || r.pixabay > 0) totals.stockEligible++;
+    // stockEligible: Pexels alone when Pixabay disabled; otherwise either.
+    if (r.pexels > 0 || (r.pixabay != null && r.pixabay > 0)) totals.stockEligible++;
     if (r.mapbox != null && r.mapbox > 0) totals.mapEligible++;
-    if (r.loc === 0 && r.wiki === 0 && r.archive === 0 && r.pexels === 0 && r.pixabay === 0 && !(r.mapbox > 0)) {
+    // allMiss: ignore pixabay if disabled (null), else require it to be 0.
+    const pixabayMiss = (r.pixabay == null) || (r.pixabay === 0);
+    if (r.loc === 0 && r.wiki === 0 && r.archive === 0 && r.pexels === 0 && pixabayMiss && !(r.mapbox > 0)) {
       totals.allMiss++;
     }
   }
@@ -7193,11 +7294,12 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
         const {sceneInputs: preProbeInputs} = prepareScenesForPlan(rawBeats, captions, voiceoverDurForScenePlan);
         const probeResult = await preProbeSceneAvailability(preProbeInputs);
         const totals = probeResult.totals || {};
+        const pixabayLogTok = totals.pixabayDisabled ? 'disabled' : String(totals.pixabayHits);
         console.log(`[probe-pre] ${preProbeInputs.length} scenes probed in ${probeResult.elapsedMs}ms — ` +
           `archival-eligible=${totals.archivalEligible}, stock-eligible=${totals.stockEligible}, ` +
           `map-probed=${totals.mapProbed} map-eligible=${totals.mapEligible}, all-miss=${totals.allMiss}; ` +
           `hits: loc=${totals.locHits} wiki=${totals.wikiHits} archive=${totals.archiveHits} ` +
-          `pexels=${totals.pexelsHits} pixabay=${totals.pixabayHits} mapbox=${totals.mapboxHits}; ` +
+          `pexels=${totals.pexelsHits} pixabay=${pixabayLogTok} mapbox=${totals.mapboxHits}; ` +
           `cache hit ratio=${probeResult.cacheHitRatio} (${probeResult.cacheHits}/${probeResult.cacheHits + probeResult.cacheMisses})`);
         // Shadow mode: store but DO NOT pass into buildScenePlan*. Phase 2
         // will thread `probeResult.perScene` into the prompt as
