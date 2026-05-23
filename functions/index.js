@@ -5646,7 +5646,7 @@ function prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec, opts = {
       if (probe) {
         out.availability = {
           archival: (probe.loc > 0 || probe.wiki > 0 || probe.archive > 0),
-          map: probe.mapbox == null ? null : (probe.mapbox > 0),
+          map: probe.mapbox == null ? null : (probe.mapbox.count > 0),
         };
       }
     }
@@ -5975,7 +5975,7 @@ async function _geminiScenePlanPass(batchInputs, extraContext, geminiKey, batchL
 // gives Gemini full-script awareness so it can plan visuals that
 // reference past/future scenes. Returns the same shape as buildScenePlan;
 // caller can swap providers freely.
-async function buildScenePlanGemini(rawBeats, captions, geminiKey, voiceoverDurationSec) {
+async function buildScenePlanGemini(rawBeats, captions, geminiKey, voiceoverDurationSec, singlepassAvailability = null) {
   if (!geminiKey) {
     console.warn('[scene-plan/gemini] GEMINI_API_KEY not set — returning []');
     return [];
@@ -5988,27 +5988,47 @@ async function buildScenePlanGemini(rawBeats, captions, geminiKey, voiceoverDura
   // thread per-scene availability + AI budget hints into the prompt so
   // Gemini picks types the catalog can actually fulfil (instead of
   // emitting archival_photo for modern topics and watching
-  // finalizeScenePlanWithAvailability rescue-downgrade them after).
-  // Defaults OFF; finalizeScenePlanWithAvailability still runs as a
+  // validateScenePlanAgainstAvailability rescue-downgrade them after).
+  // Defaults OFF; validateScenePlanAgainstAvailability still runs as a
   // safety net regardless.
+  // Phase 3: when `singlepassAvailability` is supplied (caller already
+  // ran the pre-probe and is threading the perScene array through both
+  // here and validateScenePlanAgainstAvailability), skip the internal
+  // probe and reuse the caller's array — avoids double-probing.
   let promptOpts = {};
   if (process.env.USE_SINGLEPASS_SCENE_PLAN === 'true') {
     try {
       const probeT0 = Date.now();
-      const probeResult = await preProbeSceneAvailability(sceneInputs);
+      let perScene;
+      let cacheLabel;
+      let totals;
+      if (Array.isArray(singlepassAvailability) && singlepassAvailability.length > 0) {
+        perScene = singlepassAvailability;
+        cacheLabel = 'caller-supplied';
+        totals = {};
+        for (const r of perScene) {
+          totals.archivalEligible = (totals.archivalEligible || 0) + ((r.loc > 0 || r.wiki > 0 || r.archive > 0) ? 1 : 0);
+          totals.mapProbed = (totals.mapProbed || 0) + (r.mapbox != null ? 1 : 0);
+          totals.mapEligible = (totals.mapEligible || 0) + ((r.mapbox != null && r.mapbox.count > 0) ? 1 : 0);
+        }
+      } else {
+        const probeResult = await preProbeSceneAvailability(sceneInputs);
+        perScene = probeResult.perScene;
+        cacheLabel = String(probeResult.cacheHitRatio);
+        totals = probeResult.totals || {};
+      }
       const aiBudgetImages = Math.max(1, Math.floor(AI_IMAGE_BUDGET_PER_VIDEO / AI_IMAGE_COST_PER_GENERATION));
       const reprep = prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec, {
-        availability: probeResult.perScene,
+        availability: perScene,
         aiBudgetRemaining: aiBudgetImages,
       });
       sceneInputs = reprep.sceneInputs;
       scenes = reprep.scenes;
       promptOpts = {availabilityMode: 'inline', aiBudgetImages};
-      const t = probeResult.totals || {};
       console.log(`[scene-plan/gemini] singlepass pre-probe in ${Date.now() - probeT0}ms — ` +
-        `archival-eligible=${t.archivalEligible}/${sceneInputs.length}, ` +
-        `map-eligible=${t.mapEligible}/${t.mapProbed}, ` +
-        `aiBudgetImages=${aiBudgetImages}, cache=${probeResult.cacheHitRatio}`);
+        `archival-eligible=${totals.archivalEligible}/${sceneInputs.length}, ` +
+        `map-eligible=${totals.mapEligible}/${totals.mapProbed}, ` +
+        `aiBudgetImages=${aiBudgetImages}, cache=${cacheLabel}`);
     } catch (e) {
       console.warn(`[scene-plan/gemini] singlepass pre-probe failed: ${e.message} — proceeding without availability hints`);
       promptOpts = {};
@@ -6596,23 +6616,29 @@ async function _probePixabayCount(query) {
     return typeof d.totalHits === 'number' ? d.totalHits : (Array.isArray(d.hits) ? d.hits.length : 0);
   } catch { return 0; }
 }
-// Mapbox geocoding probe — returns 1 if at least one feature matches the
-// place name, 0 otherwise. Mapbox geocoding is FREE for the first 100k
-// requests/month, so this is cheap to fire per location candidate.
+// Mapbox geocoding probe — returns {count, lng, lat, name}. count=1 when
+// at least one feature matches and we carry its coords+place_name so the
+// downstream map-coord validator can backfill mapContext.locations without
+// re-geocoding. Empty result is {count:0, lng:null, lat:null, name:null}.
+// Mapbox geocoding is FREE for the first 100k requests/month.
 async function _probeMapboxGeocode(name) {
-  if (!process.env.MAPBOX_ACCESS_TOKEN) return 0;
+  const empty = {count: 0, lng: null, lat: null, name: null};
+  if (!process.env.MAPBOX_ACCESS_TOKEN) return empty;
   const q = capQuery(name, 80);
-  if (!q) return 0;
+  if (!q) return empty;
   try {
     const url = new URL(`https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(q)}.json`);
     url.searchParams.set('access_token', process.env.MAPBOX_ACCESS_TOKEN);
     url.searchParams.set('limit', '1');
     url.searchParams.set('types', 'country,region,place,locality,district');
     const r = await fetchWithRetry(url, {}, {timeoutMs: 5000, maxAttempts: 2, label: 'mapbox-probe'});
-    if (!r.ok) return 0;
+    if (!r.ok) return empty;
     const d = await r.json();
-    return Array.isArray(d.features) && d.features.length > 0 ? 1 : 0;
-  } catch { return 0; }
+    const f = Array.isArray(d.features) && d.features.length > 0 ? d.features[0] : null;
+    if (!f) return empty;
+    const center = Array.isArray(f.center) && f.center.length >= 2 ? f.center : [null, null];
+    return {count: 1, lng: center[0], lat: center[1], name: f.place_name || q};
+  } catch { return empty; }
 }
 
 // Quick heuristic: does this scene look like it mentions a real-world
@@ -6753,16 +6779,20 @@ async function preProbeSceneAvailability(sceneInputs, opts = {}) {
         if (typeof kw === 'string' && /^[A-Z][a-zA-Z]+$/.test(kw.trim())) candidates.push(kw.trim());
       }
       if (candidates.length === 0) candidates.push(primaryKw);
-      const counts = await Promise.all(
+      const probes = await Promise.all(
         candidates.slice(0, 4).map((c) => cachedProbe('mapbox', c, _probeMapboxGeocode)),
       );
-      mapbox = counts.reduce((a, b) => Math.max(a, b), 0);
+      // _probeMapboxGeocode returns {count, lng, lat, name}; pick the
+      // first probe with count>0 (preserves coords for backfill in the
+      // validate stage). Falls back to an empty-shape object so the
+      // downstream count checks still work uniformly.
+      mapbox = probes.find((p) => p && p.count > 0) || {count: 0, lng: null, lat: null, name: null};
     }
     return {
       index: sc.index,
       primaryKw,
       loc, wiki, archive, pexels, pixabay,
-      mapbox, // null if not probed (scene doesn't look place-shaped)
+      mapbox, // null if not probed (scene doesn't look place-shaped); else {count, lng, lat, name}
     };
   }));
 
@@ -6783,14 +6813,14 @@ async function preProbeSceneAvailability(sceneInputs, opts = {}) {
     if (r.pexels > 0) totals.pexelsHits++;
     if (r.pixabay != null && r.pixabay > 0) totals.pixabayHits++;
     if (r.mapbox != null) totals.mapProbed++;
-    if (r.mapbox != null && r.mapbox > 0) totals.mapboxHits++;
+    if (r.mapbox != null && r.mapbox.count > 0) totals.mapboxHits++;
     if (r.loc > 0 || r.wiki > 0 || r.archive > 0) totals.archivalEligible++;
     // stockEligible: Pexels alone when Pixabay disabled; otherwise either.
     if (r.pexels > 0 || (r.pixabay != null && r.pixabay > 0)) totals.stockEligible++;
-    if (r.mapbox != null && r.mapbox > 0) totals.mapEligible++;
+    if (r.mapbox != null && r.mapbox.count > 0) totals.mapEligible++;
     // allMiss: ignore pixabay if disabled (null), else require it to be 0.
     const pixabayMiss = (r.pixabay == null) || (r.pixabay === 0);
-    if (r.loc === 0 && r.wiki === 0 && r.archive === 0 && r.pexels === 0 && pixabayMiss && !(r.mapbox > 0)) {
+    if (r.loc === 0 && r.wiki === 0 && r.archive === 0 && r.pexels === 0 && pixabayMiss && !(r.mapbox && r.mapbox.count > 0)) {
       totals.allMiss++;
     }
   }
@@ -6799,10 +6829,92 @@ async function preProbeSceneAvailability(sceneInputs, opts = {}) {
   return {perScene, totals, elapsedMs, cacheHits, cacheMisses, cacheHitRatio};
 }
 
-async function finalizeScenePlanWithAvailability(scenes, aiImageBudget) {
+// Phase 3: when `availability` is non-null (singlepass already wired
+// per-scene catalog hints + AI budget into the prompt), the LLM should
+// have already picked viable assetTypes — so we skip the heavy re-probe
+// and only enforce structural safety: AI budget cap (gentle warn +
+// downgrade overflow to the LLM's own fallbackChain[1]) and map coord
+// validity (with geocode backfill from the new mapbox return shape so
+// we don't have to call Mapbox again). When availability is null we
+// fall through to the legacy behavior — archival re-probe + AI-budget
+// rewrite — preserved verbatim below.
+async function validateScenePlanAgainstAvailability(scenes, availability, aiImageBudget) {
   if (!Array.isArray(scenes) || scenes.length === 0) return {};
   const t0 = Date.now();
 
+  // ── Singlepass branch: trust the LLM, validate only ───────────────
+  if (availability) {
+    const aiCapImages = Math.max(1, Math.floor((aiImageBudget?.capUsd || 1.0) / 0.08));
+    const aiCandidates = scenes
+      .map((s, idx) => ({idx, scene: s}))
+      .filter((c) => c.scene.assetType === 'ai_generated' && c.scene.aiPrompt);
+    let aiBudgetDowngraded = 0;
+    if (aiCandidates.length > aiCapImages) {
+      // Singlepass already told the LLM the AI budget — overflow here
+      // means it ignored the hint. WARN once (not the loud per-scene
+      // logspam the legacy path emits) and downgrade the trailing
+      // overflow scenes to their own declared fallbackChain[1].
+      console.warn(`[scene-plan/validate] AI overflow despite singlepass hint: ${aiCandidates.length} requested, ${aiCapImages} budget — downgrading ${aiCandidates.length - aiCapImages} trailing scenes to fallbackChain[1]`);
+      const losers = aiCandidates.slice(aiCapImages);
+      for (const l of losers) {
+        l.scene._originalAssetType = l.scene.assetType;
+        l.scene.assetType = (l.scene.fallbackChain || [])[1]
+          || (l.scene.fallbackChain || []).find((t) => t !== 'ai_generated')
+          || 'stock_footage';
+        aiBudgetDowngraded++;
+      }
+    }
+
+    // Map coord validation with backfill from the mapbox probe object.
+    // If the LLM emitted assetType=map but didn't fill in real coords
+    // AND the pre-probe found a geocode for this scene, splice the
+    // probe's lng/lat into mapContext.locations instead of downgrading.
+    const availByIdx = new Map();
+    for (const p of availability) if (p && typeof p.index === 'number') availByIdx.set(p.index, p);
+    const mapScenes = scenes.filter((s) => s.assetType === 'map');
+    let mapDowngraded = 0;
+    let mapBackfilled = 0;
+    for (const s of mapScenes) {
+      const locs = (s.mapContext && Array.isArray(s.mapContext.locations)) ? s.mapContext.locations : [];
+      const hasReal = locs.some((l) => typeof l.longitude === 'number' && typeof l.latitude === 'number' && !(l.longitude === 0 && l.latitude === 0));
+      if (!hasReal && process.env.MAPBOX_ACCESS_TOKEN) {
+        const probe = availByIdx.get(s.index);
+        const mb = probe && probe.mapbox;
+        if (mb && mb.count > 0 && typeof mb.lng === 'number' && typeof mb.lat === 'number') {
+          if (!s.mapContext) s.mapContext = {mapStyle: 'dark', zoom: null};
+          if (!Array.isArray(s.mapContext.locations)) s.mapContext.locations = [];
+          s.mapContext.locations.push({
+            name: String(mb.name || '').slice(0, 60),
+            longitude: Math.max(-180, Math.min(180, mb.lng)),
+            latitude: Math.max(-90, Math.min(90, mb.lat)),
+          });
+          mapBackfilled++;
+          console.log(`[scene-plan/validate] map backfill from mapbox probe for scene ${s.index}: "${mb.name}"`);
+          continue;
+        }
+      }
+      if (!hasReal || !process.env.MAPBOX_ACCESS_TOKEN) {
+        s._originalAssetType = s._originalAssetType || s.assetType;
+        s.assetType = 'stock_footage';
+        mapDowngraded++;
+      }
+    }
+
+    const finalBreakdown = {};
+    for (const s of scenes) finalBreakdown[s.assetType] = (finalBreakdown[s.assetType] || 0) + 1;
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(2);
+    console.log(`[scene-plan/validate] singlepass validate in ${elapsed}s — final types: ${JSON.stringify(finalBreakdown)} — ai-budget-downgraded=${aiBudgetDowngraded}, map-backfilled=${mapBackfilled}, map-invalid=${mapDowngraded}`);
+    return {
+      aiBudgetDowngraded,
+      archivalUpgradedToAi: 0,
+      archivalDowngradedToStock: 0,
+      mapDowngraded,
+      mapBackfilled,
+      singlepass: true,
+    };
+  }
+
+  // ── Legacy branch: availability null, behave as before ────────────
   // Stage A: AI budget pre-allocation (existing logic from 16C)
   const aiCapImages = Math.max(1, Math.floor((aiImageBudget?.capUsd || 1.0) / 0.08));
   const aiCandidates = scenes
@@ -7278,17 +7390,23 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     const voiceoverDurForScenePlan = (captions && captions.length)
       ? Math.max(...captions.map((c) => c.end || 0))
       : 0;
-    // Phase 1: shadow-mode pre-probe. Runs LoC/Wikimedia/Archive/Pexels/
+    // Phase 1 + Phase 3: single pre-probe that serves both shadow-mode
+    // logging (ENABLE_SCENE_PRE_PROBE) and singlepass threading
+    // (USE_SINGLEPASS_SCENE_PLAN). Runs LoC/Wikimedia/Archive/Pexels/
     // Pixabay/Mapbox in parallel for every scene BEFORE the scene-plan
-    // LLM call. Result is logged + persisted but NOT threaded into the
-    // prompt yet (Phase 2 will). Behind ENABLE_SCENE_PRE_PROBE (default
-    // off) so we can ship the layer without changing any render output.
+    // LLM call. The same perScene array is passed into both
+    // buildScenePlanGemini (as singlepassAvailability hint) and
+    // validateScenePlanAgainstAvailability (as the availability arg) so
+    // the probe runs ONCE per render instead of three times.
     // prepareScenesForPlan is pure-ish (only side effect on rawBeats is
     // idempotent `_extendedEnd` mutation), so calling it here for the
     // probe AND again inside buildScenePlanGemini/buildScenePlan
     // produces identical inputs to the LLM.
+    const USE_SINGLEPASS = process.env.USE_SINGLEPASS_SCENE_PLAN === 'true';
+    const ENABLE_PROBE = process.env.ENABLE_SCENE_PRE_PROBE === 'true';
     let scenePrePrebeStats = null;
-    if (process.env.ENABLE_SCENE_PRE_PROBE === 'true') {
+    let singlepassPerScene = null;
+    if (USE_SINGLEPASS || ENABLE_PROBE) {
       try {
         const probeT0 = Date.now();
         const {sceneInputs: preProbeInputs} = prepareScenesForPlan(rawBeats, captions, voiceoverDurForScenePlan);
@@ -7301,9 +7419,6 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
           `hits: loc=${totals.locHits} wiki=${totals.wikiHits} archive=${totals.archiveHits} ` +
           `pexels=${totals.pexelsHits} pixabay=${pixabayLogTok} mapbox=${totals.mapboxHits}; ` +
           `cache hit ratio=${probeResult.cacheHitRatio} (${probeResult.cacheHits}/${probeResult.cacheHits + probeResult.cacheMisses})`);
-        // Shadow mode: store but DO NOT pass into buildScenePlan*. Phase 2
-        // will thread `probeResult.perScene` into the prompt as
-        // availability hints.
         scenePrePrebeStats = {
           ...totals,
           elapsedMs: probeResult.elapsedMs,
@@ -7313,10 +7428,12 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
           totalProbeMs: Date.now() - probeT0,
           sceneCount: preProbeInputs.length,
         };
+        if (USE_SINGLEPASS) singlepassPerScene = probeResult.perScene;
       } catch (e) {
         // Pre-probe failures must NEVER break the render — log and move on.
         console.warn(`[probe-pre] EXCEPTION: ${e.message} — continuing without pre-probe data`);
         scenePrePrebeStats = {error: e.message};
+        singlepassPerScene = null;
       }
     }
     // Phase 19 Fix 8: USE_GEMINI_SCENE_PLAN (default true) — try Gemini
@@ -7327,7 +7444,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     let draftScenes = [];
     let scenePlanProvider = 'claude';
     if (USE_GEMINI_SCENE_PLAN && process.env.GEMINI_API_KEY) {
-      draftScenes = await buildScenePlanGemini(rawBeats, captions, process.env.GEMINI_API_KEY, voiceoverDurForScenePlan);
+      draftScenes = await buildScenePlanGemini(rawBeats, captions, process.env.GEMINI_API_KEY, voiceoverDurForScenePlan, singlepassPerScene);
       if (draftScenes.length > 0) {
         scenePlanProvider = 'gemini';
       } else {
@@ -7337,7 +7454,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     if (draftScenes.length === 0) {
       draftScenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan);
     }
-    const probeStats = await finalizeScenePlanWithAvailability(draftScenes, aiImageBudget);
+    const probeStats = await validateScenePlanAgainstAvailability(draftScenes, singlepassPerScene, aiImageBudget);
     scenes = draftScenes;
     const touched = applyScenesToBeats(rawBeats, scenes);
     const sceneMs = Date.now() - sceneT0;
