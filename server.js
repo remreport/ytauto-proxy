@@ -1956,6 +1956,12 @@ const server = http.createServer(async (req, res) => {
         '--no-progress',
         '--socket-timeout', '20',
         '--retries', '2',
+        // 2026 bot-challenge mitigation: rotate through clients that
+        // currently bypass "Sign in to confirm you're not a bot" without
+        // needing a PO token. mweb is the yt-dlp wiki's recommended
+        // fallback; tv_simply + android_vr + web_safari cover the
+        // remaining gaps when mweb itself trips the challenge.
+        '--extractor-args', 'youtube:player_client=mweb,tv_simply,android_vr,web_safari',
       ];
       if (process.env.DECODO_USER && process.env.DECODO_PASS && process.env.DECODO_ENDPOINT) {
         const u = encodeURIComponent(process.env.DECODO_USER);

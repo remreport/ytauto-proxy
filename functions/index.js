@@ -682,6 +682,34 @@ const MUSIC_COPYRIGHT_CLAIMED_BLOCKLIST = [
     titleSubstring: 'Cyberwave Orchestra',
     reason: 'Defense-in-depth: same composer as claimed track',
   },
+  // 84_Dramatic_Music by Tatamusic — Content ID claim 2026-05.
+  // Two entries: catch artist anywhere in title AND the storage-filename
+  // form ("84_Dramatic_Music") that some uploads carry as the track name.
+  {
+    titleSubstring: 'Tatamusic',
+    reason: 'YouTube Content ID claim 2026-05 (84_Dramatic_Music) — defense-in-depth: artist-wide block',
+  },
+  {
+    titleSubstring: '84_Dramatic_Music',
+    reason: 'YouTube Content ID claim 2026-05 — catches storage-filename style track names',
+  },
+];
+
+// Storage-URL / Pixabay-source blocklist. The title-based blocklist above
+// catches anything whose Firestore `name`/`title` contains the substring,
+// but uploads where the track name was sanitized may slip through if only
+// the URL still carries the artist identifier. We also block by URL
+// substring as belt-and-suspenders. Match is case-insensitive substring
+// against `t.url` (storage URL).
+const MUSIC_URL_BLOCKLIST = [
+  {
+    urlSubstring: 'tatamusic',
+    reason: 'YouTube Content ID claim 2026-05 (84_Dramatic_Music) — block any track with tatamusic in storage URL',
+  },
+  {
+    urlSubstring: '84_Dramatic_Music',
+    reason: 'YouTube Content ID claim 2026-05 — block any track with this filename in storage URL',
+  },
 ];
 
 // Substring keyword blocklist — case-insensitive match against the
@@ -700,6 +728,17 @@ function isMusicTrackUsable(t) {
   if (!t) return false;
   if (t.licensingStatus === 'claimed') return false;
   if (t.claimed === true) return false; // legacy field name
+  // URL blocklist: runs even when title/name is missing — protects against
+  // tracks where the artist identifier survives only in the storage URL.
+  const urlLower = (t.url || '').toLowerCase();
+  if (urlLower) {
+    for (const entry of MUSIC_URL_BLOCKLIST) {
+      if (urlLower.includes(entry.urlSubstring.toLowerCase())) {
+        console.log(`[music] excluded url=${(t.url||'').slice(0, 120)} — COPYRIGHT CLAIMED (${entry.reason})`);
+        return false;
+      }
+    }
+  }
   const titleOrName = t.title || t.name;
   if (!titleOrName) return true;
   if (MUSIC_TITLE_BLOCKLIST.has(titleOrName)) {
@@ -3316,15 +3355,28 @@ async function youtubeSearchTop(query, n = 3) {
   // (not Promise.all) because Decodo per-request residential IP costs
   // money and the source ladder usually only needs 1-3 candidates total.
   // Bail as soon as we have N.
+  //
+  // Phase 22 fast-fail: stop on the FIRST minted URL. Previously we tried
+  // up to n=3 candidates per scene; with the 2026 bot-challenge wave each
+  // failed clip burned ~12s on the proxy, so a single scene with no
+  // available clips could waste ~36s before falling through to stock.
+  // First-clip-or-nothing keeps youtube as a primary assetType while
+  // capping the worst-case latency cost at one clip-url round trip.
   const out = [];
   for (const item of items) {
-    if (out.length >= n) break;
+    if (out.length >= 1) break;
     const videoId = item.id?.videoId;
     if (!videoId) continue;
     let clipUrl;
     try { clipUrl = await youtubeFetchClipUrl(videoId); }
-    catch (e) { console.warn(`[youtube] clip-url fetch threw for ${videoId}: ${e.message}`); continue; }
-    if (clipUrl) out.push({url: clipUrl, creator: item.snippet?.channelTitle || null});
+    catch (e) { console.warn(`[youtube] clip-url fetch threw for ${videoId}: ${e.message}`); break; }
+    if (clipUrl) {
+      out.push({url: clipUrl, creator: item.snippet?.channelTitle || null});
+      break;
+    }
+    // First candidate failed (404 / no playable format / bot challenge).
+    // Don't grind through more IDs — degrade to stock immediately.
+    break;
   }
   if (out.length) console.log(`[youtube] ${out.length}/${items.length} clips minted for "${q.slice(0, 60)}"`);
   return out;
@@ -3339,6 +3391,11 @@ async function youtubeFetchClipUrl(videoId) {
   if (!videoId) return null;
   let resp;
   try {
+    // Phase 22 fast-fail: maxAttempts 2→1, timeoutMs 30s→12s. The proxy
+    // already does its own yt-dlp retries (--retries 2) and SIGKILLs at
+    // 25s. A second 30s attempt from the function side on top means up
+    // to 60s burned per failed clip. With the 2026 bot-challenge wave,
+    // 404s are common — the source ladder should degrade to stock fast.
     resp = await fetchWithRetry(
       `${RENDER_PROXY_URL}/youtube/clip-url`,
       {
@@ -3346,7 +3403,7 @@ async function youtubeFetchClipUrl(videoId) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({videoId, maxDuration: 240}),
       },
-      {timeoutMs: 30000, maxAttempts: 2, label: 'youtube-clip-url'},
+      {timeoutMs: 12000, maxAttempts: 1, label: 'youtube-clip-url'},
     );
   } catch (e) {
     console.warn(`[youtube] clip-url proxy threw for ${videoId}: ${e.message}`);
@@ -5662,8 +5719,8 @@ function prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec, opts = {
 // Identical post-processing for Claude and Gemini paths — both target
 // the exact same JSON shape per scene.
 function assembleScenePlan(rawBeats, scenes, sceneInputs, enriched, t0, providerLabel) {
-  const validTypes = new Set(['stock_footage', 'archival_photo', 'ai_generated', 'map', 'stat_overlay', 'quote_card', 'comparison_split', 'timeline_bar']);
-  const breakdown = {stock_footage: 0, archival_photo: 0, ai_generated: 0, map: 0, stat_overlay: 0, quote_card: 0, comparison_split: 0, timeline_bar: 0};
+  const validTypes = new Set(['stock_footage', 'archival_photo', 'ai_generated', 'youtube', 'map', 'stat_overlay', 'quote_card', 'comparison_split', 'timeline_bar']);
+  const breakdown = {stock_footage: 0, archival_photo: 0, ai_generated: 0, youtube: 0, map: 0, stat_overlay: 0, quote_card: 0, comparison_split: 0, timeline_bar: 0};
   const out = scenes.map((s, idx) => {
     const e = enriched[idx] || {};
     const at = validTypes.has(e.assetType) ? e.assetType : 'stock_footage';
@@ -5730,32 +5787,31 @@ function buildScenePlanPrompt(sceneInputs, extraContext = '', opts = {}) {
   const availabilityMode = opts.availabilityMode === 'inline' ? 'inline' : 'omit';
   const aiBudgetImages = Number.isFinite(opts.aiBudgetImages) ? opts.aiBudgetImages : null;
   const availabilityBlock = availabilityMode === 'inline' ? `
-- AVAILABILITY-DRIVEN PICKING (HARD CONSTRAINTS — override Distribution targets below):
-  Each scene input below has an "availability" object from a real-time
-  catalog probe (LoC + Wikimedia Commons + Internet Archive for archival;
-  Pexels for stock; Mapbox geocode for map). Treat it as ground truth —
-  the catalog already told you what it has for this scene's keywords.
-  * availability.archival === false → DO NOT pick archival_photo. All
-    three archival sources returned 0 hits. Even if the topic feels
-    historic, the catalog has nothing for those keywords.
-  * availability.archival === true → strong signal to pick archival_photo
-    when the scene is PRE-2000 content. The catalog has actual matching
-    material; this is exactly the gap where archival outperforms stock.
-  * availability.map === false → DO NOT pick map. Mapbox geocode found
-    no place feature, so a map render would just be empty terrain.
-  * availability.map === null → scene didn't look place-shaped to the
-    probe heuristic; you may still pick map if you see a clear named
-    place the heuristic missed.
-  * AI BUDGET: ~${aiBudgetImages != null ? aiBudgetImages : 12} ai_generated images can be used TOTAL across all
-    ${sceneInputs.length} scenes. Prioritise ai_generated for ABSTRACT/conceptual
-    scenes where availability.archival === false AND stock would only
-    return generic filler. Don't burn AI budget on scenes where
-    availability.archival === true (catalog has the real thing) or
-    where literal-action stock_footage already fits the moment.
+- HARD BUDGETS (count as you go — these override everything else):
+  * AI BUDGET: you may select AT MOST ${aiBudgetImages != null ? aiBudgetImages : 12} ai_generated scenes across the entire
+    video. Track your count as you write the array. Once you have picked
+    ${aiBudgetImages != null ? aiBudgetImages : 12} ai_generated scenes, NEVER pick ai_generated again — for the
+    remaining scenes use archival_photo / youtube / map / stock_footage
+    instead. Overflow is silently downgraded to stock by the server, so
+    every scene past the cap is a wasted slot for variety.
+  * AVAILABILITY GROUND TRUTH: each scene input has an "availability"
+    object from a real-time catalog probe (LoC + Wikimedia Commons +
+    Internet Archive for archival; Mapbox geocode for map). Treat it as
+    authoritative.
+    - availability.archival === true → PICK archival_photo. The catalog
+      has matching material. There is NO date restriction; Wikipedia /
+      Wikimedia / Internet Archive cover modern figures and events well.
+    - availability.archival === false → DO NOT pick archival_photo. All
+      three archival sources returned 0 hits for those keywords.
+    - availability.map === false → DO NOT pick map. Mapbox geocode found
+      no place feature, so a map render would just be empty terrain.
+    - availability.map === null → scene didn't look place-shaped to the
+      probe heuristic; you may still pick map if you see a clear named
+      place the heuristic missed.
 ` : '';
   return `You are planning visuals for ${sceneInputs.length} scenes of a YouTube finance/news short video. For EACH scene, output a JSON object with:
 - visualConcept: string, 5-15 words describing what should appear on screen
-- assetType: one of "stock_footage" | "archival_photo" | "ai_generated" | "map" | "stat_overlay" | "quote_card" | "comparison_split" | "timeline_bar"
+- assetType: one of "stock_footage" | "archival_photo" | "ai_generated" | "youtube" | "map" | "stat_overlay" | "quote_card" | "comparison_split" | "timeline_bar"
     * stat_overlay — full-screen code-rendered stat scene (use for KEY numbers/stats the viewer should remember; replaces generic stock when the moment is "remember THIS number")
     * quote_card — full-screen code-rendered quote scene (use when voiceover quotes someone directly)
     * comparison_split — full-screen code-rendered split scene with two competing values (use for "then vs now", "X vs Y" framings)
@@ -5768,7 +5824,7 @@ function buildScenePlanPrompt(sceneInputs, extraContext = '', opts = {}) {
     - mapStyle: "dark" (default — fits finance/news brand) | "satellite" | "streets"
     - zoom: 1-18 integer (continental=3, country=5, region=7, city=10) — only used when locations.length === 1, else auto-fit
 - templateParams: object (ONLY when assetType is one of stat_overlay/quote_card/comparison_split/timeline_bar; else null):
-    * For stat_overlay: {value: "$700B", label: "TARP bailout, October 2008", context: "approved 263-171 in Congress"}
+    * For stat_overlay: {value: "$700B"} — ONLY the value field is rendered; the big serif number is the whole visual. Caption strip carries the surrounding context.
     * For quote_card: {quote: "Whatever it takes", name: "Mario Draghi", role: "ECB President", date: "July 2012"}
     * For comparison_split: {header: "Then vs Now", leftLabel: "2008", leftValue: "\$700B", rightLabel: "2026", rightValue: "\$3T"}
     * For timeline_bar: {header: "Fed crisis interventions", events: [{date: "1913", label: "Fed founded"}, {date: "1929", label: "Black Tuesday"}, {date: "2008", label: "TARP"}]}
@@ -5782,15 +5838,15 @@ Phase 16I template guidance: aim for ~20-25% of scenes to use code-rendered temp
 
 Rules — pick the BEST type for EACH specific scene, NOT a default:
 
-- archival_photo (free, NO CAP — but STRICT eligibility): ONLY for PRE-2000 historic events, figures, or eras where Library of Congress / Wikimedia Commons / Internet Archive actually have catalogued material. Examples that qualify: "1929 crash", "FDR's New Deal", "Bretton Woods 1944", "Volcker Fed era 1979-87", "1973 oil shock", "1987 Black Monday", "gold standard", "Glass-Steagall", "Reagan tax cuts 1981". Examples that DO NOT qualify (use stock_footage / ai_generated / map / templates instead): "2008 Lehman" (modern enough that wires + stock have it — but borderline OK if pre-2010 archival is clearly available), any post-2000 event ("Trump tariffs", "2020 pandemic", "ChatGPT launch", "2024 election", "Powell rate hikes 2022", "FTX collapse", "SVB"). Heuristic: if the year mentioned is ≥ 2000, do NOT pick archival_photo — the archival sources almost always return 0 for modern queries. Pick stock_footage, ai_generated, map, or a code-rendered template instead.
+- archival_photo (free, NO CAP): defer to availability.archival — when the probe says true, the catalog has matching material and you should PICK archival_photo regardless of the year mentioned (Wikimedia / LoC / Internet Archive cover modern figures and events too). When availability.archival is false, do not pick archival_photo. Examples of scenes archival serves well: historic figures, on-camera moments, named events, era B-roll, iconic photos, official portraits — both pre-2000 ("1929 crash", "FDR's New Deal", "Bretton Woods 1944") and post-2000 ("Powell press conference", "ECB Lagarde", "Lehman 2008 floor") when the probe confirms hits.
 
-- ai_generated (BUDGET-CAPPED at $1/video ≈ 12 images, HARD LIMIT 25% of scenes): use liberally for ABSTRACT concepts, METAPHORS, FUTURE projections, HYPOTHETICAL scenarios, EMOTIONAL/conceptual moments. Examples: "the system collapsing", "shadow economy", "monetary tide", "policy machine", "the cycle repeating", "what if the dollar fell", "imagine a world without", "the looming crisis", "a generation's wealth evaporating". When a scene describes a CONCEPT rather than a physical thing, this is the right choice. Within the 25% cap, prefer ai_generated over stock for these.
+- ai_generated (BUDGET-CAPPED at $1/video ≈ 12 images — count is enforced by the HARD BUDGETS block above): pick for ABSTRACT concepts, METAPHORS, FUTURE projections, HYPOTHETICAL scenarios, EMOTIONAL/conceptual moments. Examples: "the system collapsing", "shadow economy", "monetary tide", "policy machine", "the cycle repeating", "what if the dollar fell", "imagine a world without", "the looming crisis", "a generation's wealth evaporating". When a scene describes a CONCEPT rather than a physical thing, this is the right choice — until the AI BUDGET is exhausted; then fall through to other types.
 
 - map (HARD CAP 3 per video for visual variety): ANY mention of specific countries, cities, regions, trade routes, supply chains, geographic comparisons, or location-based information. Examples: "Beijing pressures Brussels", "$50B China deal", "Shanghai port volumes", "EU-US tariffs", "supply chain through Singapore". When a scene names a PLACE in a meaningful way, this is the right choice.
 
-- stock_footage: ONLY when the scene literally describes a present-day CONCRETE action that stock footage shows well — "people walking on Wall Street", "hands typing on keyboards", "traders looking at screens", "executive in suit walking through office", "smartphone displaying app". If the scene is anything other than a literal present-day action with obvious stock visuals, prefer one of the other three types.
+- youtube (free, NO CAP): pick when the scene is built around a SPECIFIC on-camera moment that exists as a real video clip — press conferences, keynotes, breaking-news cut-ins, official statements at a podium, post-meeting remarks, congressional testimony, CEO interviews, signing ceremonies. Examples: "Powell at the FOMC podium", "Lagarde's whatever-it-takes moment", "Buffett Berkshire annual meeting clip", "Treasury Secretary press briefing". searchKeywords work just like a stock scene — bare name + role + occasion (≤4 words each), e.g. ["Powell FOMC press conference", "Federal Reserve podium", "Powell rate decision"]. Don't pick youtube for abstract concepts or generic B-roll (use ai_generated / stock_footage instead).
 
-Distribution targets (informational, not strict): aim for roughly archival 15-20%, ai_generated 20-25%, map 5-10%, stock 40-50%. The mix depends entirely on the script content — a historic script may be 80% archival, a geopolitics script 40% map, a market-psychology script 50% ai_generated. Pick the BEST type per scene, don't quota-fill.
+- stock_footage: ONLY when the scene literally describes a present-day CONCRETE action that stock footage shows well — "people walking on Wall Street", "hands typing on keyboards", "traders looking at screens", "executive in suit walking through office", "smartphone displaying app". If the scene is anything other than a literal present-day action with obvious stock visuals, prefer one of the other types.
 
 - searchKeywords RULES (Phase 15a + Phase 18 quality lift):
   * HARD LIMIT: MAX 3 items, each MAX 4 words. Anything longer is
@@ -5831,7 +5887,7 @@ Distribution targets (informational, not strict): aim for roughly archival 15-20
 - For map, the locations live in mapContext, so searchKeywords can be
   short descriptive labels.
 - searchKeywords must refine the beat hints with full scene context — better than the beat hints in isolation.
-- fallbackChain MUST start with the primary assetType. ai_generated → fallback ["ai_generated", "stock_footage"]; archival_photo → ["archival_photo", "stock_footage"]; map → ["map", "stock_footage"] (never use map as anyone's fallback).
+- fallbackChain MUST start with the primary assetType. ai_generated → fallback ["ai_generated", "stock_footage"]; archival_photo → ["archival_photo", "stock_footage"]; youtube → ["youtube", "stock_footage"]; map → ["map", "stock_footage"] (never use map as anyone's fallback).
 
 Input scenes (JSON):
 ${JSON.stringify(sceneInputs, null, 2)}
@@ -5844,11 +5900,51 @@ Output ONLY a JSON array of ${sceneInputs.length} objects, one per scene, in the
 // helpers so the Claude and Gemini paths produce identical output
 // shape. Extra context is empty here — Claude already gets the
 // per-scene voiceoverText inside sceneInputs.
-async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurationSec) {
+// Phase 4: mirrors the Gemini singlepass threading — when
+// USE_SINGLEPASS_SCENE_PLAN is on AND the caller supplied a
+// pre-probed `singlepassAvailability` array, re-prepare scenes
+// with inline availability hints + AI budget. validateScenePlanAgainstAvailability
+// still runs as a safety net in the caller regardless.
+async function buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurationSec, singlepassAvailability = null) {
   if (!Array.isArray(rawBeats) || rawBeats.length === 0) return [];
-  const {scenes, sceneInputs} = prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec);
+  let {scenes, sceneInputs} = prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec);
   if (scenes.length === 0) return [];
-  const prompt = buildScenePlanPrompt(sceneInputs, '');
+
+  let promptOpts = {};
+  if (process.env.USE_SINGLEPASS_SCENE_PLAN === 'true' &&
+      Array.isArray(singlepassAvailability) && singlepassAvailability.length > 0) {
+    try {
+      const probeT0 = Date.now();
+      const perScene = singlepassAvailability;
+      let archivalEligible = 0;
+      let mapProbed = 0;
+      let mapEligible = 0;
+      for (const r of perScene) {
+        if (r.loc > 0 || r.wiki > 0 || r.archive > 0) archivalEligible++;
+        if (r.mapbox != null) {
+          mapProbed++;
+          if (r.mapbox.count > 0) mapEligible++;
+        }
+      }
+      const aiBudgetImages = Math.max(1, Math.floor(AI_IMAGE_BUDGET_PER_VIDEO / AI_IMAGE_COST_PER_GENERATION));
+      const reprep = prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec, {
+        availability: perScene,
+        aiBudgetRemaining: aiBudgetImages,
+      });
+      sceneInputs = reprep.sceneInputs;
+      scenes = reprep.scenes;
+      promptOpts = {availabilityMode: 'inline', aiBudgetImages};
+      console.log(`[scene-plan/claude] singlepass pre-probe in ${Date.now() - probeT0}ms — ` +
+        `archival-eligible=${archivalEligible}/${sceneInputs.length}, ` +
+        `map-eligible=${mapEligible}/${mapProbed}, ` +
+        `aiBudgetImages=${aiBudgetImages}, cache=caller-supplied`);
+    } catch (e) {
+      console.warn(`[scene-plan/claude] singlepass threading failed: ${e.message} — proceeding without availability hints`);
+      promptOpts = {};
+    }
+  }
+
+  const prompt = buildScenePlanPrompt(sceneInputs, '', promptOpts);
   const t0 = Date.now();
   let enriched = [];
   try {
@@ -6475,6 +6571,30 @@ const ASSET_HANDLERS = {
     const stock = await handleStockChain(scene, ctx, 'stock_footage');
     return {...stock, provenance: [...arch.provenance, ...stock.provenance]};
   },
+  youtube: async (scene, ctx) => {
+    const provenance = [];
+    const keywords = Array.isArray(scene.searchKeywords) && scene.searchKeywords.length
+      ? scene.searchKeywords
+      : (ctx.sceneBeats?.[0]?.keywords || []);
+    const query = keywords.join(' ');
+    let clips = [];
+    if (query) {
+      try { clips = await youtubeSearchTop(query, 3); }
+      catch (e) { provenance.push({tried: 'youtube-search', ok: false, reason: e.message}); }
+    } else {
+      provenance.push({tried: 'youtube-search', ok: false, reason: 'no query'});
+    }
+    for (const c of clips) {
+      if (!c || !c.url) continue;
+      if (ctx.blocklist.has(c.url) || ctx.usedStockUrls.has(c.url)) continue;
+      ctx.usedStockUrls.add(c.url);
+      provenance.push({tried: 'youtube-search', ok: true});
+      return {url: c.url, source: 'youtube-clip', provenance, creator: c.creator || null};
+    }
+    if (query) provenance.push({tried: 'youtube-search', ok: false, reason: `${clips.length} clips, none usable`});
+    const stock = await handleStockChain(scene, ctx, 'stock_footage');
+    return {...stock, provenance: [...provenance, ...stock.provenance]};
+  },
   stock_footage: async (scene, ctx) => {
     return await handleStockChain(scene, ctx, 'stock_footage');
   },
@@ -6849,20 +6969,50 @@ async function validateScenePlanAgainstAvailability(scenes, availability, aiImag
       .map((s, idx) => ({idx, scene: s}))
       .filter((c) => c.scene.assetType === 'ai_generated' && c.scene.aiPrompt);
     let aiBudgetDowngraded = 0;
+    const downgradeRouting = {archival_photo: 0, youtube: 0, map: 0, stock_footage: 0};
     if (aiCandidates.length > aiCapImages) {
       // Singlepass already told the LLM the AI budget — overflow here
-      // means it ignored the hint. WARN once (not the loud per-scene
-      // logspam the legacy path emits) and downgrade the trailing
-      // overflow scenes to their own declared fallbackChain[1].
-      console.warn(`[scene-plan/validate] AI overflow despite singlepass hint: ${aiCandidates.length} requested, ${aiCapImages} budget — downgrading ${aiCandidates.length - aiCapImages} trailing scenes to fallbackChain[1]`);
+      // means it ignored the hint (Gemini consistently ignores per-scene
+      // budget hints when generating 100+ objects in one shot). Route
+      // each loser by per-scene availability instead of blindly sending
+      // all to stock_footage, so variety doesn't collapse.
+      console.warn(`[scene-plan/validate] AI overflow despite singlepass hint: ${aiCandidates.length} requested, ${aiCapImages} budget — routing ${aiCandidates.length - aiCapImages} trailing scenes by per-scene availability`);
+      const availByIdx = new Map();
+      for (const p of availability) if (p && typeof p.index === 'number') availByIdx.set(p.index, p);
+      const existingMapCount = scenes.filter((s) => s.assetType === 'map').length;
+      let mapPromotions = 0;
+      const maxNewMaps = Math.max(0, 3 - existingMapCount); // respect prompt's "HARD CAP 3" — adds at most 3 maps if none exist
+      const looksNamedEntity = (scene) => {
+        if (Array.isArray(scene.fallbackChain) && scene.fallbackChain.includes('youtube')) return true;
+        const kws = scene.searchKeywords || [];
+        for (const k of kws) {
+          for (const w of String(k).trim().split(/\s+/)) {
+            if (/^[A-Z][a-zA-Z]{2,}$/.test(w)) return true;
+          }
+        }
+        return false;
+      };
       const losers = aiCandidates.slice(aiCapImages);
       for (const l of losers) {
+        const probe = availByIdx.get(l.scene.index);
         l.scene._originalAssetType = l.scene.assetType;
-        l.scene.assetType = (l.scene.fallbackChain || [])[1]
-          || (l.scene.fallbackChain || []).find((t) => t !== 'ai_generated')
-          || 'stock_footage';
+        l.scene.aiPrompt = null; // no longer AI; clear the prompt so downstream renderer doesn't try to use it
+        let routed;
+        if (probe && (probe.loc > 0 || probe.wiki > 0 || probe.archive > 0)) {
+          routed = 'archival_photo';
+        } else if (looksNamedEntity(l.scene)) {
+          routed = 'youtube';
+        } else if (probe && probe.mapbox && probe.mapbox.count > 0 && mapPromotions < maxNewMaps) {
+          routed = 'map';
+          mapPromotions++;
+        } else {
+          routed = 'stock_footage';
+        }
+        l.scene.assetType = routed;
+        downgradeRouting[routed]++;
         aiBudgetDowngraded++;
       }
+      console.log(`[scene-plan/validate] AI overflow routing: archival=${downgradeRouting.archival_photo}, youtube=${downgradeRouting.youtube}, map=${downgradeRouting.map}, stock=${downgradeRouting.stock_footage}`);
     }
 
     // Map coord validation with backfill from the mapbox probe object.
@@ -7191,9 +7341,21 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
     const TEMPLATE_MAX_DURATION = 4;
     let footageStart = sceneStart;
     let templateCapped = false;
-    if (templateType && (sceneEnd - sceneStart) > TEMPLATE_MAX_DURATION) {
-      footageStart = sceneEnd - TEMPLATE_MAX_DURATION;
-      templateCapped = true;
+    // Skip the cap on scene 0 — there's no previous beat to stretch
+    // into the lead-in, so capping leaves [0, footageStart) rendering
+    // black for the entire intro (user reported ~12s black opener).
+    if (si > 0 && templateType && (sceneEnd - sceneStart) > TEMPLATE_MAX_DURATION) {
+      // Phase 18 fix 1B: clamp footageStart to the previous beat's reachable
+      // end. stretchFootageToFillGaps stretches prev up to footageStart, but
+      // video-source prev entries cap at +3s past their natural end (and at
+      // sourceDuration+0.5s when probed). When that cap < sceneEnd-4, a
+      // black gap appears between (prev.end+cap) and footageStart. Pulling
+      // footageStart back to prev.end guarantees no gap; the template just
+      // displays slightly longer than 4s on those rare scenes.
+      const prev = footage.length > 0 ? footage[footage.length - 1] : null;
+      const prevBeatEnd = (prev && typeof prev.end === 'number') ? prev.end : sceneStart;
+      footageStart = Math.max(sceneEnd - TEMPLATE_MAX_DURATION, prevBeatEnd);
+      templateCapped = footageStart > sceneStart;
     }
 
     footage.push({
@@ -7452,7 +7614,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       }
     }
     if (draftScenes.length === 0) {
-      draftScenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan);
+      draftScenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan, singlepassPerScene);
     }
     const probeStats = await validateScenePlanAgainstAvailability(draftScenes, singlepassPerScene, aiImageBudget);
     scenes = draftScenes;
@@ -7907,19 +8069,31 @@ async function probeUrl(url, {expectImage = false} = {}) {
     clearTimeout(timer);
   }
 }
-// Single-retry wrapper around probeUrl. Wikipedia / image CDNs occasionally
-// return HTTP 429 under sporadic load — a 5-second wait usually clears it.
-// Used by the preflight validator so a transient 429 doesn't burn a $5
-// Lambda render or force the user to manually press Resume.
+// Retry wrapper around probeUrl. Wikipedia / image CDNs frequently return
+// HTTP 429 (rate limit) or 503 (overloaded) under bulk preflight load —
+// the first attempt floods the upstream, then the second hits the still-
+// open throttle window. Two retries with increasing backoff (1s, 3s)
+// covers the typical throttle period. Other error classes (404 / timeout
+// / network) don't retry — they're permanent for the URL.
+function isTransientReason(reason) {
+  if (!reason) return false;
+  return /HTTP (429|503)/.test(reason);
+}
 async function probeUrlWithRetry(url, opts = {}) {
-  const first = await probeUrl(url, opts);
-  if (first.ok) return first;
-  await new Promise((r) => setTimeout(r, 5000));
-  const second = await probeUrl(url, opts);
-  if (second.ok) {
-    return {ok: true, retried: true, firstReason: first.reason};
+  const backoffsMs = [1000, 3000];
+  let last = await probeUrl(url, opts);
+  if (last.ok) return last;
+  let firstReason = last.reason;
+  let attempts = 1;
+  for (const delay of backoffsMs) {
+    if (!isTransientReason(last.reason)) break;
+    await new Promise((r) => setTimeout(r, delay));
+    last = await probeUrl(url, opts);
+    attempts++;
+    if (last.ok) return {ok: true, retried: true, firstReason};
   }
-  return {ok: false, reason: `${first.reason} → retry: ${second.reason}`};
+  const trail = attempts > 1 ? ` → retry: ${last.reason}` : '';
+  return {ok: false, reason: `${firstReason}${trail}`};
 }
 
 // Defensive music URL resolver. The dynamic music pipeline (Claude pick →
@@ -7976,19 +8150,28 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
     }
   }
 
-  // ─ URL probes (parallel, with single retry on transient failures) ─
+  // ─ URL probes (parallel, with retry+backoff on transient failures) ─
   // Failure handling is split by criticality:
-  //   - voiceover / footage / music → critical: failure aborts the render
-  //     ($5+ wasted Lambda is worse than a slightly-degraded render)
+  //   - voiceover / music → critical: failure aborts the render
+  //   - footage → degradable: try pexelsAlternates; if none work, null the
+  //     URL (gap-fill stretches the previous beat to cover). Hard-fail only
+  //     if unfixable footage exceeds FOOTAGE_UNFIXABLE_THRESHOLD of total —
+  //     one Wikimedia .djvu URL hitting a 429 must not kill a $5+ render.
   //   - overlay imageUrl → degradable: failure drops just that overlay
-  //     and the render proceeds. An overlay is an enhancement; one missing
-  //     entityPortrait beats the whole render failing on a single Wikipedia
-  //     429 (which is what burned job nGNkm7Trin6ZTdTefohn on day-11).
+  //     and the render proceeds.
+  const FOOTAGE_UNFIXABLE_THRESHOLD = 0.10;
   const probeJobs = [];
   if (voiceoverUrl) probeJobs.push(probeUrlWithRetry(voiceoverUrl).then((r) => ({label: 'voiceover', kind: 'critical', url: voiceoverUrl, ...r})));
   if (musicUrl) probeJobs.push(probeUrlWithRetry(musicUrl).then((r) => ({label: 'music', kind: 'critical', url: musicUrl, ...r})));
-  for (const f of footage || []) {
-    if (f?.url) probeJobs.push(probeUrlWithRetry(f.url).then((r) => ({label: `footage[${f.beatIndex ?? '?'}]`, kind: 'critical', url: f.url, ...r})));
+  for (let i = 0; i < (footage || []).length; i++) {
+    const f = footage[i];
+    if (f?.url) probeJobs.push(probeUrlWithRetry(f.url).then((r) => ({
+      label: `footage[${f.beatIndex ?? i}]`,
+      kind: 'footage',
+      footageIndex: i,
+      url: f.url,
+      ...r,
+    })));
   }
   // Overlay probes carry their index so we can splice failures from
   // overlayLayer in place (the array reference passed via inputProps is
@@ -8007,9 +8190,8 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
     }
   }
   const probeResults = await Promise.all(probeJobs);
-  // Two passes: collect critical failures into errors, collect overlay
-  // failures into a drop-list so we splice high-to-low (preserves indices).
   const overlayDropIndices = [];
+  const footageFailures = [];
   let retriedCount = 0;
   for (const r of probeResults) {
     if (r.retried) retriedCount++;
@@ -8017,9 +8199,51 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
     if (r.kind === 'overlay') {
       overlayDropIndices.push(r.overlayIndex);
       warnings.push(`dropped overlay[${r.overlayIndex}] (${r.overlayDescriptor}): probe failed — ${r.reason}`);
+    } else if (r.kind === 'footage') {
+      footageFailures.push({idx: r.footageIndex, reason: r.reason, url: r.url});
     } else {
       errors.push(`URL probe failed — ${r.label}: ${r.reason} (${r.url.slice(0, 100)})`);
     }
+  }
+  // Footage recovery: try each beat's pexelsAlternates (probe in turn,
+  // swap on first ok). If none survive, null the URL so gap-fill can
+  // stretch the previous beat over the silence.
+  let footageSwapped = 0;
+  let footageDropped = 0;
+  if (footageFailures.length && Array.isArray(footage)) {
+    for (const fail of footageFailures) {
+      const beat = footage[fail.idx];
+      const alts = (beat && Array.isArray(beat.pexelsAlternates)) ? beat.pexelsAlternates : [];
+      let swappedTo = null;
+      for (const altUrl of alts) {
+        const probe = await probeUrlWithRetry(altUrl);
+        if (probe.ok) { swappedTo = altUrl; break; }
+      }
+      if (swappedTo) {
+        footage[fail.idx] = {...beat, previousUrl: beat.url, url: swappedTo, originalUrl: swappedTo, replacedReason: `preflight pexels-alt swap (was: ${fail.reason})`};
+        footageSwapped++;
+        warnings.push(`swapped footage[${fail.idx}] to pexels alternate (was: ${fail.reason})`);
+      } else {
+        footage[fail.idx] = {...beat, previousUrl: beat.url, url: null, source: null, replacedReason: `preflight drop — no working alt (was: ${fail.reason})`};
+        footageDropped++;
+        warnings.push(`dropped footage[${fail.idx}] (no working alt): ${fail.reason}`);
+      }
+    }
+  }
+  // Re-fill gaps created by dropped footage so MainComp doesn't render
+  // black through the missing beats. Best-effort — if voiceover duration
+  // can't be derived from captions, use the last footage end as the cap.
+  if (footageDropped && Array.isArray(footage) && footage.length) {
+    const lastEnd = footage[footage.length - 1]?.end || voiceoverDurEstSec || 0;
+    const refilled = stretchFootageToFillGaps(footage, lastEnd);
+    for (let i = 0; i < refilled.length; i++) footage[i] = refilled[i];
+  }
+  // Hard-fail threshold: too many unfixable scenes means the render
+  // would be a slideshow of black gaps — better to abort than ship.
+  const totalFootage = (footage || []).length;
+  const unfixableRate = totalFootage ? footageDropped / totalFootage : 0;
+  if (unfixableRate > FOOTAGE_UNFIXABLE_THRESHOLD) {
+    errors.push(`footage unfixable rate ${(unfixableRate * 100).toFixed(1)}% > ${(FOOTAGE_UNFIXABLE_THRESHOLD * 100)}% threshold (${footageDropped}/${totalFootage} dropped, ${footageSwapped} swapped)`);
   }
   // Splice high-to-low so indices stay valid as we remove.
   if (overlayDropIndices.length && Array.isArray(overlayLayer)) {
@@ -8028,10 +8252,10 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
   }
 
   const ok = errors.length === 0;
-  console.log(`[preflight] ${jobId}: ok=${ok} probes=${probeResults.length} errors=${errors.length} warnings=${warnings.length} retries=${retriedCount} overlaysDropped=${overlayDropIndices.length}`);
+  console.log(`[preflight] ${jobId}: ok=${ok} probes=${probeResults.length} errors=${errors.length} warnings=${warnings.length} retries=${retriedCount} overlaysDropped=${overlayDropIndices.length} footageSwapped=${footageSwapped} footageDropped=${footageDropped}`);
   if (warnings.length) console.warn(`[preflight] ${jobId} warnings:\n  - ${warnings.join('\n  - ')}`);
   if (errors.length) console.warn(`[preflight] ${jobId} errors:\n  - ${errors.join('\n  - ')}`);
-  return {ok, errors, warnings, probesRun: probeResults.length, overlaysDropped: overlayDropIndices.length};
+  return {ok, errors, warnings, probesRun: probeResults.length, overlaysDropped: overlayDropIndices.length, footageSwapped, footageDropped};
 }
 
 async function renderOnLambda(inputProps, jobRef, {progressLabel = 'Rendering on Lambda'} = {}) {
