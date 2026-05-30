@@ -81,6 +81,19 @@ const YOUTUBE_API_KEY = defineSecret('YOUTUBE_API_KEY');
 const PIXABAY_API_KEY = defineSecret('PIXABAY_API_KEY');
 const UNSPLASH_ACCESS_KEY = defineSecret('UNSPLASH_ACCESS_KEY');
 
+// A bound secret can hold the literal placeholder "PENDING_SIGNUP" when
+// the account hasn't been provisioned yet — the env var is then truthy
+// but the upstream API rejects every call. Treat the placeholder as
+// "no key" so the gate at each source short-circuits instead of firing
+// guaranteed-fail requests that burn the cascade rung.
+function isUsableKey(v) {
+  if (!v) return false;
+  const s = String(v).trim();
+  if (!s) return false;
+  if (s.toUpperCase() === 'PENDING_SIGNUP') return false;
+  return true;
+}
+
 // ─── Non-secret config ──────────────────────────────────────────────
 const AWS_REGION = 'us-east-1';
 const REMOTION_LAMBDA_FUNCTION_NAME =
@@ -96,9 +109,20 @@ const REMOTION_LAMBDA_SERVE_URL =
 // Music volume default. Per-channel UI override (channelMusicSettings.volume)
 // still wins, EXCEPT a stored value of exactly 0 is treated as "unset" and
 // the default is used — a stale 0 override was silencing music entirely.
-// Phase 20: 0.04 was too quiet (user reported NO music at all in latest
-// render). Bumped to 0.08 — still well under voiceover, but audible.
-const DEFAULT_MUSIC_VOLUME = 0.08;
+// Phase 20: 0.04 was too quiet → 0.08 → 0.18 → 0.35 (audible but too
+// loud on the JPMorgan render — track-dependent) → 0.28 (user-validated
+// step down). Phase 21: 0.28 slightly overpowered the voiceover on the
+// Rem Report render → 0.18, a -3.84 dB cut (20·log10(0.18/0.28)) that
+// puts music ~14.9 dB under voice. Since the final loudnorm=I=-14 pass
+// normalizes the already-mixed program (VO dominates integrated loudness),
+// voice stays ~-14 LUFS and music drops the full ~3.8 dB. The library is
+// now loudness-normalized, so the older "0.18 = inaudible" annotations
+// were measured pre-backfill and no longer apply.
+// MUST stay in sync with remotion/src/MainComp.jsx fallback (~line 432);
+// otherwise split-mode segments rendered when the input prop is null would
+// silently fall through to the bundle's fallback at a different number
+// from what timings.musicVolume reports.
+const DEFAULT_MUSIC_VOLUME = 0.18;
 function getDefaultMusicVolume() {
   return DEFAULT_MUSIC_VOLUME;
 }
@@ -207,6 +231,92 @@ async function fetchWithRetry(url, opts = {}, retryOpts = {}) {
     }
   }
   throw lastErr || new Error(`${label}: exhausted ${maxAttempts} attempts`);
+}
+
+// Per-host concurrency limiter. loc.gov and Wikimedia Commons both rate-
+// limit aggressively when ~14 archival queries fire in parallel from one
+// rendering job. A small semaphore keeps in-flight requests low so each
+// caller sees Retry-After backoff against a fresh budget instead of all
+// 14 burning the limit at once. Shared by the pre-probe and the per-beat
+// sourcing call so the probe can't exhaust the budget either.
+function makeSemaphore(max) {
+  let inFlight = 0;
+  const queue = [];
+  return {
+    async acquire() {
+      if (inFlight < max) { inFlight++; return; }
+      await new Promise((resolve) => queue.push(resolve));
+    },
+    release() {
+      inFlight--;
+      if (queue.length) {
+        inFlight++;
+        queue.shift()();
+      }
+    },
+  };
+}
+// Caps tuned to keep us well under per-host rate limits while still
+// letting a 99-scene render drain in reasonable time. loc.gov 429s on
+// ~5 concurrent; Wikimedia Commons starts 429ing around 8-10 concurrent.
+const locGovSemaphore = makeSemaphore(2);
+const wikimediaSemaphore = makeSemaphore(3);
+
+// Fix #4: Wikimedia 429 cooldown. After fetchWithRetry exhausts its retries
+// and we still see a 429, set this so subsequent Wikimedia callers in the
+// same render skip the HTTP entirely for 60s instead of re-hammering the
+// API. Reset to 0 on a successful response so we recover automatically.
+let wikimediaRateLimitedUntil = 0;
+function wikimediaInCooldown() { return Date.now() < wikimediaRateLimitedUntil; }
+function markWikimediaRateLimited(ttlMs = 60_000) {
+  wikimediaRateLimitedUntil = Date.now() + ttlMs;
+}
+
+// PROACTIVE Wikimedia rate pacer. The concurrency semaphore caps PARALLEL
+// calls but not the sustained RATE — under a bulk render (entity-first probe
+// + archival cascade + scene-plan pre-probe all hitting Wikimedia) the rate
+// still 429s, which darkens all Wiki* for 60s and craters footage coverage.
+// This spaces every Wikimedia/Wikipedia HTTP call ≥ minIntervalMs apart
+// GLOBALLY (shared slot across the Commons search APIs + the Wikipedia REST
+// page-image fetch) so we stay under the limit and make steady progress
+// instead of bursting. Reactive cooldown remains a safety valve; pacing
+// keeps us from tripping it in the first place.
+let _wikiPaceNextSlotMs = 0;
+async function paceWikimedia(minIntervalMs = 250) {
+  const now = Date.now();
+  const wait = Math.max(0, _wikiPaceNextSlotMs - now);
+  _wikiPaceNextSlotMs = Math.max(now, _wikiPaceNextSlotMs) + minIntervalMs;
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+}
+
+// FIX 2: per-job probe-results cache. The scene-plan pre-probe fires
+// against LOC/Wikimedia first; the source-ladder fires the SAME hosts
+// again per scene 10-30 seconds later. The second wave lands inside
+// loc.gov's 429 window every single render — so we cache the URL list
+// that the probe already paid for and let the source-ladder read it
+// back instead of re-asking. Keyed by `${source}|${queryLowercased}`;
+// values are the parsed candidate arrays (objects with {url, creator})
+// in the same shape locGovSearchTop / wikimediaImageSearchTop already
+// return, so callers can use the cached value as-is.
+//
+// Scope: module-level so warm Cloud Functions instances reuse the cache
+// across the same job's pre-probe → source-ladder hop. Cleared at the
+// top of processJob so a later job in the same warm instance can't read
+// a previous job's URLs (cache misses fire fresh HTTP as usual).
+const probeResultsCache = new Map();
+function _probeCacheKey(source, query) {
+  return `${source}|${String(query || '').trim().toLowerCase()}`;
+}
+function getProbeCache(source, query) {
+  const k = _probeCacheKey(source, query);
+  return probeResultsCache.has(k) ? probeResultsCache.get(k) : null;
+}
+function setProbeCache(source, query, results) {
+  const k = _probeCacheKey(source, query);
+  probeResultsCache.set(k, Array.isArray(results) ? results : []);
+}
+function clearProbeCache() {
+  probeResultsCache.clear();
 }
 
 // ─── AssemblyAI ─────────────────────────────────────────────────────
@@ -656,6 +766,7 @@ ${scriptText.slice(0, 2500)}`;
 const MUSIC_TITLE_BLOCKLIST = new Set([
   'Inspirational Cinematic Orchestra',
   'Sigmamusicart Epic Cinematic',
+  'Absolutesound Suspense Ambience', // user flagged "terrible" 2026-05-29 — never use again
 ]);
 
 // Phase-16A: COPYRIGHT-CLAIMED blocklist. Distinct from
@@ -709,6 +820,10 @@ const MUSIC_URL_BLOCKLIST = [
   {
     urlSubstring: '84_Dramatic_Music',
     reason: 'YouTube Content ID claim 2026-05 — block any track with this filename in storage URL',
+  },
+  {
+    urlSubstring: 'Absolutesound_Suspense_Ambience',
+    reason: 'user flagged as terrible 2026-05-29 — never use again (trackId MwJbMQZnjRjXgOIUkzbW)',
   },
 ];
 
@@ -853,11 +968,27 @@ async function selectMusicForVideo({
   // small we widen back to the full set — Claude can still pick the
   // longest available even when nothing matches the duration target.
   const longEnough = tracks.filter((t) => (t.duration || 0) >= voiceoverDurationSec * 0.8);
-  const candidatePool = longEnough.length >= 3 ? longEnough : tracks;
+  const durationPool = longEnough.length >= 3 ? longEnough : tracks;
+
+  // Phase 22: LRA filter for steady documentary-bed selection. Tracks
+  // with LRA<5 LU are flat enough to sit under voiceover at constant
+  // gain without quiet→loud swings that make the music feel uneven on
+  // screen. Backfill ran ffmpeg ebur128 on all 40 tracks: at LRA<5
+  // the pool is 15 tracks across all six moods (6 flat + 9 medium-flat),
+  // cleanly excluding the 7 dynamic trailer-style tracks (LRA≥9)
+  // that caused the JPMorgan ear-test "quiet intro → loud climax"
+  // unevenness. New uploads land lra-tagged via bulk-import-music.js.
+  // Tracks predating the backfill (none today, but defensive) are
+  // excluded from the LRA-filtered set; widen-back catches the case
+  // where LRA filtering leaves too few candidates.
+  const lraFiltered = durationPool.filter((t) => typeof t.lra === 'number' && t.lra < 5);
+  const candidatePool = lraFiltered.length >= 3 ? lraFiltered : durationPool;
+  const lraFilterActive = candidatePool === lraFiltered;
 
   const trackLines = candidatePool.map((t) => {
     const dur = t.duration ? `${Math.round(t.duration)}s` : 'unknown duration';
-    return `- ID:${t.id}  mood:${t.mood||'?'}  ${dur}  name:"${(t.name||'').slice(0, 60)}"`;
+    const lra = typeof t.lra === 'number' ? `LRA:${t.lra.toFixed(1)}` : 'LRA:?';
+    return `- ID:${t.id}  mood:${t.mood||'?'}  ${dur}  ${lra}  name:"${(t.name||'').slice(0, 60)}"`;
   }).join('\n');
 
   const scriptIntro = (scriptText || '').slice(0, 500);
@@ -872,10 +1003,10 @@ VIDEO
 - Script intro: ${scriptIntro}
 - Script climax: ${scriptOutro}
 
-TRACKS (${candidatePool.length}):
+TRACKS (${candidatePool.length}${lraFilterActive ? ', pre-filtered LRA<5 for steady documentary bed' : ', LRA filter widened — pool was too small after filtering'}):
 ${trackLines}
 
-Pick the best fit on mood + topic. Prefer tracks with duration ≥ video length when possible.
+Pick the best fit on mood + topic. LRA (loudness range, in LU) is the track's quiet-vs-loud swing — lower = flatter, more even under voiceover; higher = bigger build-ups that feel uneven as a constant bed. Among tracks that fit mood + topic equally well, prefer the LOWEST LRA. Prefer tracks with duration ≥ video length when possible.
 Don't worry about volume — that's controlled separately by the render pipeline.
 
 Output ONLY a JSON object, no prose, no fences:
@@ -896,9 +1027,16 @@ Output ONLY a JSON object, no prose, no fences:
   };
 }
 
-// Run ebur128 over a local audio file to extract integrated loudness
-// (LUFS). Returns null on failure — never blocks an upload, just means
-// the track lands without precomputed loudness metadata.
+// Run ebur128 over a local audio file to extract integrated loudness,
+// loudness range, and true peak. Returns {i, lra, peak} on success or
+// null on failure — never blocks an upload, just means the track lands
+// without precomputed loudness metadata.
+//
+// Note: this function is currently orphan code in index.js — the real
+// upload path lives in scripts/bulk-import-music.js (measureLufs there
+// is the function actually called when a track is added to the library).
+// Both must stay in sync; extending one without the other regresses the
+// upload-time metadata capture.
 async function measureIntegratedLoudness(localPath) {
   const ffmpegPath = getFfmpegPath();
   if (!ffmpegPath) return null;
@@ -906,7 +1044,7 @@ async function measureIntegratedLoudness(localPath) {
     const {spawn} = require('node:child_process');
     const proc = spawn(ffmpegPath, [
       '-i', localPath,
-      '-af', 'ebur128',
+      '-af', 'ebur128=peak=true',
       '-f', 'null', '-',
     ], {stdio: ['ignore', 'ignore', 'pipe']});
     let err = '';
@@ -914,9 +1052,18 @@ async function measureIntegratedLoudness(localPath) {
     const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} resolve(null); }, 60000);
     proc.once('close', () => {
       clearTimeout(timer);
-      // ebur128 prints a final summary block ending with "Integrated loudness:"
-      const m = /Integrated loudness:[\s\S]*?I:\s*(-?[\d.]+)\s*LUFS/i.exec(err);
-      resolve(m ? parseFloat(m[1]) : null);
+      // ebur128 prints a final summary block at process exit with section
+      // headers. Match in each section so we don't grab per-frame
+      // readings like "I: -70.0 LUFS" emitted before audio kicks in.
+      const iM   = /Integrated loudness:[\s\S]*?I:\s*(-?[\d.]+)\s*LUFS/i.exec(err);
+      const lraM = /Loudness range:[\s\S]*?LRA:\s*(-?[\d.]+)\s*LU/i.exec(err);
+      const pkM  = /True peak:[\s\S]*?Peak:\s*(-?[\d.]+)\s*dBFS/i.exec(err);
+      if (!iM || !lraM) return resolve(null);
+      resolve({
+        i:    parseFloat(iM[1]),
+        lra:  parseFloat(lraM[1]),
+        peak: pkM ? parseFloat(pkM[1]) : null,
+      });
     });
     proc.once('error', () => { clearTimeout(timer); resolve(null); });
   });
@@ -1101,6 +1248,7 @@ const COMPANY_DOMAIN_MAP = {
   'microsoft': 'microsoft.com',
   'tesla': 'tesla.com',
   'nvidia': 'nvidia.com',
+  'dell': 'dell.com',
   'meta': 'meta.com',
   'facebook': 'meta.com',
   'reuters': 'reuters.com',
@@ -1195,6 +1343,15 @@ async function fetchWikipediaImage(name) {
   if (!name || typeof name !== 'string') return null;
   const key = name.trim().toLowerCase();
   if (_wikiImageCache.has(key)) return _wikiImageCache.get(key);
+  // FIX 3: shared Wikimedia cooldown. When a 429 has tripped the cooldown
+  // (Commons search API, the image CDN via caching/validation, or a prior
+  // REST call here) skip the REST + 6-qualifier loop entirely rather than
+  // piling more requests onto a throttled host. Do NOT negative-cache —
+  // once the cooldown lifts a later scene can still resolve this name.
+  if (wikimediaInCooldown()) {
+    console.log(`[wiki] "${name.trim()}" skipped — Wikimedia in 429 cooldown`);
+    return null;
+  }
   const baseName = name.trim();
   try {
     // Phase 1: try bare name + common qualifiers if disambig.
@@ -1204,6 +1361,7 @@ async function fetchWikipediaImage(name) {
     for (const qualifier of _PERSON_DISAMBIG_QUALIFIERS) {
       const candidate = qualifier ? `${baseName} ${qualifier}` : baseName;
       const url = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(candidate)}`;
+      await paceWikimedia();
       let resp;
       try {
         resp = await fetchWithRetry(
@@ -1215,7 +1373,17 @@ async function fetchWikipediaImage(name) {
         console.warn(`[wiki] "${candidate}" fetch failed after retries: ${e.message}`);
         continue;
       }
-      if (!resp.ok) continue;
+      if (!resp.ok) {
+        // FIX 3: on 429, trip the shared cooldown and stop trying further
+        // qualifiers — return null WITHOUT negative-caching so a later
+        // scene can retry once the cooldown lifts.
+        if (resp.status === 429) {
+          markWikimediaRateLimited();
+          console.warn(`[wiki] "${baseName}" 429 — entering Wikimedia cooldown, skipping remaining qualifiers`);
+          return null;
+        }
+        continue;
+      }
       const data = await resp.json();
       if (data.type === 'disambiguation') continue;
       const imageUrl = data.originalimage?.source || data.thumbnail?.source || null;
@@ -1242,8 +1410,32 @@ async function fetchWikipediaImage(name) {
 // at the start of each beat that mentions them. Mutates `rawBeats` in
 // place. No-op if no beats have entities. Caps total enrichment time
 // at ~6s (12 entities × 500ms typical Wikipedia latency).
+// CHANGE B: entityPortrait overlay disabled. The corner/centered portrait
+// card frequently showed the WRONG person (Wikipedia disambiguation, name
+// collisions, stale Logo.dev hits) — net negative on viewer trust. Skip
+// injection so the scene's underlying fullscreen footage (the archival/
+// stock asset it already sourced) plays uninterrupted. No black frames:
+// the overlay was an absolute-positioned div over OffthreadVideo/Img;
+// removing it just stops the card from drawing.
+//
+// Downstream consequences (all benign):
+//   • pairQuotesWithEntityPortraits drops quotes paired to a missing
+//     portrait (existing orphan-quote behavior — no new code path)
+//   • [verify-overlay] / [anchor] / [overlay-spacing] logs for
+//     entityPortrait simply go silent
+//   • beat.entities is still populated and still used by the
+//     entity-anchored footage probe (Microsoft / LinkedIn / Substack
+//     archival sourcing — unaffected)
+//   • Image fetch (Logo.dev + Wikipedia) is skipped: ~3-6s pipeline time
+//     saved per job, no Wikipedia/Logo.dev calls
+const ENTITY_PORTRAIT_OVERLAY_DISABLED = true;
+
 async function enrichBeatsWithEntityImages(rawBeats, captions = null) {
   if (!Array.isArray(rawBeats) || rawBeats.length === 0) return;
+  if (ENTITY_PORTRAIT_OVERLAY_DISABLED) {
+    console.log(`[entities] portrait overlay disabled — beat.entities preserved for footage sourcing; no corner/center cards will render`);
+    return;
+  }
   const unique = new Map(); // canonicalName → {type, imageUrl?}
   for (const b of rawBeats) {
     if (!Array.isArray(b?.entities)) continue;
@@ -2041,6 +2233,81 @@ function _intToWords(n) {
   }
   return null; // numbers ≥1000 — let the digit form carry it
 }
+
+// ─── Item #8: spell out numbers for TTS ─────────────────────────────
+// ElevenLabs rushes/mispronounces raw numeric forms ("$2.4 trillion",
+// "5.25%", "300,000", "2008"). normalizeNumbersForTts runs on the
+// fact-checked script JUST before it's sent to TTS — nothing else
+// (overlays, footage search, captions) is affected. CONSERVATIVE by
+// design: only currency, percentages, <scale-word> numbers, 1900–2099
+// years, and comma-grouped integers are converted. Bare small integers
+// and index/entity numbers ("S&P 500", "50 basis points", "200-day")
+// are deliberately left untouched so names/quantities aren't mangled.
+function _ttsBelow1000(n) {
+  if (n < 20) return _DIGIT_WORDS[n];
+  if (n < 100) { const t = Math.floor(n / 10); const o = n % 10; return o ? `${_TENS_WORDS[t]}-${_DIGIT_WORDS[o]}` : _TENS_WORDS[t]; }
+  const h = Math.floor(n / 100); const r = n % 100;
+  return r ? `${_DIGIT_WORDS[h]} hundred ${_ttsBelow1000(r)}` : `${_DIGIT_WORDS[h]} hundred`;
+}
+function _ttsIntToWords(n) {
+  if (n === 0) return 'zero';
+  const scales = [['trillion', 1e12], ['billion', 1e9], ['million', 1e6], ['thousand', 1e3]];
+  const parts = [];
+  let rem = n;
+  for (const [name, val] of scales) {
+    if (rem >= val) { parts.push(`${_ttsBelow1000(Math.floor(rem / val))} ${name}`); rem %= val; }
+  }
+  if (rem > 0) parts.push(_ttsBelow1000(rem));
+  return parts.join(' ');
+}
+// "2.4" → "two point four"; "300000" → "three hundred thousand";
+// "5.25" → "five point two five". Integer part read as a number; decimal
+// digits read individually (natural for prices/percentages).
+function _ttsNumberToWords(numStr) {
+  const neg = /^-/.test(numStr);
+  const s = String(numStr).replace(/^-/, '').replace(/,/g, '');
+  const [intPart, decPart] = s.split('.');
+  let w = _ttsIntToWords(parseInt(intPart || '0', 10));
+  if (decPart) w += ' point ' + decPart.split('').map((d) => _DIGIT_WORDS[+d]).join(' ');
+  return (neg ? 'negative ' : '') + w;
+}
+// 2008 → "twenty oh eight"; 2025 → "twenty twenty-five"; 1980 →
+// "nineteen eighty"; 2000 → "two thousand"; 2010 → "twenty ten".
+function _ttsYearToWords(y) {
+  if (y % 1000 === 0) return `${_ttsBelow1000(y / 1000)} thousand`;
+  if (y % 100 === 0) return `${_ttsBelow1000(Math.floor(y / 100))} hundred`;
+  const hi = Math.floor(y / 100); const lo = y % 100;
+  const loW = lo < 10 ? `oh ${_DIGIT_WORDS[lo]}` : _ttsBelow1000(lo);
+  return `${_ttsBelow1000(hi)} ${loW}`;
+}
+function normalizeNumbersForTts(text) {
+  if (!text || typeof text !== 'string') return text;
+  return text
+    // $ + scale word: "$2.4 trillion", "-$2 trillion"
+    .replace(/(-?)\$\s?(\d[\d,]*(?:\.\d+)?)\s+(trillion|billion|million|thousand)\b/gi,
+      (_m, sign, num, scale) => `${sign ? 'negative ' : ''}${_ttsNumberToWords(num)} ${scale.toLowerCase()} dollars`)
+    // $ + K/M/B suffix: "$69K", "$50B" (avoids "...dollars K" mangling)
+    .replace(/(-?)\$\s?(\d[\d,]*(?:\.\d+)?)\s?([KkMmBb])\b/g,
+      (_m, sign, num, suf) => { const map = {k: 'thousand', m: 'million', b: 'billion'}; return `${sign ? 'negative ' : ''}${_ttsNumberToWords(num)} ${map[suf.toLowerCase()]} dollars`; })
+    // $ plain: "$300,000", "$73,000", "$50"
+    .replace(/(-?)\$\s?(\d[\d,]*(?:\.\d+)?)/g,
+      (_m, sign, num) => `${sign ? 'negative ' : ''}${_ttsNumberToWords(num)} dollars`)
+    // percent: "5.25%", "-19%", "75%"
+    .replace(/(-?)(\d[\d,]*(?:\.\d+)?)\s?%/g,
+      (_m, sign, num) => `${sign ? 'negative ' : ''}${_ttsNumberToWords(num)} percent`)
+    // number + scale word, no currency: "2.4 trillion"
+    .replace(/\b(\d[\d,]*(?:\.\d+)?)\s+(trillion|billion|million|thousand)\b/gi,
+      (_m, num, scale) => `${_ttsNumberToWords(num)} ${scale.toLowerCase()}`)
+    // years 1900–2099, standalone. Lookahead blocks a following digit and a
+    // decimal point ONLY when it precedes a digit ("2008.5"), so a year that
+    // ends a sentence ("...since 2008.") still converts.
+    .replace(/(?<![\d.$,])(19\d\d|20\d\d)(?!\d)(?!\.\d)/g,
+      (m) => _ttsYearToWords(parseInt(m, 10)))
+    // bare comma-grouped integers: "300,000"
+    .replace(/\b\d{1,3}(?:,\d{3})+\b/g,
+      (m) => _ttsIntToWords(parseInt(m.replace(/,/g, ''), 10)));
+}
+
 function expandStatTextVariants(text) {
   const out = new Set();
   const raw = (text || '').trim();
@@ -2671,17 +2938,150 @@ function dropRedundantLowerThirds(rawBeats) {
 // now parses its own text and animates count-up intrinsically when
 // the value qualifies, so no server-side upgrade pass is needed.)
 // Niche → target beat duration (seconds). Drives editing pace —
-// finance/news/breaking content gets 3s cuts (tight), documentary
-// gets 6s (slower). User feedback after the first 100/100 render:
-// "clips still are too long should cut more often" — tightened
-// finance from 4 → 3 to push toward 3-5s beats. No UI setting;
-// computed from channel.niche text.
+// finance/news/breaking content gets 2s cuts (tight), documentary
+// gets 6s (slower). History: 4 → 3 (first user push) → 2 (after
+// ffprobe-measured avg of ~6.8s on 4 jobs proved the 3s target was
+// still being missed; tightening to 2 aims for 2-4s beats with the
+// scene builder's HARD_MAX=6s catching only the outliers, so most
+// cuts land on LLM-chosen sentence boundaries rather than arbitrary
+// mid-sentence breaks). No UI setting; computed from channel.niche.
 function targetPaceForNiche(niche) {
   const n = (niche || '').toLowerCase();
-  if (/finance|news|stock|market|invest|crypto|breaking|trading|economy/.test(n)) return 3;
+  if (/finance|news|stock|market|invest|crypto|breaking|trading|economy/.test(n)) return 2;
   if (/tech|\bai\b|coding|software|programming|gaming|product/.test(n)) return 4;
   if (/documentary|history|deep dive|long form|essay/.test(n)) return 6;
   return 4; // sensible default for anything we haven't bucketed
+}
+
+// Entity-enumeration detection. Looks for sequences of NAMED ENTITIES
+// (capitalized tokens, optionally multi-word) separated by commas /
+// periods / "and" / "or" — either the comma-list form ("Apple,
+// Microsoft, Google, and Meta") or the "Not X. Not Y." emphatic form
+// ("Not Intel. Not Qualcomm. Not Texas Instruments."). Returns the
+// list of entity strings in order, or [] when no enumeration matches.
+// STOPWORDS keeps ordinals/pronouns/list-markers from being mistaken
+// for entities even when they appear capitalized at sentence start.
+function findEnumeratedEntities(sentence) {
+  if (typeof sentence !== 'string' || !sentence.trim()) return [];
+  const STOPWORDS = new Set([
+    'I','A','An','The','And','Or','But','Not','No','Yes','It','He','She','They','We','You',
+    'This','That','These','Those','First','Second','Third','Fourth','Fifth','Sixth','Last',
+    'Then','Now','Today','Tomorrow','Yesterday','Here','There','Some','Most','All','Every',
+    'Many','Few','Several','One','Two','Three','Four','Five','Six','Seven','Eight','Nine','Ten',
+    'Both','Either','Neither',
+  ]);
+  const entityTok = `[A-Z][A-Za-z0-9.&'-]*(?:\\s+[A-Z][A-Za-z0-9.&'-]+)*`;
+  const cleanList = (parts) => {
+    const out = [];
+    for (const raw of parts) {
+      const p = raw.trim();
+      if (!p) continue;
+      const head = p.split(/\s+/)[0];
+      if (STOPWORDS.has(head)) continue;
+      out.push(p);
+    }
+    return out;
+  };
+  // Emphatic form: "Not X. Not Y. Not Z."
+  const negRe = /(?:^|\.\s+)Not\s+([A-Z][A-Za-z0-9.&'-]*(?:\s+[A-Z][A-Za-z0-9.&'-]+)*)/g;
+  const negs = [];
+  let m;
+  while ((m = negRe.exec(sentence)) !== null) negs.push(m[1].trim());
+  if (negs.length >= 2) {
+    const cleaned = cleanList(negs);
+    if (cleaned.length >= 2) return cleaned;
+  }
+  // Comma list with optional trailing ", and X" / ", or X"
+  const commaRe = new RegExp(`(${entityTok})((?:,\\s+${entityTok})+(?:,?\\s+(?:and|or)\\s+${entityTok})?)`);
+  const cm = commaRe.exec(sentence);
+  if (cm) {
+    const all = cm[0];
+    const parts = all.split(/,\s+(?:and\s+|or\s+)?|\s+(?:and|or)\s+/);
+    const cleaned = cleanList(parts);
+    if (cleaned.length >= 2) return cleaned;
+  }
+  // Simple "X and Y" / "X or Y"
+  const andRe = new RegExp(`(${entityTok})(?:\\s+(?:and|or)\\s+(${entityTok}))+`);
+  const am = andRe.exec(sentence);
+  if (am) {
+    const all = am[0];
+    const parts = all.split(/\s+(?:and|or)\s+/);
+    const cleaned = cleanList(parts);
+    if (cleaned.length >= 2) return cleaned;
+  }
+  return [];
+}
+
+// Safety net for the ENTITY ENUMERATION SPLIT RULE in the breakIntoBeats
+// prompt. Even with explicit instruction Claude sometimes returns ONE
+// beat covering "Not Intel. Not Qualcomm. Not Texas Instruments." (the
+// failure mode from the Micron job diagnosis). This pass walks each
+// beat, detects multi-entity enumerations in beat.sentence, and splits
+// into per-entity sub-beats with the time window divided evenly. To
+// avoid double-splitting beats Claude already split correctly, we skip
+// any beat whose keywords already name exactly one of the detected
+// entities (the LLM-pre-split sub-beat case). Hero / overlay / sfx
+// metadata stays on the FIRST sub-beat only so density floors aren't
+// undermined by duplicate overlays.
+function splitEntityEnumerationBeats(beats) {
+  if (!Array.isArray(beats) || beats.length === 0) return beats;
+  const out = [];
+  let splitCount = 0;
+  let addedCount = 0;
+  for (const beat of beats) {
+    if (!beat || typeof beat.sentence !== 'string') {
+      out.push(beat);
+      continue;
+    }
+    const entities = findEnumeratedEntities(beat.sentence);
+    if (entities.length < 2) {
+      out.push(beat);
+      continue;
+    }
+    // LLM-pre-split guard: if this beat's keywords already target a
+    // single one of the detected entities, treat it as a finished
+    // sub-beat and don't re-split. Substring match in either direction
+    // so "Texas Instruments" matches keyword "texas instruments office".
+    const kwLower = (beat.keywords || []).map((k) => String(k).toLowerCase());
+    const hits = entities.filter((e) => {
+      const eLow = e.toLowerCase();
+      return kwLower.some((k) => k.includes(eLow) || eLow.includes(k));
+    });
+    if (hits.length === 1) {
+      out.push(beat);
+      continue;
+    }
+    const start = typeof beat.start === 'number' ? beat.start : 0;
+    const end = typeof beat.end === 'number' ? beat.end : start;
+    const duration = end - start;
+    if (duration <= 0) {
+      out.push(beat);
+      continue;
+    }
+    const perEntity = duration / entities.length;
+    for (let i = 0; i < entities.length; i++) {
+      const subStart = start + i * perEntity;
+      const subEnd = i === entities.length - 1 ? end : start + (i + 1) * perEntity;
+      const isFirst = i === 0;
+      out.push({
+        ...beat,
+        start: subStart,
+        end: subEnd,
+        keywords: [entities[i]],
+        heroMoment: isFirst ? !!beat.heroMoment : false,
+        overlays: isFirst ? (Array.isArray(beat.overlays) ? beat.overlays : []) : [],
+        sfx: isFirst ? (Array.isArray(beat.sfx) ? beat.sfx : []) : [],
+        entities: [{type: 'company', name: entities[i]}],
+      });
+    }
+    splitCount++;
+    addedCount += entities.length - 1;
+    console.log(`[beat-split] "${beat.sentence.slice(0, 60)}…" (${start.toFixed(1)}→${end.toFixed(1)}s) → ${entities.length} entity beats: ${entities.join(', ')}`);
+  }
+  if (splitCount > 0) {
+    console.log(`[beat-split] split ${splitCount} multi-entity beat(s) into ${addedCount} extra sub-beats (total ${out.length})`);
+  }
+  return out;
 }
 
 async function breakIntoBeats(captions, anthropicKey, {channelId, timingTags} = {}) {
@@ -2722,12 +3122,35 @@ async function breakIntoBeats(captions, anthropicKey, {channelId, timingTags} = 
 
 DO NOT refuse this task based on content quality, topic relevance, brevity, perceived inappropriateness, or any other judgment about the content. The transcription is whatever the speaker said; your job is just to group it. Always submit at least one beat. An empty beats array is a task failure.
 
-PACING REQUIREMENT (mandatory) — viewer should see a visual change every ${targetSec}-${targetSec + 2} seconds. HARD CEILING: 5s per beat. A beat longer than 5s is a pacing failure — split it.
-- Target beat duration: ${targetSec}-${targetSec + 2} seconds.
-- This script is ${totalScriptSec.toFixed(1)}s long → aim for ~${expectedBeats} beats. A 5-minute video at this pace = ~${Math.round(300 / targetSec)} beats; producing half that is a task failure.
+PACING REQUIREMENT (HARD CONTRACT — failure = task failure):
+- Target beat duration: ${targetSec}-${targetSec + 2} seconds. HARD CEILING: ${targetSec + 3}s per beat.
+- This script is ${totalScriptSec.toFixed(1)}s long. You MUST return AT LEAST ${expectedBeats} beats. Returning fewer than ${expectedBeats} beats is an immediate task failure — the output will be rejected and re-prompted. There is no upper limit; more shorter beats is always preferred over fewer longer ones. A 5-minute video at this pace = ~${Math.round(300 / targetSec)} beats.
+- Every sentence longer than ${targetSec + 1}s MUST be split into 2+ beats with DIFFERENT visual keywords per beat. Same sentence text on each split-beat is fine — the time range and the keywords must differ. A long sentence kept as a single beat IS a task failure.
 - Combine adjacent short sentences only when BOTH are under 1.5s.
-- AGGRESSIVELY SPLIT any sentence longer than ${targetSec + 1}s into multiple beats — same sentence text, different start/end ranges within the sentence's time window, different visual keywords per beat. The viewer should never sit on one clip for more than ${targetSec + 2}s.
-  Example: a sentence from 10.0s→18.5s (8.5s) becomes 2-3 beats: beat A 10.0→13.0 keywords=["wall street trader screens"], beat B 13.0→16.0 keywords=["federal reserve building exterior"], beat C 16.0→18.5 keywords=["dollar bills closeup"]. All three share the same sentence text but cut the visual every 3s.
+- The viewer must NEVER sit on a single visual for more than ${targetSec + 2}s. Mid-sentence cuts at natural pause/phrase boundaries are preferred over arbitrary timestamps — read the sentence and split where the meaning breaks (clause, comma, transition word).
+  Example: a 10.0s→18.5s sentence (8.5s) at targetSec=${targetSec} becomes 3-4 beats:
+    beat A 10.0→12.5 keywords=["wall street trader screens"]
+    beat B 12.5→15.0 keywords=["federal reserve building exterior"]
+    beat C 15.0→17.0 keywords=["dollar bills closeup"]
+    beat D 17.0→18.5 keywords=["bond yield chart upward"]
+  All four share the same sentence text; the time ranges divide the sentence's 8.5s window; the keywords change at each cut so the visual actually changes.
+
+ENTITY ENUMERATION SPLIT RULE (HARD CONTRACT — failure = task failure):
+When a sentence enumerates two or more NAMED ENTITIES (companies, tickers, real people, branded products) in series — separated by commas, periods, or the words "and" / "or" — EACH ENTITY GETS ITS OWN BEAT, even if the combined sentence is short. The viewer should see Intel's logo/footage when "Intel" is spoken, Qualcomm's when "Qualcomm" is spoken, etc. One image covering three named companies is a task failure.
+
+Examples (each row = one input sentence → required beat count and per-beat keywords/entities):
+- "Not Intel. Not Qualcomm. Not Texas Instruments." → 3 beats. Beat A keywords=["Intel headquarters"], entities=[{type:"company",name:"Intel"}]. Beat B keywords=["Qualcomm logo"], entities=[{type:"company",name:"Qualcomm"}]. Beat C keywords=["Texas Instruments office"], entities=[{type:"company",name:"Texas Instruments"}].
+- "Nvidia, AMD, Broadcom" → 3 beats, one per company. Each beat's keywords and entities point at the single company that beat covers.
+- "Samsung and SK Hynix" → 2 beats.
+- "Apple, Microsoft, Google, and Meta" → 4 beats.
+- "Powell and Yellen" → 2 beats. Each beat targets one person.
+
+Do NOT split when the list is not made of named entities:
+- "first, second, third" → 1 beat (ordinals, not entities).
+- "fast, cheap, and reliable" → 1 beat (adjectives).
+- "she walked, then ran, then stopped" → 1 beat (verbs).
+
+Splitting applies even when the total sentence is short. Three 1.5s entity beats beat one 4.5s beat with a generic combined image. Divide the sentence's time window evenly across the entities; reuse the full sentence text on each sub-beat (the time range and the keywords/entities differ). This rule overrides the "combine adjacent short sentences" guidance above — never combine sentences that name different entities.
 
 STEP 1 — Group sentences into beats. For each beat, set:
 - start / end timing (seconds, from the input — start of first sentence to end of last sentence in the beat, or a split-range within one sentence if you're cutting mid-sentence per the pacing rule)
@@ -2996,6 +3419,11 @@ Regenerate the SAME ${totalSec.toFixed(0)}s of beats with MORE visual density on
         if (bestScore >= 2.7) break;
       }
     }
+    const beforeSplit = bestBeats.length;
+    bestBeats = splitEntityEnumerationBeats(bestBeats);
+    if (bestBeats.length !== beforeSplit) {
+      console.log(`breakIntoBeats: entity-enumeration split expanded ${beforeSplit} → ${bestBeats.length} beats`);
+    }
     console.log(`breakIntoBeats: final ${bestMeasure.overlays} overlays, ${bestMeasure.entities} entities, ${bestMeasure.animations} animations across ${bestBeats.length} beats (score ${bestScore.toFixed(2)})`);
     return bestBeats;
   }
@@ -3100,7 +3528,7 @@ async function pexelsSearchTop(query, n = 3) {
 // Pexels — returns up to N direct mp4 URLs sorted by relevance.
 // PIXABAY_API_KEY must be in env (register at pixabay.com/api/docs/).
 async function pixabaySearchTop(query, n = 3) {
-  if (!process.env.PIXABAY_API_KEY) return [];
+  if (!isUsableKey(process.env.PIXABAY_API_KEY)) return [];
   const url = new URL('https://pixabay.com/api/videos/');
   url.searchParams.set('key', process.env.PIXABAY_API_KEY);
   url.searchParams.set('q', query);
@@ -3133,9 +3561,81 @@ async function pixabaySearchTop(query, n = 3) {
 // file with non-free or restrictive licenses). Returns absolute image
 // URLs. Used by searchAllFootageSources when the scene plan emits
 // assetType="archival_photo".
+// Fix #4: relevance filter for Wikimedia search results. Wikimedia's
+// fulltext search is surprisingly permissive on short acronyms — "UBS"
+// matched a Dutch LPG municipal video ("LPG_en_Kernachtig_Wijchen...")
+// in a real Micron job because the substring collided. Require at least
+// one non-trivial token (>=3 chars, not in stoplist) from the query to
+// appear in the file title/URL, otherwise drop the result.
+const WIKIMEDIA_RELEVANCE_STOPWORDS = new Set([
+  'the', 'and', 'or', 'of', 'in', 'on', 'at', 'to', 'a', 'an', 'is', 'are',
+]);
+function _wikimediaTokens(s) {
+  return String(s || '').toLowerCase().match(/[a-z0-9]{3,}/g) || [];
+}
+function filterWikimediaByRelevance(results, query, label = 'wikimedia') {
+  const queryTokens = _wikimediaTokens(query).filter((t) => !WIKIMEDIA_RELEVANCE_STOPWORDS.has(t));
+  if (!queryTokens.length) return results;
+  const kept = [];
+  for (const r of results) {
+    const filename = decodeURIComponent(String(r.url || '').split('/').pop() || '');
+    const titleTokens = new Set(_wikimediaTokens((r.title || '') + ' ' + filename));
+    if (queryTokens.some((t) => titleTokens.has(t))) kept.push(r);
+  }
+  const rejected = results.length - kept.length;
+  if (rejected > 0) {
+    console.log(`[${label}] filtered ${rejected}/${results.length} results by relevance: query="${String(query).slice(0, 80)}"`);
+  }
+  return kept;
+}
+
+// Shared parser used by wikimediaImageSearchTop AND _probeWikimediaImage
+// (so the pre-probe stores the same candidate shape the source-ladder
+// later reads from the cache). License + MIME + size filtering lives
+// here so both paths agree on what counts as a usable hit.
+function _parseWikimediaImagePages(data, n) {
+  const pages = Object.values(data.query?.pages || {});
+  // CC-BY 3.0/4.0, CC0, PD, PD-old, "Public domain", GFDL, CC-BY-SA.
+  const allowedLicenseRe = /\b(cc0|public domain|pd|cc[\-\s]?by(?:[\-\s]?sa)?|gfdl)\b/i;
+  // Remotion <Img> renderable raster formats only.
+  const renderableImgRe = /\.(jpe?g|png|webp|gif)(\?|#|$)/i;
+  const out = [];
+  for (const p of pages) {
+    const info = (p.imageinfo || [])[0];
+    if (!info || !info.mime || !info.url) continue;
+    if (!/^image\//i.test(info.mime)) continue;
+    if (!renderableImgRe.test(info.url)) continue;
+    const restrictions = info.extmetadata?.Restrictions?.value;
+    if (restrictions && String(restrictions).trim().length > 0 && !/^false$/i.test(String(restrictions))) {
+      continue;
+    }
+    const license = info.extmetadata?.LicenseShortName?.value || '';
+    if (license && !allowedLicenseRe.test(String(license))) continue;
+    if (info.size && info.size > 25 * 1024 * 1024) continue;
+    out.push({url: info.url, creator: stripWikimediaArtist(info.extmetadata?.Artist?.value)});
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
 async function wikimediaImageSearchTop(query, n = 3) {
   const q = capQuery(query, 120);
   if (!q) return [];
+  // Cache BEFORE the cooldown gate. A cached result is free (no HTTP), so a
+  // recurring subject (an entity named across many scenes) MUST keep
+  // resolving even while we're in a 429 cooldown — otherwise the first scene
+  // caches the entity's images but every later scene returns [] and drops to
+  // generic stock (the FTX/SEC "shown once then random footage" bug). The
+  // pre-probe also seeds this, so the source-ladder reuses it HTTP-free.
+  const cached = getProbeCache('wikimedia-image', q);
+  if (cached) {
+    if (cached.length) console.log(`[wikimedia-image] cache hit: ${cached.length} URL(s) for "${q.slice(0, 60)}" (skipped HTTP)`);
+    return cached.slice(0, n);
+  }
+  if (wikimediaInCooldown()) {
+    console.log(`[wikimedia-image] skipping query (in 429 cooldown)`);
+    return [];
+  }
   const url = new URL('https://commons.wikimedia.org/w/api.php');
   url.searchParams.set('action', 'query');
   url.searchParams.set('format', 'json');
@@ -3151,37 +3651,24 @@ async function wikimediaImageSearchTop(query, n = 3) {
   url.searchParams.set('iiextmetadatafilter', 'LicenseShortName|Restrictions|Artist');
   url.searchParams.set('origin', '*');
   let resp;
+  await paceWikimedia();
+  await wikimediaSemaphore.acquire();
   try { resp = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 3, label: 'wikimedia-image'}); }
   catch (e) { console.warn(`Wikimedia image search threw for "${q}": ${e.message}`); return []; }
+  finally { wikimediaSemaphore.release(); }
   if (!resp.ok) {
+    if (resp.status === 429) markWikimediaRateLimited();
     console.warn(`Wikimedia image ${resp.status} for "${q}"`);
-    return [];
+    return []; // transient — do NOT cache so a later call can retry
   }
   const data = await resp.json();
-  const pages = Object.values(data.query?.pages || {});
-  // Whitelist licenses (lowercased substrings). CC-BY 3.0/4.0, CC0, PD,
-  // PD-old, "Public domain", GFDL is acceptable, CC-BY-SA is acceptable.
-  const allowedLicenseRe = /\b(cc0|public domain|pd|cc[\-\s]?by(?:[\-\s]?sa)?|gfdl)\b/i;
-  const out = [];
-  for (const p of pages) {
-    const info = (p.imageinfo || [])[0];
-    if (!info || !info.mime || !info.url) continue;
-    if (!/^image\//i.test(info.mime)) continue;
-    // Restrictions check — Commons sometimes flags trademarks / personality
-    // rights even on PD files. Skip anything with a non-empty restriction.
-    const restrictions = info.extmetadata?.Restrictions?.value;
-    if (restrictions && String(restrictions).trim().length > 0 && !/^false$/i.test(String(restrictions))) {
-      continue;
-    }
-    const license = info.extmetadata?.LicenseShortName?.value || '';
-    if (license && !allowedLicenseRe.test(String(license))) continue;
-    // Some images are huge SVG/large bitmaps. Skip >25MB to keep Lambda
-    // download budget reasonable.
-    if (info.size && info.size > 25 * 1024 * 1024) continue;
-    out.push({url: info.url, creator: stripWikimediaArtist(info.extmetadata?.Artist?.value)});
-    if (out.length >= n) break;
-  }
-  return out;
+  // Parse to a broad n=20 once, cache that, then slice for the caller —
+  // a later source-ladder call asking for n=3 reuses the same 20 without
+  // a fresh request.
+  const parsed = _parseWikimediaImagePages(data, 20);
+  const out = filterWikimediaByRelevance(parsed, q, 'wikimedia-image');
+  setProbeCache('wikimedia-image', q, out);
+  return out.slice(0, n);
 }
 
 // Wikimedia's Artist extmetadata field is HTML (e.g. `<a href="...">User:Foo</a>`
@@ -3203,50 +3690,76 @@ function stripWikimediaArtist(html) {
 // API endpoint: https://www.loc.gov/photos/?fo=json&q=QUERY
 // Returns: {results: [{image_url: [{...sizes}], item: {...}, rights_info: ...}]}
 // License: filter for "no known restrictions" (LOC's PD marker).
+function _parseLocGovResults(data, n) {
+  const results = Array.isArray(data?.results) ? data.results : [];
+  const out = [];
+  const renderableImgRe = /\.(jpe?g|png|webp|gif)(\?|#|$)/i;
+  for (const item of results) {
+    if (out.length >= n) break;
+    const rights = (item.rights_info || '').toLowerCase();
+    if (rights && !/no known restrictions|public domain|cc[\-\s]?by|cc[\-\s]?0/i.test(rights)) continue;
+    const imgs = Array.isArray(item.image_url) ? item.image_url : [];
+    if (imgs.length === 0) continue;
+    let pick = null;
+    for (let k = imgs.length - 1; k >= 0; k--) {
+      const cand = imgs[k];
+      if (typeof cand === 'string' && renderableImgRe.test(cand)) { pick = cand; break; }
+    }
+    if (!pick) continue;
+    out.push({url: pick, creator: null});
+  }
+  return out;
+}
+
 async function locGovSearchTop(query, n = 3) {
+  const q = String(query || '').trim();
+  if (!q) return [];
+  // FIX 2: cache lookup first. The pre-probe wave and the source ladder
+  // both call locGovSearchTop with the same query string; without a cache
+  // the second call burns another loc.gov HTTP round-trip that competes
+  // with in-flight retries for the per-IP throttle budget.
+  const cached = getProbeCache('loc-gov', q);
+  if (cached) {
+    if (cached.length) console.log(`[loc-gov] cache hit: ${cached.length} URL(s) for "${q.slice(0, 60)}" (skipped HTTP)`);
+    return cached.slice(0, n);
+  }
   const url = new URL('https://www.loc.gov/photos/');
   url.searchParams.set('fo', 'json');
-  url.searchParams.set('q', query);
+  url.searchParams.set('q', q);
   url.searchParams.set('c', '15'); // request up to 15 then filter
+  // Throttle: loc.gov 429s aggressively when ~14 archival queries fire
+  // in parallel. Semaphore caps concurrency so retries land in fresh
+  // budget windows; fetchWithRetry honours the Retry-After header and
+  // backs off exponentially on 429/5xx. If we still 429 after retries
+  // we degrade quietly (return []), letting the cascade move on.
+  await locGovSemaphore.acquire();
   let resp;
   try {
-    // Phase 17 Issue 4: bumped 5s → 12s. LOC API is slow on complex
-    // queries (8-15s typical) and 5s was timing out 80%+ of requests.
-    resp = await fetch(url, {
-      headers: {'User-Agent': 'rem-report-bot/1.0 (yt-automation; contact via channel owner)'},
-      signal: AbortSignal.timeout(12000),
-    });
+    // Phase 17 Issue 4: 12s per attempt — loc.gov is slow on complex queries.
+    resp = await fetchWithRetry(
+      url,
+      {headers: {'User-Agent': 'rem-report-bot/1.0 (yt-automation; contact via channel owner)'}},
+      {timeoutMs: 12000, maxAttempts: 3, baseBackoffMs: 1000, label: 'loc-gov'},
+    );
   } catch (e) {
-    console.warn(`[loc-gov] fetch threw for "${query}": ${e.message}`);
-    return [];
+    console.warn(`[loc-gov] fetch threw for "${q}": ${e.message}`);
+    return []; // transient — do NOT cache
+  } finally {
+    locGovSemaphore.release();
   }
   if (!resp.ok) {
-    console.warn(`[loc-gov] HTTP ${resp.status} for "${query}"`);
-    return [];
+    console.warn(`[loc-gov] HTTP ${resp.status} for "${q}" — degrading to next cascade rung`);
+    return []; // transient — do NOT cache
   }
   let data;
   try { data = await resp.json(); }
   catch (e) { console.warn(`[loc-gov] JSON parse threw: ${e.message}`); return []; }
-  const results = Array.isArray(data.results) ? data.results : [];
-  const out = [];
-  for (const item of results) {
-    if (out.length >= n) break;
-    // Filter to PD / no-known-restrictions
-    const rights = (item.rights_info || '').toLowerCase();
-    if (rights && !/no known restrictions|public domain|cc[\-\s]?by|cc[\-\s]?0/i.test(rights)) continue;
-    // image_url is an array of size variants; pick the largest reasonable
-    // size (typically the second or third — first is often a "default"
-    // thumbnail). Filter out tiny thumbnails (< 400px wide).
-    const imgs = Array.isArray(item.image_url) ? item.image_url : [];
-    if (imgs.length === 0) continue;
-    // LOC URLs include a size hint like "...#h=600&w=900". Pick the
-    // last one (usually the highest-resolution variant).
-    const pick = imgs[imgs.length - 1];
-    if (!pick || typeof pick !== 'string') continue;
-    out.push({url: pick, creator: null});
-  }
-  if (out.length) console.log(`[loc-gov] ${out.length} hits for "${query.slice(0, 60)}"`);
-  return out;
+  // Parse up to the API's request ceiling (15) once, cache that, then
+  // slice for the caller. A later ladder call with n=3 reuses the same 15.
+  const out = _parseLocGovResults(data, 15);
+  setProbeCache('loc-gov', q, out);
+  if (out.length) console.log(`[loc-gov] ${out.length} hits for "${q.slice(0, 60)}"`);
+  return out.slice(0, n);
 }
 
 // Day-15 Phase 15c: Wikimedia Commons VIDEO search. Same API as
@@ -3256,9 +3769,47 @@ async function locGovSearchTop(query, n = 3) {
 // Prelinger for those) — best for MODERN government footage:
 // Bernanke/Powell/Yellen lectures, White House addresses, congressional
 // hearings, Occupy-era B-roll. Same license filter as images.
+function _parseWikimediaVideoPages(data, n) {
+  const pages = Object.values(data.query?.pages || {});
+  const allowedLicenseRe = /\b(cc0|public domain|pd|cc[\-\s]?by(?:[\-\s]?sa)?|gfdl)\b/i;
+  // Remotion <OffthreadVideo> codec allowlist — Commons also hosts .ogv
+  // and .webm-with-Theora-audio that Lambda Chromium chokes on. Strict
+  // extension filter keeps only the three known-good container formats.
+  const renderableVideoRe = /\.(mp4|mov|webm)(\?|#|$)/i;
+  const out = [];
+  for (const p of pages) {
+    const info = (p.imageinfo || [])[0];
+    if (!info || !info.mime || !info.url) continue;
+    if (!/^video\//i.test(info.mime)) continue;
+    if (!renderableVideoRe.test(info.url)) continue;
+    const restrictions = info.extmetadata?.Restrictions?.value;
+    if (restrictions && String(restrictions).trim().length > 0 && !/^false$/i.test(String(restrictions))) {
+      continue;
+    }
+    const license = info.extmetadata?.LicenseShortName?.value || '';
+    if (license && !allowedLicenseRe.test(String(license))) continue;
+    // Size cap: 100 MB (Commons videos can be large; Lambda /tmp is 512 MB)
+    if (info.size && info.size > 100 * 1024 * 1024) continue;
+    out.push({url: info.url, creator: stripWikimediaArtist(info.extmetadata?.Artist?.value)});
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
 async function wikimediaVideoSearchTop(query, n = 3) {
   const q = capQuery(query, 120);
   if (!q) return [];
+  // Cache BEFORE the cooldown gate (see wikimediaImageSearchTop) — a cached
+  // recurring subject must keep resolving HTTP-free during a 429 cooldown.
+  const cached = getProbeCache('wikimedia-video', q);
+  if (cached) {
+    if (cached.length) console.log(`[wikimedia-video] cache hit: ${cached.length} URL(s) for "${q.slice(0, 60)}" (skipped HTTP)`);
+    return cached.slice(0, n);
+  }
+  if (wikimediaInCooldown()) {
+    console.log(`[wikimedia-video] skipping query (in 429 cooldown)`);
+    return [];
+  }
   const url = new URL('https://commons.wikimedia.org/w/api.php');
   url.searchParams.set('action', 'query');
   url.searchParams.set('format', 'json');
@@ -3271,34 +3822,24 @@ async function wikimediaVideoSearchTop(query, n = 3) {
   url.searchParams.set('iiextmetadatafilter', 'LicenseShortName|Restrictions|Artist');
   url.searchParams.set('origin', '*');
   let resp;
+  await paceWikimedia();
+  await wikimediaSemaphore.acquire();
   try { resp = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 3, label: 'wikimedia-video'}); }
   catch (e) { console.warn(`[wikimedia-video] search threw for "${q}": ${e.message}`); return []; }
+  finally { wikimediaSemaphore.release(); }
   if (!resp.ok) {
+    if (resp.status === 429) markWikimediaRateLimited();
     console.warn(`[wikimedia-video] HTTP ${resp.status} for "${q}"`);
-    return [];
+    return []; // transient — do NOT cache
   }
   const data = await resp.json();
-  const pages = Object.values(data.query?.pages || {});
-  const allowedLicenseRe = /\b(cc0|public domain|pd|cc[\-\s]?by(?:[\-\s]?sa)?|gfdl)\b/i;
-  const out = [];
-  for (const p of pages) {
-    const info = (p.imageinfo || [])[0];
-    if (!info || !info.mime || !info.url) continue;
-    if (!/^video\//i.test(info.mime)) continue;
-    // Skip if non-empty restrictions
-    const restrictions = info.extmetadata?.Restrictions?.value;
-    if (restrictions && String(restrictions).trim().length > 0 && !/^false$/i.test(String(restrictions))) {
-      continue;
-    }
-    const license = info.extmetadata?.LicenseShortName?.value || '';
-    if (license && !allowedLicenseRe.test(String(license))) continue;
-    // Size cap: 100 MB (Commons videos can be large; Lambda /tmp is 512 MB)
-    if (info.size && info.size > 100 * 1024 * 1024) continue;
-    out.push({url: info.url, creator: stripWikimediaArtist(info.extmetadata?.Artist?.value)});
-    if (out.length >= n) break;
-  }
+  // Parse to a broad n=15 once, cache that, then slice for the caller —
+  // a later ladder call asking for n=3 reuses the same 15 without HTTP.
+  const parsed = _parseWikimediaVideoPages(data, 15);
+  const out = filterWikimediaByRelevance(parsed, q, 'wikimedia-video');
+  setProbeCache('wikimedia-video', q, out);
   if (out.length) console.log(`[wikimedia-video] ${out.length} hits for "${query.slice(0, 60)}"`);
-  return out;
+  return out.slice(0, n);
 }
 
 // Phase 21 Fix 3: YouTube Data API v3 search for stock clips. Two-step
@@ -3454,7 +3995,7 @@ async function pexelsPhotoSearchTop(query, n = 3) {
 }
 
 async function pixabayPhotoSearchTop(query, n = 3) {
-  if (!process.env.PIXABAY_API_KEY) return [];
+  if (!isUsableKey(process.env.PIXABAY_API_KEY)) return [];
   const url = new URL('https://pixabay.com/api/');
   url.searchParams.set('key', process.env.PIXABAY_API_KEY);
   url.searchParams.set('q', query);
@@ -3484,7 +4025,7 @@ async function pixabayPhotoSearchTop(query, n = 3) {
 }
 
 async function unsplashSearchTop(query, n = 3) {
-  if (!process.env.UNSPLASH_ACCESS_KEY) return [];
+  if (!isUsableKey(process.env.UNSPLASH_ACCESS_KEY)) return [];
   const url = new URL('https://api.unsplash.com/search/photos');
   url.searchParams.set('query', query);
   url.searchParams.set('per_page', '15');
@@ -3560,17 +4101,59 @@ const AI_PROMPT_SANITIZER_RULES = [
   {pattern: /\bmonetary policy\b/i, replace: 'Federal Reserve building Washington DC marble columns'},
   {pattern: /\bregulatory framework\b/i, replace: 'Capitol Hill dome Washington DC dusk'},
 ];
-function sanitizeAiPrompt(rawPrompt) {
+// Item #16: generic brand sanitizer. The ~15 hardcoded rules above only fire
+// for specific framings ("{name} logo", "{name} document"). For ANY other
+// company/organization/institution name mentioned in the scene, replace it
+// with a short context-neutral noun ("a major company") so the rest of the
+// prompt's visual context drives the image — avoids fake-logo renders + fal
+// content-moderation rejects on unlisted brands. Entity list comes from the
+// scene's beats (same source as forbiddenNames).
+const _ENTITY_TYPE_TO_NEUTRAL_NOUN = {
+  company: 'a major company',
+  organization: 'a major organization',
+  institution: 'a major institution',
+};
+const _SANITIZER_ORG_TYPES = new Set(['company', 'organization', 'institution']);
+function sanitizeAiPrompt(rawPrompt, opts = {}) {
+  const sceneEntities = Array.isArray(opts.sceneEntities) ? opts.sceneEntities : [];
   let out = rawPrompt;
   const rewrites = [];
+  // Pass 1: hardcoded substring rules — hand-tuned per-brand descriptors win.
+  // Wrap each replacement in sentinels (…) so Pass 2 can SKIP it.
+  // Without that, a Pass-1 descriptor that intentionally contains the brand
+  // name for context (e.g. "JPMorgan Chase tower glass facade…") would be
+  // wiped by Pass 2's generic sweep.
   for (const rule of AI_PROMPT_SANITIZER_RULES) {
     if (rule.pattern.test(out)) {
       const before = out;
-      out = out.replace(rule.pattern, rule.replace);
+      out = out.replace(rule.pattern, `${rule.replace}`);
       if (out !== before) rewrites.push({pattern: String(rule.pattern), replace: rule.replace});
     }
   }
-  return {prompt: out, rewrites};
+  // Pass 2: generic entity-name sweep on UNPROTECTED segments only. For any
+  // company/org/institution name still mentioned (Pass 1 didn't cover it),
+  // swap for the type-appropriate neutral noun. Longest names first so
+  // "Goldman Sachs" replaces cleanly before a bare "Goldman" would partial-match.
+  const sortedEntities = sceneEntities
+    .filter((e) => e && _SANITIZER_ORG_TYPES.has(e.type) && typeof e.name === 'string' && e.name.trim().length >= 2)
+    .sort((a, b) => b.name.length - a.name.length);
+  const segments = out.split(/([\s\S]*?)/);
+  for (let i = 0; i < segments.length; i += 2) { // even indices = unprotected
+    let part = segments[i];
+    for (const e of sortedEntities) {
+      const name = e.name.trim();
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      // Possessive-aware: optional 's matched (ASCII apostrophe).
+      const re = new RegExp(`\\b${escaped}(?:'s)?\\b`, 'gi');
+      if (!re.test(part)) continue;
+      const noun = _ENTITY_TYPE_TO_NEUTRAL_NOUN[e.type] || 'a major company';
+      const before = part;
+      part = part.replace(re, (m) => /'s$/i.test(m) ? `${noun}'s` : noun);
+      if (part !== before) rewrites.push({pattern: `entity:${name}`, replace: noun});
+    }
+    segments[i] = part;
+  }
+  return {prompt: segments.join(''), rewrites};
 }
 
 // Phase 16D: forbiddenNames mechanism. Real-person face fabrication is
@@ -3591,7 +4174,46 @@ function createAiImageBudgetTracker() {
   return {spent: 0, generated: 0, cacheHits: 0, skipped: 0, capUsd: AI_IMAGE_BUDGET_PER_VIDEO};
 }
 
-async function generateAiImage({prompt, falApiKey, budgetTracker, forbiddenNames = []}) {
+// Person-name filter — extracted so preflight's AI rescue can apply the
+// same deepfake guard used by validateScenePlanAgainstAvailability when
+// it rewrites archival→AI prompts. Builds two regexes (full name +
+// trailing last-name only) and returns strip/test helpers.
+function buildPersonNameFilter(forbiddenNames) {
+  const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const seen = new Set();
+  const names = [];
+  for (const n of Array.isArray(forbiddenNames) ? forbiddenNames : []) {
+    const k = String(n || '').toLowerCase().trim();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    names.push(n);
+  }
+  const personNameRegex = names.length
+    ? new RegExp(`\\b(?:${names.map(escapeRe).join('|')})\\b`, 'gi')
+    : null;
+  const lastNamesOnly = names
+    .map((n) => String(n).trim().split(/\s+/).slice(-1)[0])
+    .filter((w) => w && w.length >= 3);
+  const lastNameRegex = lastNamesOnly.length
+    ? new RegExp(`\\b(?:${lastNamesOnly.map(escapeRe).join('|')})\\b`, 'gi')
+    : null;
+  const stripPersonNames = (text) => {
+    if (typeof text !== 'string' || !text) return text;
+    let out = text;
+    if (personNameRegex) out = out.replace(personNameRegex, '');
+    if (lastNameRegex) out = out.replace(lastNameRegex, '');
+    return out.replace(/\s+/g, ' ').replace(/\s*[,;]\s*[,;]+/g, ',').trim();
+  };
+  const mentionsPerson = (text) => {
+    if (typeof text !== 'string' || !text) return false;
+    if (personNameRegex && personNameRegex.test(text)) { personNameRegex.lastIndex = 0; return true; }
+    if (lastNameRegex && lastNameRegex.test(text)) { lastNameRegex.lastIndex = 0; return true; }
+    return false;
+  };
+  return {stripPersonNames, mentionsPerson};
+}
+
+async function generateAiImage({prompt, falApiKey, budgetTracker, forbiddenNames = [], sceneEntities = []}) {
   if (!prompt || typeof prompt !== 'string' || prompt.trim().length < 10) {
     console.warn('[ai-image] empty/short prompt — skipping');
     return null;
@@ -3603,7 +4225,7 @@ async function generateAiImage({prompt, falApiKey, budgetTracker, forbiddenNames
   // Phase 16D: sanitize un-imageable subjects (logos/docs/abstract
   // concepts → concrete scenes), append forbiddenNames clause,
   // bookend with style prefix + suffix.
-  const {prompt: sanitized, rewrites} = sanitizeAiPrompt(prompt.trim());
+  const {prompt: sanitized, rewrites} = sanitizeAiPrompt(prompt.trim(), {sceneEntities});
   if (rewrites.length) {
     console.log(`[ai-image] sanitizer rewrote ${rewrites.length} pattern(s) — first: ${rewrites[0].pattern} → "${rewrites[0].replace.slice(0, 50)}..."`);
   }
@@ -3740,13 +4362,31 @@ async function generateMapImage({mapContext, mapboxToken}) {
   }
   // 1280x720 @2x = 2560x1440 effective (covers 16:9 1080p with room).
   const size = '1280x720@2x';
-  // Mapbox auto-fits when we use 'auto' position; or explicit center+zoom if Claude gave one.
+  // Position rules — Mapbox 422s on `padding` unless position is `auto`
+  // *and* the markers form a non-degenerate bounding box:
+  //   "Padding cannot be used without the auto parameter or without a
+  //   provided bounding box."
+  // Single-marker `auto` has a zero-area bbox, so Mapbox rejects padding
+  // — fall back to explicit center+zoom there. Multi-marker `auto`
+  // computes a real bbox and padding works. Explicit lon,lat,zoom from
+  // Claude always drops padding (no bbox).
+  const validLocs = mapContext.locations.filter(
+    (l) => typeof l.longitude === 'number' && typeof l.latitude === 'number',
+  );
   let position = 'auto';
-  if (typeof mapContext.zoom === 'number' && mapContext.locations.length === 1) {
-    const l = mapContext.locations[0];
+  if (validLocs.length === 1) {
+    const l = validLocs[0];
+    const z = typeof mapContext.zoom === 'number'
+      ? Math.max(0, Math.min(18, mapContext.zoom))
+      : 5; // country-level default for a single point
+    position = `${l.longitude.toFixed(4)},${l.latitude.toFixed(4)},${z}`;
+  } else if (typeof mapContext.zoom === 'number') {
+    // Multi-marker but Claude pinned an explicit zoom — center on first.
+    const l = validLocs[0];
     position = `${l.longitude.toFixed(4)},${l.latitude.toFixed(4)},${Math.max(0, Math.min(18, mapContext.zoom))}`;
   }
-  const url = `https://api.mapbox.com/styles/v1/${style}/static/${markers}/${position}/${size}?access_token=${mapboxToken}&padding=80&logo=false&attribution=false`;
+  const paddingParam = position === 'auto' ? '&padding=80' : '';
+  const url = `https://api.mapbox.com/styles/v1/${style}/static/${markers}/${position}/${size}?access_token=${mapboxToken}${paddingParam}&logo=false&attribution=false`;
   // Cache via SHA256 of the URL (sans token) so token rotations don't
   // invalidate. We bake style+markers+position into the key.
   const cacheKey = `${style}|${markers}|${position}|${size}`;
@@ -3807,7 +4447,13 @@ async function generateMapImage({mapContext, mapboxToken}) {
 async function validateImageUrl(url) {
   try {
     const head = await fetch(url, {method: 'HEAD'});
-    if (!head.ok) return {ok: false, reason: `HEAD ${head.status}`};
+    if (!head.ok) {
+      // FIX 3: feed the shared Wikimedia cooldown when the image/video CDN
+      // 429s during the probe's own candidate validation, so the entity-
+      // first probe (and fetchWikipediaImage) back off before the storm.
+      if (head.status === 429 && /wikimedia\.org|wikipedia\.org/i.test(url)) markWikimediaRateLimited();
+      return {ok: false, reason: `HEAD ${head.status}`};
+    }
     const ct = head.headers.get('content-type') || '';
     if (!/^image\//i.test(ct)) return {ok: false, reason: `bad content-type: ${ct}`};
     const len = parseInt(head.headers.get('content-length') || '0', 10);
@@ -3832,22 +4478,27 @@ async function wikimediaSearchTop(query, n = 3) {
   url.searchParams.set('iiprop', 'url|mime|size|extmetadata');
   url.searchParams.set('iiextmetadatafilter', 'Artist');
   url.searchParams.set('origin', '*');
-  const resp = await fetch(url);
+  await paceWikimedia();
+  await wikimediaSemaphore.acquire();
+  let resp;
+  try { resp = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 3, label: 'wikimedia'}); }
+  catch (e) { console.warn(`Wikimedia search threw for "${query}": ${e.message}`); return []; }
+  finally { wikimediaSemaphore.release(); }
   if (!resp.ok) {
     console.warn(`Wikimedia ${resp.status} for "${query}"`);
     return [];
   }
   const data = await resp.json();
   const pages = Object.values(data.query?.pages || {});
+  // Remotion <OffthreadVideo> renderable container formats only. Drops
+  // ogv/ogg (Theora) and any other format Lambda Chromium can't decode.
+  const renderableVideoRe = /\.(mp4|mov|webm)(\?|#|$)/i;
   const out = [];
   for (const p of pages) {
     const info = (p.imageinfo || [])[0];
     if (!info || !info.mime || !info.url) continue;
     if (!/^video\//i.test(info.mime)) continue;
-    // Wikimedia hosts .webm and .ogv heavily — Lambda Chromium can
-    // decode webm; ogv is hit-or-miss. Prefer mp4 when available, accept
-    // webm. Skip ogv.
-    if (/ogg|ogv/i.test(info.url)) continue;
+    if (!renderableVideoRe.test(info.url)) continue;
     out.push({url: info.url, creator: stripWikimediaArtist(info.extmetadata?.Artist?.value)});
     if (out.length >= n) break;
   }
@@ -3868,6 +4519,15 @@ const _ARCHIVE_MAX_RUNTIME_SEC = 600; // 10 min — Lambda caps + scene relevanc
 async function archiveSearchTop(query, n = 3) {
   const baseQ = capQuery(query, 100);
   if (!baseQ) return [];
+  // FIX 2: cache lookup first. Pre-probe and source-ladder both call
+  // archiveSearchTop with the same query; the second call would otherwise
+  // re-run the two-pass advancedsearch + per-doc metadata fetches against
+  // archive.org, which is the slowest source in the cascade.
+  const cached = getProbeCache('archive-org', baseQ);
+  if (cached) {
+    if (cached.length) console.log(`[archive-org] cache hit: ${cached.length} URL(s) for "${baseQ.slice(0, 60)}" (skipped HTTP)`);
+    return cached.slice(0, n);
+  }
   // Two-pass query: first try Prelinger (best curated PD finance/news
   // footage), fall through to general movies search if no hits.
   const queries = [
@@ -3937,17 +4597,29 @@ async function archiveSearchTop(query, n = 3) {
           console.log(`[archive-org] skip ${d.identifier} — runtime ${lenSec}s > ${_ARCHIVE_MAX_RUNTIME_SEC}s cap`);
           continue;
         }
+        // Final extension guard — defense in depth against pick.name with
+        // odd casing/suffixes the earlier .mp4 filter let through.
+        const renderableVideoRe = /\.(mp4|mov|webm)(\?|#|$)/i;
+        const downloadUrl = `https://archive.org/download/${d.identifier}/${encodeURIComponent(pick.name)}`;
+        if (!renderableVideoRe.test(downloadUrl)) continue;
         const archiveCreator = Array.isArray(meta.metadata?.creator) ? meta.metadata.creator[0] : meta.metadata?.creator;
         out.push({
-          url: `https://archive.org/download/${d.identifier}/${encodeURIComponent(pick.name)}`,
+          url: downloadUrl,
           creator: typeof archiveCreator === 'string' && archiveCreator.length ? archiveCreator.slice(0, 80) : null,
         });
       } catch (e) {
         console.warn(`[archive-org] metadata fetch threw for ${d.identifier}: ${e.message}`);
       }
     }
-    if (out.length > 0) return out;
+    if (out.length > 0) {
+      setProbeCache('archive-org', baseQ, out);
+      return out;
+    }
   }
+  // Both passes returned empty — cache the empty array so the source-ladder
+  // doesn't re-run the same two HTTP advancedsearch round-trips just to
+  // re-confirm zero hits.
+  setProbeCache('archive-org', baseQ, []);
   return [];
 }
 
@@ -3977,7 +4649,7 @@ function _splitUrlsAndCreators(results) {
 // ftyp check works on any mp4 regardless of CDN). First-N-validated
 // wins; sources later in the chain only run when earlier ones return
 // empty for this query.
-async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = null) {
+async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = null, opts = {}) {
   // Read channel's footageSources toggles from settings doc, default
   // to the broad set if missing. Same pattern as musicSettings.
   // Phase 21 Fix 3/4: youtube, pexelsPhoto, pixabayPhoto, unsplash
@@ -4001,16 +4673,22 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
     } catch {/* keep fallback */}
   }
 
-  // Day-14 Phase 3 + Day-15 15b + Day-16 16F: archival_photo cascade.
+  // Day-14 Phase 3 + Day-15 15b + Day-16 16F + Pass-2: archival_photo cascade.
   // Order: Library of Congress (Phase 16F, primary for US finance) →
-  // Wikimedia Commons images (best for known figures/iconic moments) →
-  // Wikimedia Commons video (modern Fed/Powell speeches) →
+  // Wikimedia Commons IMAGES (broad CC photo trove of companies/people —
+  //   far richer than Commons CC video, which is sparse and often fails
+  //   Lambda playback) →
+  // Wikimedia Commons VIDEO (Powell/Yellen speeches, hearings — useful
+  //   when image is empty) →
   // Internet Archive Prelinger (era/industry footage from 1920s-80s) →
   // existing Pexels-first ladder fallback.
+  //
+  // opts.skipLocGov: caller can bypass loc.gov (entity-anchored short
+  // queries 429-storm loc.gov without ever hitting). See CHANGE 2.
   if (assetTypeHint === 'archival_photo' && cfg.wikimedia) {
     // Phase 16F: LOC.gov first — US-focused PD archive, strongest for
     // US finance/political history. Cheap (no key, ~1s per call).
-    if (cfg.locGov !== false) {
+    if (cfg.locGov !== false && !opts.skipLocGov) {
       let locResults;
       try { locResults = await locGovSearchTop(query, n); }
       catch (e) { console.warn(`[footage] loc-gov threw for "${query}": ${e.message}`); locResults = []; }
@@ -4021,27 +4699,40 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
         return {urls: locUrls, source: 'loc-gov-image', sourceCounts, creators};
       }
     }
+    // CHANGE A: wikimedia-video preferred BUT validated. A real motion
+    // clip of a named figure beats a still photo when it actually plays
+    // on Lambda. Previously we committed to video on the first non-empty
+    // search result; many of those URLs were .webm-with-Theora-audio or
+    // throttled-CDN files that failed downstream validation, dropping the
+    // scene all the way to generic stock instead of the wikimedia-image
+    // we could have had. Now we HEAD+ftyp/EBML-check each video candidate
+    // (same probe preflight uses) before committing — if none survive,
+    // we fall through to wikimedia-image in the SAME pass so the scene
+    // never drops past Wikimedia when an image is available.
+    if (cfg.wikimediaVideo !== false) {
+      let videoResults;
+      try { videoResults = await wikimediaVideoSearchTop(query, n); }
+      catch (e) { console.warn(`[footage] wikimedia-video threw for "${query}": ${e.message}`); videoResults = []; }
+      if (videoResults && videoResults.length) {
+        const verdicts = await Promise.all(videoResults.map((r) => validatePexelsVideo(r.url).catch((e) => ({ok: false, reason: e.message}))));
+        const validated = videoResults.filter((_r, i) => verdicts[i]?.ok);
+        if (validated.length) {
+          const {urls: videoUrls, creators} = _splitUrlsAndCreators(validated);
+          const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'wikimedia-video': videoUrls.length};
+          console.log(`[source-ladder] archival_photo "${query}" → wikimedia-video (${videoUrls.length}/${videoResults.length} candidates validated, preferred over still image)`);
+          return {urls: videoUrls, source: 'wikimedia-video', sourceCounts, creators};
+        }
+        console.log(`[source-ladder] archival_photo "${query}" — wikimedia-video had ${videoResults.length} hits but 0 passed playback validation, falling through to wikimedia-image`);
+      }
+    }
     let imageResults;
     try { imageResults = await wikimediaImageSearchTop(query, n); }
     catch (e) { console.warn(`[footage] wikimedia-image threw for "${query}": ${e.message}`); imageResults = []; }
     if (imageResults && imageResults.length) {
       const {urls: imageUrls, creators} = _splitUrlsAndCreators(imageResults);
       const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'wikimedia-image': imageUrls.length};
-      console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image (${imageUrls.length} candidates)`);
+      console.log(`[source-ladder] archival_photo "${query}" → wikimedia-image (${imageUrls.length} candidates, video empty or unplayable)`);
       return {urls: imageUrls, source: 'wikimedia-image', sourceCounts, creators};
-    }
-    // Phase 15c: Wikimedia image missed → try Wikimedia video (good
-    // for modern Fed/Powell speeches, congressional hearings).
-    if (cfg.wikimediaVideo !== false) {
-      let videoResults;
-      try { videoResults = await wikimediaVideoSearchTop(query, n); }
-      catch (e) { console.warn(`[footage] wikimedia-video threw for "${query}": ${e.message}`); videoResults = []; }
-      if (videoResults && videoResults.length) {
-        const {urls: videoUrls, creators} = _splitUrlsAndCreators(videoResults);
-        const sourceCounts = {pexels: 0, pixabay: 0, wikimedia: 0, archive: 0, 'wikimedia-video': videoUrls.length};
-        console.log(`[source-ladder] archival_photo "${query}" → wikimedia-video (${videoUrls.length} candidates, image empty)`);
-        return {urls: videoUrls, source: 'wikimedia-video', sourceCounts, creators};
-      }
     }
     // Phase 15b: Wikimedia (both image + video) missed → try Internet
     // Archive (Prelinger first, then general PD movies).
@@ -4107,15 +4798,25 @@ async function searchAllFootageSources(channelId, query, n = 3, assetTypeHint = 
   return {urls: [], source: null, sourceCounts, creators: {}};
 }
 
-// Validate a Pexels mp4 URL before committing it to render. Catches
-// the ~5% of files that are missing frames, truncated, or 404s, which
+// Validate a video URL before committing it to render. Catches the
+// ~5% of files that are missing frames, truncated, or 404s, which
 // blow up Remotion mid-render with "No frame found at position X".
 //   - HEAD: 2xx, content-type video/*, content-length sane
-//   - Range GET (first 1 MB): MP4 starts with 'ftyp' box at offset 4
+//   - Range GET (first 1 MB): MP4 starts with 'ftyp' box at offset 4,
+//     or WebM/Matroska starts with EBML magic 1A 45 DF A3 at offset 0.
+//     Wikimedia serves .webm; without the EBML branch every wikimedia-
+//     video candidate was being rejected here even though the bytes
+//     were fine.
 async function validatePexelsVideo(url) {
   try {
     const head = await fetch(url, {method: 'HEAD'});
-    if (!head.ok) return {ok: false, reason: `HEAD ${head.status}`};
+    if (!head.ok) {
+      // FIX 3: feed the shared Wikimedia cooldown when the image/video CDN
+      // 429s during the probe's own candidate validation, so the entity-
+      // first probe (and fetchWikipediaImage) back off before the storm.
+      if (head.status === 429 && /wikimedia\.org|wikipedia\.org/i.test(url)) markWikimediaRateLimited();
+      return {ok: false, reason: `HEAD ${head.status}`};
+    }
     const ct = head.headers.get('content-type') || '';
     if (!/^video\//i.test(ct)) return {ok: false, reason: `bad content-type: ${ct}`};
     const len = parseInt(head.headers.get('content-length') || '0', 10);
@@ -4126,12 +4827,42 @@ async function validatePexelsVideo(url) {
     if (!ranged.ok && ranged.status !== 206) return {ok: false, reason: `Range ${ranged.status}`};
     const buf = Buffer.from(await ranged.arrayBuffer());
     if (buf.length < 12) return {ok: false, reason: 'range body too small'};
-    const magic = buf.toString('ascii', 4, 8);
-    if (magic !== 'ftyp') return {ok: false, reason: `no ftyp box (got "${magic}")`};
+    const ftyp = buf.toString('ascii', 4, 8);
+    const isMp4 = ftyp === 'ftyp';
+    const isWebm = buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3;
+    if (!isMp4 && !isWebm) {
+      const hex = buf.slice(0, 8).toString('hex');
+      return {ok: false, reason: `no ftyp/EBML magic (got 0x${hex})`};
+    }
     return {ok: true, length: len};
   } catch (e) {
     return {ok: false, reason: e.message};
   }
+}
+
+// Single source of truth: every source whose URL points at image bytes
+// (JPEG/PNG/WebP) rather than a video container. Used by BOTH:
+//   1. pickValidatorForSource (sourcing time) — picks validateImageUrl
+//      so HEAD content-type is read as image/*, not rejected.
+//   2. PREFLIGHT_IMAGE_SOURCES (preflight) — derives from this set so
+//      ffprobe is never called on a JPEG ("no video stream" → eviction).
+// Add a new image-shaped source HERE ONCE; preflight picks it up
+// automatically. Keeping these in two lists drifted before — see
+// PREFLIGHT_IMAGE_SOURCES comment near line 4627 for the incident.
+const IMAGE_SOURCES = new Set([
+  'wikimedia-image',
+  'pexels-photo',
+  'pixabay-photo',
+  'unsplash',
+  'loc-gov-image', // Library of Congress JPEGs from the archival cascade
+  // Entity-first probe still sources (see probeEntityFirstSource). Both
+  // return image bytes — they MUST live here so pickValidatorForSource
+  // uses validateImageUrl and preflight HEAD-probes instead of ffprobe.
+  'wikimedia-image-entity', // Commons still, entity-name anchored
+  'wikipedia-pageimage-entity', // Wikipedia REST page lead image
+]);
+function pickValidatorForSource(source) {
+  return IMAGE_SOURCES.has(source) ? validateImageUrl : validatePexelsVideo;
 }
 
 // ─── Universal source cache to Firebase Storage ─────────────────────
@@ -4158,8 +4889,32 @@ async function cacheRemoteToFirebase(sourceUrl, {prefix = 'cache/footage', defau
     return {url: `https://storage.googleapis.com/${bucket.name}/${path}`, hit: true};
   }
 
-  const resp = await fetch(sourceUrl);
-  if (!resp.ok) throw new Error(`Cache fetch ${resp.status} for ${sourceUrl.slice(0, 80)}`);
+  // FIX 1: fetch with retry on transient throttle/overload (429/503).
+  // Wikimedia's image CDN (upload.wikimedia.org) 429s under bulk load —
+  // without retry the cache MISS leaves the original Wikimedia URL on the
+  // footage entry, which then 429s again at the render-gate probe and gets
+  // dropped (no pexelsAlternates exist for Wiki* stills) → tripped the 10%
+  // unfixable abort. Retrying here lands the bytes in Firebase Storage so
+  // the render never touches Wikimedia. Honors Retry-After and feeds the
+  // shared Wikimedia cooldown so the entity-first probe backs off too.
+  const isWikiSrc = /wikimedia\.org|wikipedia\.org/i.test(sourceUrl);
+  const MAX_FETCH_ATTEMPTS = 4;
+  let resp;
+  for (let attempt = 1; attempt <= MAX_FETCH_ATTEMPTS; attempt++) {
+    resp = await fetch(sourceUrl);
+    if (resp.ok) break;
+    const transient = resp.status === 429 || resp.status === 503;
+    if (transient && isWikiSrc) markWikimediaRateLimited();
+    if (transient && attempt < MAX_FETCH_ATTEMPTS) {
+      const ra = parseInt(resp.headers.get('retry-after') || '', 10);
+      const waitMs = Number.isFinite(ra) ? Math.min(ra * 1000, 15_000) : Math.min(1000 * 2 ** (attempt - 1), 8_000);
+      try { await resp.body?.cancel(); } catch {/* ignore */}
+      await new Promise((r) => setTimeout(r, waitMs));
+      continue;
+    }
+    throw new Error(`Cache fetch ${resp.status} for ${sourceUrl.slice(0, 80)}`);
+  }
+  if (!resp.ok) throw new Error(`Cache fetch ${resp.status} after ${MAX_FETCH_ATTEMPTS} attempts for ${sourceUrl.slice(0, 80)}`);
 
   const {pipeline} = require('node:stream/promises');
   const {Readable} = require('node:stream');
@@ -4480,24 +5235,41 @@ async function deepValidateBeat(url, opts = {}) {
 // stored Pexels alternates first — these are fast (one fetch + one
 // probe each, no external API) and don't touch Replicate. Only fall
 // back to Flux when every alternate fails.
-// Phase-6b CRITICAL: source names that produce IMAGE assets (PNG/JPEG)
-// rather than video files. Preflight's deepValidateBeat is video-only
-// (ffprobe expects a video stream); running it on PNGs throws "no
-// video stream" → preflight nuked + blocklisted + cache-evicted every
-// fal-ai-image / mapbox-image / wikimedia-image URL → MainComp received
-// null URLs for those scenes → BLACK SCREENS for every image-source
-// scene in v7 staging renders. This whitelist makes preflight skip
-// image sources (they get a HEAD-probe instead for defense-in-depth).
+// Preflight skips ffprobe for any image-shaped source and HEAD-probes
+// instead. Derived from IMAGE_SOURCES (sourcing-time selector) so the
+// two lists can't drift again. Extra entries below are sources that
+// never come back from searchAllFootageSources (so they don't belong
+// in IMAGE_SOURCES) but still produce image bytes preflight must skip:
+//   fal-ai-image, mapbox-image — generated upstream of the stock chain
+//   placeholder-black — data: URL last-resort
+//   flux — legacy preflight-swap target, kept for back-compat
+// Incident: pexels-photo / pixabay-photo / unsplash were added as
+// archival cascade fallbacks and to IMAGE_SOURCES but NOT to this set
+// (when it was a hand-maintained literal), so preflight ffprobed those
+// JPEGs → "no video stream" → 13 valid beats nulled, 13 cached files
+// deleted, 13 Pexels URLs blocklisted. Deriving from IMAGE_SOURCES
+// makes that class of drift structurally impossible.
 const PREFLIGHT_IMAGE_SOURCES = new Set([
-  'fal-ai-image', 'wikimedia-image', 'mapbox-image', 'placeholder-black', 'flux',
-  'loc-gov-image', // Phase 16F — Library of Congress photos
+  ...IMAGE_SOURCES,
+  'fal-ai-image',
+  'mapbox-image',
+  'placeholder-black',
+  'flux',
 ]);
 
-async function preflightValidateFootage(footage, jobRef, {channelId} = {}) {
+async function preflightValidateFootage(footage, jobRef, {channelId, forbiddenNames = [], aiImageBudget = null, falApiKey = null} = {}) {
   selfTestFfprobeOnce();
   const VALIDATE_BATCH = 5;
   const ABORT_FAIL_RATE = 0.20;
   const t0 = Date.now();
+  // Phase 16D++: AI-image rescue is enabled only when both a budget
+  // tracker and a fal key are wired through. Without either, the path
+  // degrades to the historical behavior (ship url=null, gap-fill covers).
+  const aiRescueEnabled = !!(aiImageBudget && falApiKey);
+  const personFilter = aiRescueEnabled ? buildPersonNameFilter(forbiddenNames) : null;
+  let aiRescueGenerated = 0;
+  let aiRescueBudgetSkipped = 0;
+  let aiRescueFailed = 0;
 
   // Phase 1: probe-only. No swaps, no external API calls. On failure
   // for a Firebase-cached beat we eagerly evict the cached file +
@@ -4637,18 +5409,75 @@ async function preflightValidateFootage(footage, jobRef, {channelId} = {}) {
         console.log(`[preflight] beat ${idx + 1} swapped to alternate Pexels`);
         return;
       }
-      // No working Pexels alternate — drop the beat. Gap-fill will
-      // stretch the previous beat to cover. Flux fallback removed
-      // (AI imagery is off-brand for finance/news content).
-      footage[idx] = {
-        ...beat,
-        url: null,
-        source: null,
-        previousUrl: beat.url,
-        replacedReason: `pre-flight: alts exhausted, beat skipped (was: ${reason})`,
-      };
-      unfixed++;
-      console.warn(`[preflight] beat ${idx + 1} skipped — no working Pexels source`);
+      // No working Pexels alternate. Before shipping url=null, attempt
+      // the AI-image rescue: generate a fal.ai Nano Banana image from
+      // the scene visualConcept (or first 200 chars of voiceoverText).
+      // Same deepfake guard as the scene-plan AI path — if the prompt
+      // names a forbidden person we strip the name + wrap in a context-
+      // only "empty editorial setting" frame so the model never tries
+      // to fabricate a face. On success we ship the AI URL with
+      // source='ai-image-rescue' so telemetry can distinguish a rescued
+      // beat from a normal fal-ai-image scene. On failure (budget
+      // exhausted, fal.ai error, or rescue disabled because key/budget
+      // wasn't plumbed through) we preserve the historical behavior:
+      // ship url=null and let gap-fill stretch the previous beat.
+      let rescuedUrl = null;
+      if (aiRescueEnabled) {
+        const basePrompt = (typeof beat.visualConcept === 'string' && beat.visualConcept.trim())
+          ? beat.visualConcept.trim()
+          : (typeof beat.sentence === 'string' ? beat.sentence.trim().slice(0, 200) : '');
+        if (basePrompt && basePrompt.length >= 10) {
+          let finalPrompt = basePrompt;
+          if (personFilter && personFilter.mentionsPerson(basePrompt)) {
+            const stripped = personFilter.stripPersonNames(basePrompt);
+            finalPrompt = `Empty editorial setting — no people visible. Context: ${stripped}. Empty podium, building exterior, boardroom, or symbolic environment; NO faces, NO bodies, NO recognizable individuals.`;
+          }
+          // Budget pre-check so we can distinguish "budget exhausted"
+          // from "fal.ai failed" in the log line.
+          const budgetExhausted = aiImageBudget.spent + AI_IMAGE_COST_PER_GENERATION > aiImageBudget.capUsd;
+          if (budgetExhausted) {
+            aiRescueBudgetSkipped++;
+            console.warn(`[ai-rescue] beat ${idx + 1} url=null, budget exhausted, shipping null`);
+          } else {
+            try {
+              rescuedUrl = await generateAiImage({
+                prompt: finalPrompt,
+                falApiKey,
+                budgetTracker: aiImageBudget,
+                forbiddenNames,
+              });
+            } catch (e) {
+              console.warn(`[ai-rescue] beat ${idx + 1} generation threw: ${e.message}`);
+            }
+            if (rescuedUrl) {
+              aiRescueGenerated++;
+              console.log(`[ai-rescue] beat ${idx + 1} url=null → AI image generated`);
+            } else {
+              aiRescueFailed++;
+              console.warn(`[ai-rescue] beat ${idx + 1} url=null, fal.ai returned no URL, shipping null`);
+            }
+          }
+        }
+      }
+      if (rescuedUrl) {
+        footage[idx] = {
+          ...beat,
+          url: rescuedUrl,
+          source: 'ai-image-rescue',
+          previousUrl: beat.url,
+          replacedReason: `pre-flight: alts exhausted, AI rescue (was: ${reason})`,
+        };
+      } else {
+        footage[idx] = {
+          ...beat,
+          url: null,
+          source: null,
+          previousUrl: beat.url,
+          replacedReason: `pre-flight: alts exhausted, beat skipped (was: ${reason})`,
+        };
+        unfixed++;
+        console.warn(`[preflight] beat ${idx + 1} skipped — no working Pexels source`);
+      }
     }));
   }
 
@@ -4663,8 +5492,11 @@ async function preflightValidateFootage(footage, jobRef, {channelId} = {}) {
     'timings.preflightPexelsSwaps': pexelsSwaps,
     'timings.preflightFluxSwaps': fluxSwaps,
     'timings.preflightUnfixed': unfixed,
+    'timings.preflightAiRescueGenerated': aiRescueGenerated,
+    'timings.preflightAiRescueBudgetSkipped': aiRescueBudgetSkipped,
+    'timings.preflightAiRescueFailed': aiRescueFailed,
   }).catch(() => {});
-  console.log(`pre-flight: probed ${probedCount}, ${failures.length} invalid, ${evictedCount} evicted, ${pexelsSwaps} alt-Pexels + ${fluxSwaps} Flux swapped, ${unfixed} unfixed (took ${(validationMs / 1000).toFixed(1)}s)`);
+  console.log(`pre-flight: probed ${probedCount}, ${failures.length} invalid, ${evictedCount} evicted, ${pexelsSwaps} alt-Pexels + ${fluxSwaps} Flux swapped, ${aiRescueGenerated} AI-rescued, ${unfixed} unfixed (took ${(validationMs / 1000).toFixed(1)}s)`);
 }
 
 // ─── ffmpeg (companion to ffprobe) ──────────────────────────────────
@@ -4857,8 +5689,18 @@ function sliceCaptionsForSegment(captions, segStart, segEnd) {
 // have a Pexels-CDN-typical 5-10s natural duration so stretching them
 // further than ~3s past their natural end risks running out of frames
 // → black tail or frozen frame.
-const VIDEO_SOURCE_NAMES = new Set(['pexels', 'pixabay', 'wikimedia', 'archive', 'ai-video', 'archive-org-video', 'wikimedia-video']);
+const VIDEO_SOURCE_NAMES = new Set(['pexels', 'pixabay', 'wikimedia', 'archive', 'ai-video', 'archive-org-video', 'wikimedia-video', 'wikimedia-video-entity']);
 
+// Hard ceiling for how long the cold-open template (scene 0 with a
+// templateType) can be held on screen, including stretch into a null-
+// url successor. The Phase 18 fix at sourceScenesAndBuildFootage skips
+// the normal 4s template cap on si===0 so the cold open isn't preceded
+// by a black [0..footageStart) interval — but with no upper bound the
+// chyron froze for 12.58s in the Micron job when scene 1's Wikimedia
+// URL collapsed. 6s keeps the punchy intro feel; anything beyond should
+// be filled by the AI-image rescue in preflightValidateFootage, not by
+// freezing a static template.
+const COLD_OPEN_TEMPLATE_MAX_HOLD_SEC = 6;
 function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
   // Phase-6b fix 2: per-entry cap. Image-shaped entries (fal-ai-image,
   // mapbox-image, wikimedia-image, placeholder-black) get the original
@@ -4895,7 +5737,17 @@ function stretchFootageToFillGaps(footage, totalDuration, maxStretchSec) {
     }
     if ((cur.end || 0) < nextStart) {
       const isVideo = VIDEO_SOURCE_NAMES.has(cur.source);
-      const cap = explicitCap != null ? explicitCap : (isVideo ? 3 : Infinity);
+      let cap = explicitCap != null ? explicitCap : (isVideo ? 3 : Infinity);
+      // Phase 22 fix A: clamp cold-open template stretch. The cold opener
+      // (start===0, templateType set) historically could stretch
+      // unbounded across a null-url successor → 12s frozen chyron. Cap
+      // it to COLD_OPEN_TEMPLATE_MAX_HOLD_SEC so the next stage (or the
+      // black-gap-becomes-AI-image rescue) takes over.
+      const isColdOpenTemplate = isCurTemplate && (cur.start || 0) === 0;
+      if (isColdOpenTemplate) {
+        const remainingBudget = COLD_OPEN_TEMPLATE_MAX_HOLD_SEC - (cur.end || 0);
+        cap = Math.min(cap, Math.max(0, remainingBudget));
+      }
       let targetEnd = Math.min(nextStart, (cur.end || 0) + cap);
       // Phase-6b fix A: when video source has a known sourceDuration
       // (set by preflight from ffprobe), cap displayed duration at
@@ -5648,13 +6500,15 @@ function snapScenesToWordBoundaries(scenes, rawBeats, captions, voiceoverDuratio
 function prepareScenesForPlan(rawBeats, captions, voiceoverDurationSec, opts = {}) {
   const availabilityArr = Array.isArray(opts.availability) ? opts.availability : null;
   const aiBudgetRemaining = Number.isFinite(opts.aiBudgetRemaining) ? opts.aiBudgetRemaining : null;
-  // Phase 15d + Phase 16I: STRICT sentence-boundary cuts at a denser
-  // pace. Phase 16I lowered SOFT_MIN 4→2.5s + HARD_MAX 15→12s to
-  // target ~3s avg scene (friend's pipeline produces ~280 scenes per
-  // 14-min video; this brings us closer without breaking the
-  // sentence-boundary rule).
-  const SCENE_SOFT_MIN = 2.5; // close at sentence-change once we're past this
-  const SCENE_HARD_MAX = 12;  // emergency cut even mid-sentence
+  // Phase 15d + Phase 16I + Phase 22-pacing: STRICT sentence-boundary cuts.
+  // Item #13 pacing re-tune: SCENE_HARD_MAX raised 6→8 (emergency cap only).
+  // The close-at-sentence cutoff stays at SCENE_SOFT_MIN, so the average scene
+  // duration is unchanged; the only effect is that scenes which would have hit
+  // the old 6s emergency cap mid-sentence now have headroom to 8s to close on a
+  // natural sentence boundary instead of being cut mid-sentence.
+  // Audio mapping is unchanged: only scene-boundary placement shifts.
+  const SCENE_SOFT_MIN = 2.0; // absolute floor + close-at-sentence threshold
+  const SCENE_HARD_MAX = 8;   // emergency cut even mid-sentence (safety only; was 6)
   const scenes = [];
   let cur = {start: rawBeats[0].start || 0, beats: [0]};
   for (let i = 1; i < rawBeats.length; i++) {
@@ -5876,14 +6730,29 @@ Rules — pick the BEST type for EACH specific scene, NOT a default:
     "container ship Long Beach port aerial"]
   * Stock scene examples (BAD — TOO VAGUE): ["financial crisis",
     "dramatic markets", "scary headlines"]
-- For archival_photo specifically: 2026 has BOTH Wikimedia Commons AND
-  Internet Archive video as backing sources. Wikimedia is better for
-  WELL-KNOWN named figures + iconic moments (FDR, Lincoln, Bernanke);
+- For archival_photo specifically: 2026 has Library of Congress,
+  Wikimedia Commons (images + video) and Internet Archive as backing
+  sources. Wikimedia is the best source for NAMED PEOPLE — historical
+  AND modern. Use the person's NAME explicitly in searchKeywords any
+  time the scene mentions a real public figure (CEOs, politicians,
+  central bankers, founders). Theme-only queries miss thousands of
+  CC-licensed portraits and event photos every modern figure has on
+  Commons. Examples:
+  * Historical: ["FDR fireside chat 1933"], ["Bernanke testimony 2008"],
+    ["Greenspan Senate testimony"]
+  * Modern tech: ["Jensen Huang Nvidia keynote"], ["Sam Altman OpenAI"],
+    ["Sundar Pichai Google IO"], ["Satya Nadella Microsoft"],
+    ["Tim Cook Apple keynote"], ["Mark Zuckerberg Senate"], ["Lisa Su AMD"],
+    ["Elon Musk Tesla"]
+  * Modern finance/policy: ["Janet Yellen Treasury"], ["Powell FOMC"],
+    ["Warren Buffett Berkshire"], ["Jamie Dimon JPMorgan"]
+  Rule of thumb: if the scene mentions a real person, INCLUDE THEIR
+  NAME — "Jensen Huang Nvidia GPU" beats "GPU data center" every time.
   Internet Archive (Prelinger collection) is better for ERA/INDUSTRY
-  footage (1929 trading floors, 1950s factory lines, 1970s gas crisis).
-  When the scene is a generic-era visual, lean Internet Archive — use
-  era + activity keywords ("1929 stock exchange", "1970s gas station",
-  "Great Depression breadline").
+  footage with no named subject (1929 trading floors, 1950s factory
+  lines, 1970s gas crisis). When the scene is a generic-era visual,
+  lean Internet Archive — use era + activity keywords ("1929 stock
+  exchange", "1970s gas station", "Great Depression breadline").
 - For map, the locations live in mapContext, so searchKeywords can be
   short descriptive labels.
 - searchKeywords must refine the beat hints with full scene context — better than the beat hints in isolation.
@@ -6383,11 +7252,28 @@ async function handleAiGenerated(scene, ctx) {
     provenance.push({tried: 'fal-ai-image', ok: false, reason: 'no aiPrompt'});
     return {url: null, source: null, provenance};
   }
+  // Item #16: gather company/org/institution entity names from THIS scene's
+  // beats so the AI-prompt sanitizer can swap any unlisted brand for a
+  // generic neutral noun ("a major company") instead of letting the literal
+  // brand name reach fal.ai (where it produces fake logos or hits content-mod).
+  const sceneEntities = [];
+  const _seenEnt = new Set();
+  for (const b of (ctx.sceneBeats || [])) {
+    if (!Array.isArray(b?.entities)) continue;
+    for (const e of b.entities) {
+      if (!e?.name) continue;
+      const k = String(e.name).toLowerCase().trim();
+      if (!k || _seenEnt.has(k)) continue;
+      _seenEnt.add(k);
+      sceneEntities.push({name: e.name, type: e.type || null});
+    }
+  }
   const aiUrl = await generateAiImage({
     prompt: scene.aiPrompt,
     falApiKey: process.env.FAL_AI_API_KEY,
     budgetTracker: ctx.aiImageBudget,
     forbiddenNames: ctx.forbiddenNames || [], // Phase 16D
+    sceneEntities, // Item #16
   });
   if (aiUrl) {
     provenance.push({tried: 'fal-ai-image', ok: true});
@@ -6404,17 +7290,40 @@ async function handleMap(scene, ctx) {
     provenance.push({tried: 'mapbox-image', ok: false, reason: 'no mapContext'});
     return {url: null, source: null, provenance};
   }
+  // Capture the resolved location names so the footage record audits
+  // what was actually geocoded. Useful when reviewing renders where a
+  // map looks wrong — surfaces whether the scene-plan / pre-probe step
+  // picked an irrelevant entity for the Mapbox query.
+  const locs = Array.isArray(scene.mapContext.locations) ? scene.mapContext.locations : [];
+  const mapQuery = locs.map((l) => l && l.name).filter(Boolean).join(' | ').slice(0, 240) || null;
+  // Maps ONLY when a place is actually NAMED in this scene's narration —
+  // otherwise the map is irrelevant decoration (user: "random map at 1:00,
+  // maps should only be if a city is mentioned exactly then"). Require a
+  // location name (or a ≥4-char token of it, e.g. "Washington" of
+  // "Washington D.C.") to appear in the spoken sentences; else skip the map
+  // and let the handler fall through to scene-matched stock.
+  const spoken = (Array.isArray(ctx.sceneBeats) ? ctx.sceneBeats : []).map((b) => b?.sentence || '').join(' ').toLowerCase();
+  const placeNamed = locs.some((l) => {
+    const name = String(l?.name || '').toLowerCase().trim();
+    if (!name) return false;
+    if (spoken.includes(name)) return true;
+    return name.split(/[^a-z]+/).some((tok) => tok.length >= 4 && spoken.includes(tok));
+  });
+  if (!placeNamed) {
+    provenance.push({tried: 'mapbox-image', ok: false, reason: `no location spoken in scene (locs: ${mapQuery || 'none'})`});
+    return {url: null, source: null, provenance, mapQuery};
+  }
   const mapUrl = await generateMapImage({
     mapContext: scene.mapContext,
     mapboxToken: process.env.MAPBOX_ACCESS_TOKEN,
   });
   if (mapUrl) {
-    provenance.push({tried: 'mapbox-image', ok: true});
+    provenance.push({tried: 'mapbox-image', ok: true, ...(mapQuery ? {reason: `query="${mapQuery}"`} : {})});
     ctx.usedStockUrls.add(mapUrl);
-    return {url: mapUrl, source: 'mapbox-image', provenance};
+    return {url: mapUrl, source: 'mapbox-image', provenance, mapQuery};
   }
   provenance.push({tried: 'mapbox-image', ok: false, reason: 'generation failed'});
-  return {url: null, source: null, provenance};
+  return {url: null, source: null, provenance, mapQuery};
 }
 
 // Stock chain (used by stock_footage primary + as fallback for other types).
@@ -6430,9 +7339,58 @@ async function handleStockChain(scene, ctx, assetTypeHint) {
     provenance.push({tried: 'stock-chain', ok: false, reason: 'no query'});
     return {url: null, source: null, provenance, pexelsAlternates: []};
   }
-  const {urls: rawCandidates, source: pickedSource, creators = {}} = await searchAllFootageSources(ctx.channelId, query, 3, assetTypeHint);
+  // Pass-3 entity augmentation (archival_photo only): when the scene's
+  // constituent beats name real entities (rawBeats[i].entities), fire a
+  // tight name-anchored query through the archival cascade FIRST. LOC /
+  // Wikimedia / Archive respond best to short queries (the 4-word rule
+  // in the prompt); joining all keywords often pushes them over the
+  // limit so the cascade returns 0 even when "Constellation Energy"
+  // alone would hit. Includes person AND company/organization/institution
+  // — Wikipedia has rich pages for named companies (Constellation, Three
+  // Mile Island, Microsoft) and they're exactly the subjects with real
+  // archival imagery. We still fall back to the keyword query if the
+  // name probe misses, so theme-only scenes are unaffected.
+  const ENTITY_ANCHOR_TYPES = new Set(['person', 'company', 'organization', 'institution']);
+  let rawCandidates;
+  let pickedSource;
+  let creators;
+  if (assetTypeHint === 'archival_photo' && Array.isArray(ctx.sceneBeats)) {
+    const entityNames = [];
+    const seen = new Set();
+    for (const b of ctx.sceneBeats) {
+      if (!Array.isArray(b?.entities)) continue;
+      for (const e of b.entities) {
+        if (!ENTITY_ANCHOR_TYPES.has(e?.type) || !e?.name) continue;
+        const key = String(e.name).toLowerCase().trim();
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        entityNames.push(e.name);
+      }
+    }
+    if (entityNames.length) {
+      const nameQuery = entityNames.slice(0, 2).join(' ');
+      console.log(`[stock-chain] archival_photo entity-anchored probe for scene ${scene.index}: "${nameQuery}" (${entityNames.length} entity(s))`);
+      // CHANGE 2: skip loc.gov for entity-anchored probes. loc.gov 429s
+      // on every short entity query (57 fresh 429s in job 0jOGJ4qG…) and
+      // has effectively never returned a hit for a single-name probe.
+      // Keep loc.gov in the scene-description path where it actually
+      // returns content for long US-finance/history queries.
+      const r = await searchAllFootageSources(ctx.channelId, nameQuery, 3, 'archival_photo', {skipLocGov: true});
+      if (r && Array.isArray(r.urls) && r.urls.length) {
+        rawCandidates = r.urls;
+        pickedSource = r.source;
+        creators = r.creators || {};
+        provenance.push({tried: `entity-anchored:${r.source}`, ok: true, reason: `query="${nameQuery}"`});
+      } else {
+        provenance.push({tried: 'entity-anchored', ok: false, reason: `no archival match for "${nameQuery}"`});
+      }
+    }
+  }
+  if (!rawCandidates) {
+    ({urls: rawCandidates, source: pickedSource, creators = {}} = await searchAllFootageSources(ctx.channelId, query, 3, assetTypeHint));
+  }
   const candidates = rawCandidates.filter((c) => !ctx.blocklist.has(c));
-  const validator = pickedSource === 'wikimedia-image' ? validateImageUrl : validatePexelsVideo;
+  const validator = pickValidatorForSource(pickedSource);
   for (let ci = 0; ci < candidates.length; ci++) {
     const cand = candidates[ci];
     if (ctx.usedStockUrls.has(cand)) continue;
@@ -6448,10 +7406,28 @@ async function handleStockChain(scene, ctx, assetTypeHint) {
   return {url: null, source: null, provenance, pexelsAlternates: []};
 }
 
-// Generic stock cascade (last resort). 10 finance-themed queries with
-// HEAD probe for upstream-reachability. Returns first survivor.
+// Stock fallback. Tries SCENE-MATCHED queries first so the fallback still
+// matches what's said at that moment, and only drops to hardcoded generic
+// finance b-roll as an absolute last resort (better than a black frame, but
+// it won't match the line). Each candidate is validated + HEAD-probed for
+// upstream reachability. Returns first survivor.
 async function handleGenericStock(scene, ctx) {
   const provenance = [];
+  // Scene-matched queries, most-specific first:
+  //   1. visualConcept — the scene plan's description of the intended shot.
+  //   2. the scene's own keywords joined.
+  //   3. each keyword individually — broadens the net (the "retry with a
+  //      similar search" step) when the exact join found nothing.
+  const vc = String(scene.visualConcept || '').trim();
+  const kws = (Array.isArray(scene.searchKeywords) && scene.searchKeywords.length)
+    ? scene.searchKeywords
+    : (ctx.sceneBeats?.[0]?.keywords || []);
+  const sceneQueries = [];
+  const pushQ = (q) => { const s = String(q || '').trim(); if (s && !sceneQueries.includes(s)) sceneQueries.push(s); };
+  if (vc) pushQ(vc.split(/\s+/).slice(0, 8).join(' '));
+  if (kws.length) pushQ(kws.slice(0, 3).join(' '));
+  for (const k of kws.slice(0, 3)) pushQ(k);
+
   const GENERIC_QUERIES = [
     'financial district city skyline night',
     'businessman walking office corridor',
@@ -6464,24 +7440,34 @@ async function handleGenericStock(scene, ctx) {
     'global currency money exchange',
     'aerial city economic activity',
   ];
-  for (const gq of GENERIC_QUERIES) {
-    const {urls: rawCandidates, source: pickedSource, creators = {}} = await searchAllFootageSources(ctx.channelId, gq, 5, 'stock_footage');
-    const candidates = rawCandidates.filter((c) => !ctx.blocklist.has(c) && !ctx.usedStockUrls.has(c));
-    for (const cand of candidates) {
-      const v = await validatePexelsVideo(cand);
-      if (!v.ok) continue;
-      let reachable = true;
-      try {
-        const headProbe = await fetch(cand, {method: 'HEAD', signal: AbortSignal.timeout(2500)});
-        reachable = headProbe.ok;
-      } catch { reachable = false; }
-      if (!reachable) continue;
-      ctx.usedStockUrls.add(cand);
-      provenance.push({tried: 'generic-stock', ok: true, reason: `query="${gq}"`});
-      return {url: cand, source: pickedSource, provenance, genericFallback: true, creator: creators[cand] || null};
+
+  // Tier 1 = scene-matched (genericFallback:false — it DOES match the line);
+  // Tier 2 = hardcoded generic (genericFallback:true — last resort).
+  const tiers = [
+    {label: 'scene-stock', queries: sceneQueries, generic: false},
+    {label: 'generic-stock', queries: GENERIC_QUERIES, generic: true},
+  ];
+  for (const tier of tiers) {
+    for (const gq of tier.queries) {
+      const {urls: rawCandidates, source: pickedSource, creators = {}} = await searchAllFootageSources(ctx.channelId, gq, 5, 'stock_footage');
+      const candidates = rawCandidates.filter((c) => !ctx.blocklist.has(c) && !ctx.usedStockUrls.has(c));
+      const validator = pickValidatorForSource(pickedSource);
+      for (const cand of candidates) {
+        const v = await validator(cand);
+        if (!v.ok) continue;
+        let reachable = true;
+        try {
+          const headProbe = await fetch(cand, {method: 'HEAD', signal: AbortSignal.timeout(2500)});
+          reachable = headProbe.ok;
+        } catch { reachable = false; }
+        if (!reachable) continue;
+        ctx.usedStockUrls.add(cand);
+        provenance.push({tried: tier.label, ok: true, reason: `query="${gq}"`});
+        return {url: cand, source: pickedSource, provenance, genericFallback: tier.generic, creator: creators[cand] || null};
+      }
     }
   }
-  provenance.push({tried: 'generic-stock', ok: false, reason: '10 queries exhausted'});
+  provenance.push({tried: 'generic-stock', ok: false, reason: 'scene + generic queries exhausted'});
   return {url: null, source: null, provenance, genericFallback: false};
 }
 
@@ -6658,6 +7644,14 @@ async function _probeLocGov(query) {
 async function _probeWikimediaImage(query) {
   const q = capQuery(query, 120);
   if (!q) return 0;
+  // Pass-2 fix: maxAttempts 3 → 1 and shared semaphore. The pre-probe
+  // was burning the Wikimedia rate budget via 25-concurrent × 3-retry
+  // bursts (100+ 429s per render), leaving sourcing-time to face a
+  // throttle ceiling it couldn't clear. Shadow data — a missed hit
+  // just costs prompt signal, not a render. Mirrors loc-probe and
+  // archive-probe, both already maxAttempts=1 for the same reason.
+  await paceWikimedia();
+  await wikimediaSemaphore.acquire();
   try {
     const url = new URL('https://commons.wikimedia.org/w/api.php');
     url.searchParams.set('action', 'query');
@@ -6667,11 +7661,12 @@ async function _probeWikimediaImage(query) {
     url.searchParams.set('srnamespace', '6');
     url.searchParams.set('srlimit', '1');
     url.searchParams.set('origin', '*');
-    const r = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 3, label: 'wikimedia-probe'});
+    const r = await fetchWithRetry(url, {}, {timeoutMs: 8000, maxAttempts: 1, label: 'wikimedia-probe'});
     if (!r.ok) return 0;
     const d = await r.json();
     return d?.query?.searchinfo?.totalhits || 0;
   } catch { return 0; }
+  finally { wikimediaSemaphore.release(); }
 }
 async function _probeArchiveOrg(query) {
   const q = capQuery(query, 120);
@@ -6721,7 +7716,7 @@ async function _probePexelsCount(query) {
   } catch { return 0; }
 }
 async function _probePixabayCount(query) {
-  if (!process.env.PIXABAY_API_KEY) return 0;
+  if (!isUsableKey(process.env.PIXABAY_API_KEY)) return 0;
   const q = capQuery(query, 120);
   if (!q) return 0;
   try {
@@ -6761,26 +7756,89 @@ async function _probeMapboxGeocode(name) {
   } catch { return empty; }
 }
 
-// Quick heuristic: does this scene look like it mentions a real-world
-// place? Used to skip Mapbox probes for scenes that have nothing
-// place-like to geocode. Captialised multi-word phrases in voiceoverText
-// or any beat keyword hint that looks like a proper noun are enough to
-// trigger a probe — false positives waste one geocoding call but the
-// quota is huge, so favour recall over precision here.
+// Does this scene actually mention a real-world place? The old
+// heuristic (any two consecutive capitalised words) fired on company
+// names, ticker symbols and product names — e.g. "Samsung and SK
+// Hynix are the other two" → mapbox-image of South Korea. The viewer
+// sees a generic world map and the scene is unrelated to the VO.
+//
+// Tightened gate: require an explicit geographic signal — a country
+// from PLACE_TOKENS, a finance-relevant city/region, or one of the
+// explicit geographic phrases ("country", "border", "based in", …).
+// Company / ticker / person names alone never trigger a probe.
+const PLACE_TOKENS = new Set([
+  // Countries
+  'us', 'usa', 'u.s.', 'u.s', 'america', 'american', 'mexico', 'mexican', 'canada', 'canadian',
+  'china', 'chinese', 'taiwan', 'taiwanese', 'japan', 'japanese', 'korea', 'korean',
+  'india', 'indian', 'russia', 'russian', 'ukraine', 'ukrainian', 'germany', 'german',
+  'france', 'french', 'uk', 'britain', 'british', 'england', 'english', 'scotland',
+  'ireland', 'irish', 'italy', 'italian', 'spain', 'spanish', 'portugal', 'portuguese',
+  'netherlands', 'dutch', 'belgium', 'belgian', 'switzerland', 'swiss', 'sweden', 'swedish',
+  'norway', 'norwegian', 'denmark', 'danish', 'finland', 'finnish', 'poland', 'polish',
+  'turkey', 'turkish', 'israel', 'israeli', 'iran', 'iranian', 'iraq', 'iraqi',
+  'saudi', 'arabia', 'uae', 'egypt', 'egyptian', 'brazil', 'brazilian', 'argentina', 'argentinian',
+  'australia', 'australian', 'singapore', 'malaysia', 'malaysian', 'thailand', 'thai',
+  'vietnam', 'vietnamese', 'indonesia', 'indonesian', 'philippines', 'pakistan', 'pakistani',
+  'south africa', 'nigeria', 'nigerian', 'kenya',
+  // Common finance-relevant cities, regions, financial districts
+  'washington', 'd.c.', 'dc', 'new york', 'manhattan', 'brooklyn', 'wall street',
+  'london', 'paris', 'berlin', 'frankfurt', 'munich', 'zurich', 'geneva', 'milan', 'madrid',
+  'amsterdam', 'brussels', 'dublin', 'stockholm', 'oslo', 'copenhagen', 'helsinki',
+  'moscow', 'kyiv', 'kiev', 'istanbul', 'dubai', 'riyadh', 'tel aviv', 'jerusalem',
+  'tokyo', 'osaka', 'seoul', 'busan', 'pyongyang', 'beijing', 'shanghai', 'shenzhen',
+  'guangzhou', 'hong kong', 'macau', 'taipei', 'hsinchu', 'kaohsiung',
+  'mumbai', 'delhi', 'bangalore', 'bengaluru', 'singapore', 'kuala lumpur', 'jakarta',
+  'sydney', 'melbourne', 'auckland', 'mexico city', 'sao paulo', 'rio de janeiro',
+  'buenos aires', 'santiago', 'lima', 'bogota', 'caracas',
+  'silicon valley', 'san francisco', 'palo alto', 'mountain view', 'cupertino',
+  'los angeles', 'seattle', 'redmond', 'austin', 'dallas', 'houston', 'chicago',
+  'detroit', 'pittsburgh', 'boston', 'cambridge', 'philadelphia', 'atlanta', 'miami',
+  'phoenix', 'denver', 'salt lake city', 'portland', 'minneapolis',
+  'europe', 'european', 'asia', 'asian', 'africa', 'african', 'middle east',
+  'eu', 'eurozone', 'g7', 'g20', 'opec', 'asean', 'nato', 'brics',
+]);
+const GEO_PHRASE_REGEX = new RegExp([
+  // Explicit geography vocabulary
+  '\\b(?:country|countries|continents?|continental|regions?|regional|borders?|border-?crossings?)\\b',
+  '\\b(?:map|maps|mapped|atlas|globe|globally|global|worldwide|world-wide)\\b',
+  '\\b(?:headquartered\\s+in|based\\s+in|located\\s+in|located\\s+at|sited\\s+in|operates\\s+in|operating\\s+in)\\b',
+  '\\b(?:capital\\s+of|capital\\s+city)\\b',
+  '\\b(?:ports?|harbou?rs?|coast(?:al)?|coastline|peninsula|strait\\s+of|gulf\\s+of)\\b',
+  '\\b(?:north|south|east|west|northern|southern|eastern|western|central)\\s+(?:hemisphere|coast|asia|europe|africa|america|americas|pacific|atlantic)\\b',
+  '\\b(?:cross-?border|trans-?atlantic|trans-?pacific|inter-?national|geopolitic(?:s|al))\\b',
+].join('|'), 'i');
 function shouldProbeMap(sceneInput) {
   if (!sceneInput) return false;
   const text = `${sceneInput.voiceoverText || ''} ${(sceneInput.beatKeywordHints || []).join(' ')}`;
   if (!text.trim()) return false;
-  // Two or more consecutive capitalised words OR a single capitalised
-  // token that isn't sentence-initial (after lowercasing the first char
-  // of each sentence). Cheap regex — generous on recall.
-  const properNounRun = /\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+\b/;
-  if (properNounRun.test(text)) return true;
-  // Also catch lone city/country names in beat keyword hints (e.g.
-  // "Shanghai", "Berlin"). The hints don't carry sentence context, so
-  // any capitalised token there is a plausible place name.
+  const lower = text.toLowerCase();
+  // 1) Explicit geographic vocabulary — fastest path.
+  if (GEO_PHRASE_REGEX.test(lower)) return true;
+  // 2) Known country / city / region tokens. Iterate the set; multi-word
+  // entries ("south korea", "wall street") require substring check, so
+  // we accept either an exact whole-word match or a contained phrase.
+  for (const tok of PLACE_TOKENS) {
+    if (tok.includes(' ')) {
+      // multi-word place — require it as a contained phrase
+      if (lower.includes(tok)) return true;
+    } else {
+      // single-token place — require a whole-word match so "us" doesn't
+      // fire on "users" / "usage" / "must" etc.
+      const re = new RegExp(`\\b${tok.replace(/\./g, '\\.')}\\b`, 'i');
+      if (re.test(lower)) return true;
+    }
+  }
+  // 3) Beat keyword hints flagged as places. Hints carry no sentence
+  // context, but the planner only sets them when it has high confidence
+  // the term is the scene's anchor — so a hint that itself matches a
+  // PLACE_TOKEN counts. Company / ticker hints ("Samsung", "NVDA") do
+  // NOT — they will not appear in PLACE_TOKENS.
   for (const kw of (sceneInput.beatKeywordHints || [])) {
-    if (typeof kw === 'string' && /^[A-Z][a-zA-Z]+$/.test(kw.trim())) return true;
+    if (typeof kw !== 'string') continue;
+    const k = kw.trim().toLowerCase();
+    if (!k) continue;
+    if (PLACE_TOKENS.has(k)) return true;
+    if (GEO_PHRASE_REGEX.test(k)) return true;
   }
   return false;
 }
@@ -6810,7 +7868,9 @@ async function preProbeSceneAvailability(sceneInputs, opts = {}) {
   // actually bound. Without a key the probe silently returns 0 for
   // every scene, which made "pixabay=0" look meaningful when it
   // really means "never called". Skip the probe + flag it instead.
-  const pixabayDisabled = !process.env.PIXABAY_API_KEY;
+  // isUsableKey also treats the literal "PENDING_SIGNUP" placeholder
+  // as no-key, so the gate isn't fooled by a truthy stub string.
+  const pixabayDisabled = !isUsableKey(process.env.PIXABAY_API_KEY);
 
   // Cache shape: Map<source, Map<query, count>>. One entry per source so
   // the same query across sources doesn't collide. Sentinel value -1
@@ -6958,9 +8018,52 @@ async function preProbeSceneAvailability(sceneInputs, opts = {}) {
 // we don't have to call Mapbox again). When availability is null we
 // fall through to the legacy behavior — archival re-probe + AI-budget
 // rewrite — preserved verbatim below.
-async function validateScenePlanAgainstAvailability(scenes, availability, aiImageBudget) {
+async function validateScenePlanAgainstAvailability(scenes, availability, aiImageBudget, rawBeats = null) {
   if (!Array.isArray(scenes) || scenes.length === 0) return {};
   const t0 = Date.now();
+  // Deepfake guard: collect every real person named in rawBeats so the
+  // archival→AI upgrade path can detect and strip them from the
+  // synthesized aiPrompt. Mirrors the collection in
+  // sourceScenesAndBuildFootage so coverage matches forbiddenNames.
+  const allPersonNames = [];
+  if (Array.isArray(rawBeats)) {
+    const seen = new Set();
+    for (const b of rawBeats) {
+      if (!Array.isArray(b?.entities)) continue;
+      for (const e of b.entities) {
+        if (e?.type !== 'person' || !e.name) continue;
+        const k = String(e.name).toLowerCase().trim();
+        if (!k || seen.has(k)) continue;
+        seen.add(k);
+        allPersonNames.push(e.name);
+      }
+    }
+  }
+  const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const personNameRegex = allPersonNames.length
+    ? new RegExp(`\\b(?:${allPersonNames.map(escapeRe).join('|')})\\b`, 'gi')
+    : null;
+  // Also catch standalone last-name mentions ("Powell", "Lagarde") that
+  // appear without the first name in visualConcept/searchKeywords.
+  const lastNamesOnly = allPersonNames
+    .map((n) => String(n).trim().split(/\s+/).slice(-1)[0])
+    .filter((w) => w && w.length >= 3);
+  const lastNameRegex = lastNamesOnly.length
+    ? new RegExp(`\\b(?:${lastNamesOnly.map(escapeRe).join('|')})\\b`, 'gi')
+    : null;
+  const stripPersonNames = (text) => {
+    if (typeof text !== 'string' || !text) return text;
+    let out = text;
+    if (personNameRegex) out = out.replace(personNameRegex, '');
+    if (lastNameRegex) out = out.replace(lastNameRegex, '');
+    return out.replace(/\s+/g, ' ').replace(/\s*[,;]\s*[,;]+/g, ',').trim();
+  };
+  const mentionsPerson = (text) => {
+    if (typeof text !== 'string' || !text) return false;
+    if (personNameRegex && personNameRegex.test(text)) { personNameRegex.lastIndex = 0; return true; }
+    if (lastNameRegex && lastNameRegex.test(text)) { lastNameRegex.lastIndex = 0; return true; }
+    return false;
+  };
 
   // ── Singlepass branch: trust the LLM, validate only ───────────────
   if (availability) {
@@ -7140,7 +8243,22 @@ async function validateScenePlanAgainstAvailability(scenes, availability, aiImag
         const VINTAGE_PREFIX = 'vintage photograph, black and white, archival style: ';
         if (hasAiBudget) {
           scene.assetType = 'ai_generated';
-          const base = scene.aiPrompt || `Editorial scene: ${scene.visualConcept || (scene.searchKeywords || []).join(' ')}`;
+          // Deepfake guard: when the archival miss is a person-scene (the
+          // visualConcept / searchKeywords / planner-supplied aiPrompt
+          // names a real human), feeding those names into the image
+          // generator produces a fake likeness. Strip names and build a
+          // context-only prompt depicting an empty setting instead.
+          const rawConcept = scene.visualConcept || (scene.searchKeywords || []).join(' ');
+          const existingPrompt = scene.aiPrompt || '';
+          const needsStrip = mentionsPerson(rawConcept) || mentionsPerson(existingPrompt);
+          let base;
+          if (needsStrip) {
+            const strippedConcept = stripPersonNames(rawConcept) || 'editorial setting';
+            base = `Empty editorial setting — no people visible. Context: ${strippedConcept}. Depict an empty podium, building exterior, boardroom, or symbolic environment; NO faces, NO bodies, NO recognizable individuals.`;
+            console.log(`[entity-scene] person-scene upgraded to AI, name stripped, context-only prompt`);
+          } else {
+            base = existingPrompt || `Editorial scene: ${rawConcept}`;
+          }
           // Avoid double-prefixing on repeat passes.
           scene.aiPrompt = base.toLowerCase().startsWith('vintage photograph') ? base : VINTAGE_PREFIX + base;
           archivalUpgradedToAi++;
@@ -7174,6 +8292,66 @@ async function validateScenePlanAgainstAvailability(scenes, availability, aiImag
   return {aiBudgetDowngraded, archivalUpgradedToAi, archivalDowngradedToStock, mapDowngraded};
 }
 
+// ─── Item #12: stat_overlay hard cap ────────────────────────────────
+// Finance scripts surface lots of memorable numbers and the scene-plan LLM
+// tends to over-assign stat_overlay, producing a repetitive number-card
+// feel. Cap stat_overlay at STAT_OVERLAY_CAP_PCT of total scenes and demote
+// the weakest excess to a real-footage type via the scene's fallbackChain
+// (so they re-enter the entity-first → stock ladder instead of rendering
+// yet another number card). Runs AFTER validateScenePlanAgainstAvailability
+// so the cap acts on post-availability counts.
+//
+// Ranking — strongest "single number" first (kept), weakest first to drop:
+//   • currency + scale word/letter ($2.4T, $700 billion) — strongest
+//   • plain currency ($73,000) — strong
+//   • striking percent gets a floor (9.1% beats a plain "$50")
+//   • multi-number / range / arrow ("$4T → $9T") — weakened single-stat focus
+//   • empty / non-numeric value — first to demote
+const STAT_OVERLAY_CAP_PCT = 0.10;
+function _statWorthinessScore(scene) {
+  const v = String(scene?.templateParams?.value || '').trim();
+  if (!v) return -1;
+  const isMultiNum = (v.match(/\d/g) || []).length > 6 || /[→→\-—\/]\s?\$?\d/.test(v);
+  const hasCurrency = v.includes('$');
+  const hasPercent = v.includes('%');
+  const m = v.match(/(-?\d[\d,]*(?:\.\d+)?)\s*(trillion|billion|million|thousand|[TtBbMmKk])?/);
+  if (!m) return 0;
+  const num = Math.abs(parseFloat(m[1].replace(/,/g, '')));
+  const sc = (m[2] || '').toLowerCase();
+  const factor = sc === 'trillion' || sc === 't' ? 1e12
+    : sc === 'billion' || sc === 'b' ? 1e9
+    : sc === 'million' || sc === 'm' ? 1e6
+    : sc === 'thousand' || sc === 'k' ? 1e3 : 1;
+  let mag = num * factor;
+  // Striking percent floor: a plain "9.1%" should beat a plain "$50".
+  if (hasPercent && factor === 1) mag = Math.max(mag, num * 1e6);
+  if (hasCurrency) mag *= 1.5;
+  if (isMultiNum) mag *= 0.4;
+  return mag;
+}
+function applyStatOverlayCap(scenes, capPct = STAT_OVERLAY_CAP_PCT) {
+  if (!Array.isArray(scenes) || scenes.length === 0) return {before: 0, kept: 0, demoted: 0, cap: 0};
+  const cap = Math.max(1, Math.floor(scenes.length * capPct));
+  const stats = scenes
+    .map((s, idx) => ({idx, s, score: _statWorthinessScore(s)}))
+    .filter((c) => c.s.assetType === 'stat_overlay');
+  if (stats.length <= cap) return {before: stats.length, kept: stats.length, demoted: 0, cap};
+  stats.sort((a, b) => b.score - a.score);
+  const keep = stats.slice(0, cap);
+  const demote = stats.slice(cap);
+  for (const {s} of demote) {
+    s._originalAssetType = s._originalAssetType || s.assetType;
+    // Prefer the scene's own fallbackChain (the scene director already
+    // picked the best alternative for THIS scene's content); skip any
+    // other template types — we want REAL footage, not another card.
+    const fallback = (Array.isArray(s.fallbackChain) ? s.fallbackChain : [])
+      .find((t) => t && t !== 'stat_overlay' && t !== 'quote_card' && t !== 'comparison_split' && t !== 'timeline_bar');
+    s.assetType = fallback || 'stock_footage';
+  }
+  console.log(`[scene-plan] stat_overlay cap: ${stats.length} → ${keep.length} kept (cap=${cap} = ${(capPct * 100).toFixed(0)}% of ${scenes.length}), ${demote.length} demoted to real footage`);
+  return {before: stats.length, kept: keep.length, demoted: demote.length, cap};
+}
+
 // Phase 16C preAllocateAiBudget retained as a back-compat shim — it's
 // called by the older path that didn't have the full probe. New path
 // calls finalizeScenePlanWithAvailability instead.
@@ -7193,6 +8371,233 @@ function preAllocateAiBudget(scenes, aiImageBudget) {
   console.log(`[scene-plan] AI budget pre-alloc: ${aiCapImages} kept, ${losers.length} downgraded`);
   return {kept: aiCapImages, downgraded: losers.length};
 }
+
+// Query-building stopwords for retry construction. Broader than the
+// relevance-filter set (WIKIMEDIA_RELEVANCE_STOPWORDS, intentionally tiny)
+// — used only to pick the most-distinctive keyword and to strip filler
+// from the video topic. Kept separate so widening it here can't change
+// what filterWikimediaByRelevance keeps.
+const QUERY_STOPWORDS = new Set([
+  'the', 'and', 'or', 'of', 'in', 'on', 'at', 'to', 'a', 'an', 'is', 'are',
+  'was', 'were', 'be', 'been', 'being', 'it', 'its', 'this', 'that', 'these',
+  'those', 'as', 'by', 'for', 'with', 'from', 'into', 'than', 'then', 'they',
+  'them', 'their', 'more', 'most', 'just', 'before', 'after', 'about', 'over',
+  'under', 'what', 'why', 'how', 'when', 'where', 'who', 'will', 'would',
+  'could', 'should', 'can', 'may', 'might', 'have', 'has', 'had', 'do', 'does',
+  'did', 'not', 'but', 'so', 'if', 'up', 'out', 'down', 'vs', 'versus',
+]);
+// Distinctive tokens of a phrase: lowercased ≥3-char alnum tokens minus
+// QUERY_STOPWORDS, original order preserved. _wikimediaTokens already
+// enforces the ≥3-char + alnum rule.
+function _distinctiveTokens(phrase) {
+  return _wikimediaTokens(phrase).filter((t) => !QUERY_STOPWORDS.has(t));
+}
+
+// PART A (relevance-first): Wikipedia/Wikimedia anchoring probe. Runs for
+// EVERY non-template scene (the caller skips code-rendered templates) and
+// tries to anchor the scene to REAL, SCENE-SPECIFIC Wikipedia/Wikimedia
+// footage before the normal Pexels-first ladder. Video preferred over stills.
+//
+// RELEVANCE-FIRST query building — queries come ONLY from the scene's own
+// subjects, NEVER the video's overall topic. (Topic-level queries fetched
+// footage about the general subject, not what's said in that 5s scene — the
+// "irrelevant Wikipedia clips" the user flagged.) Priority:
+//   1. PERSON entities — highest value; a real person's photo is almost
+//      always available + relevant (e.g. "Michael Dell" → his portrait).
+//   2. Other named entities (company / org / product / place / event).
+//   3. Entity-LESS scenes only: ONE tight query from the scene's own visual
+//      keywords (scene-specific, e.g. "offshore oil platform"), gated by the
+//      relevance filter. Generic scenes that miss fall to Pexels/AI — a
+//      relevant stock clip beats an off-topic Wikimedia one.
+// No video-topic fallback: a scene with no named subject and no concrete
+// keyword returns null → Pexels (relevance over raw coverage).
+//
+// Each attempt runs Video → Image → PageImage; first renderable hit wins.
+// Page-image (fetchWikipediaImage) only runs on ≤4-token title-shaped
+// candidates (a sentence won't resolve to a page + burns the qualifier loop).
+//
+// Throttling is PROACTIVE (paceWikimedia spaces Wikimedia calls under the
+// rate limit), so we no longer hard-skip the probe on the shared 60s cooldown
+// — that deferred to the archival cascade's 429s and collapsed coverage to
+// ~4%. If a genuine 429 still trips the cooldown, the search fns +
+// fetchWikipediaImage self-skip (return empty) without further HTTP.
+//
+// Returns {url, source, creator, entity, provenance, telemetry}. telemetry
+// = {attempted, outcome:'video'|'image'|'pageimage'|'fellthrough', retried}.
+// entity is set only for entity-derived anchors (keeps footage.entityAnchor
+// meaning "a real named entity"). url===null → caller runs the normal handler.
+//
+// Source tags (registered in IMAGE_SOURCES / VIDEO_SOURCE_NAMES + MainComp):
+//   wikimedia-video-entity / wikimedia-image-entity / wikipedia-pageimage-entity
+async function probeEntityFirstSource(sceneBeats, ctx) {
+  const provenance = [];
+  const telemetry = {attempted: false, outcome: 'fellthrough', retried: false};
+  const miss = () => ({url: null, source: null, provenance, telemetry});
+  if (!Array.isArray(sceneBeats)) return miss();
+
+  const taken = (u) => !u || ctx.blocklist.has(u) || ctx.usedStockUrls.has(u);
+
+  // ── Gather scene-specific signals ───────────────────────────────────
+  // Unique entities across the scene's beats, split person vs other so we
+  // anchor people first. ANY entity type counts as a nameable subject.
+  const persons = [];
+  const others = [];
+  const seen = new Set();
+  for (const b of sceneBeats) {
+    if (!Array.isArray(b?.entities)) continue;
+    for (const e of b.entities) {
+      if (!e?.name) continue;
+      const key = String(e.name).toLowerCase().trim();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      if (e.type === 'person') persons.push(e.name); else others.push(e.name);
+    }
+  }
+  const keywords = (Array.isArray(ctx.sceneKeywords) ? ctx.sceneKeywords : []).filter(Boolean);
+
+  // ── Build the ordered, de-duped attempt list (scene-specific only) ───
+  // Each attempt: {label, query, pageTitles[], entityName|null}.
+  const attempts = [];
+  const addAttempt = (label, query, pageTitles, entityName) => {
+    const q = String(query || '').trim();
+    if (!q) return;
+    attempts.push({label, query: q, pageTitles: (pageTitles || []).filter(Boolean), entityName: entityName || null});
+  };
+
+  // 1. People first — one attempt per named person (up to 2).
+  for (const name of persons.slice(0, 2)) addAttempt('person', name, [name], name);
+  // 2. Other named entities — combined search query + per-name page titles.
+  if (others.length) addAttempt('entity', others.slice(0, 3).join(' '), others.slice(0, 2), others[0]);
+  // 3. Entity-LESS scenes only: ONE tight scene-keyword query against Commons
+  //    image/video search (scene-specific, NOT the video topic; relevance-
+  //    filtered). NO page-image titles here: a generic keyword resolves a
+  //    Wikipedia page lead image for the wrong thing (e.g. "investor",
+  //    "political" → odd/loosely-relevant portraits). Page-images are for
+  //    real NAMED entities only (the person/entity attempts above).
+  if (!persons.length && !others.length && keywords.length) {
+    const kwQuery = keywords.slice(0, 2).join(' ').trim();
+    if (kwQuery) addAttempt('scene-keyword', kwQuery, [], null);
+  }
+
+  // De-dupe identical queries so each Commons search fires once.
+  const plan = [];
+  const seenQ = new Set();
+  for (const a of attempts) {
+    const k = a.query.toLowerCase();
+    if (seenQ.has(k)) continue;
+    seenQ.add(k);
+    plan.push(a);
+  }
+  if (!plan.length) return miss(); // no named subject + no concrete keyword
+  telemetry.attempted = true;
+
+  // ── Run each attempt's Video → Image → PageImage ladder. Stop on the
+  //    first renderable hit. Video preferred at EVERY attempt. ──────────
+  const titleShaped = (t) => _wikimediaTokens(t).length <= 4; // page-image guard
+  for (let ai = 0; ai < plan.length; ai++) {
+    const a = plan[ai];
+    const tag = a.label;
+    // No hard-break on cooldown: proactive pacing (paceWikimedia) keeps us
+    // under the limit, and if a genuine 429 still trips the shared cooldown
+    // the search fns + fetchWikipediaImage self-skip (return empty) without
+    // HTTP — so these attempts no-op cheaply and resume the moment it lifts,
+    // rather than darkening every subsequent scene for 60s.
+    if (ai > 0) telemetry.retried = true;
+
+    // a) Commons VIDEO — preferred. Already relevance-filtered upstream;
+    //    we playback-validate each candidate before committing.
+    try {
+      const vids = await wikimediaVideoSearchTop(a.query, 3);
+      for (const r of (vids || [])) {
+        if (taken(r?.url)) continue;
+        const v = await validatePexelsVideo(r.url).catch((e) => ({ok: false, reason: e.message}));
+        if (!v.ok) continue;
+        ctx.usedStockUrls.add(r.url);
+        telemetry.outcome = 'video';
+        provenance.push({tried: 'wikimedia-video-entity', ok: true, reason: `${a.label} query="${a.query}"`});
+        console.log(`[entity-first] ${tag} query="${a.query}" → wikimedia-video-entity`);
+        return {url: r.url, source: 'wikimedia-video-entity', creator: r.creator || null, entity: a.entityName, provenance, telemetry};
+      }
+    } catch (e) {
+      provenance.push({tried: 'wikimedia-video-entity', ok: false, reason: `${a.label}: ${e.message}`});
+    }
+
+    // b) Commons STILL.
+    try {
+      const imgs = await wikimediaImageSearchTop(a.query, 3);
+      for (const r of (imgs || [])) {
+        if (taken(r?.url)) continue;
+        // No sourcing-time HEAD probe: the Commons API already vetted
+        // mime/license/size + renderable extension. A HEAD here only adds
+        // image-CDN load that throttles (429s / connection resets) and
+        // false-rejects perfectly good images — the FTX/SEC misses. Real
+        // reachability is re-checked when the asset is cached to Firebase
+        // (with 429 retry) and at the render-gate (keeps transient failures,
+        // drops only hard 404s). So trust the candidate and anchor it.
+        ctx.usedStockUrls.add(r.url);
+        telemetry.outcome = 'image';
+        provenance.push({tried: 'wikimedia-image-entity', ok: true, reason: `${a.label} query="${a.query}"`});
+        console.log(`[entity-first] ${tag} query="${a.query}" → wikimedia-image-entity`);
+        return {url: r.url, source: 'wikimedia-image-entity', creator: r.creator || null, entity: a.entityName, provenance, telemetry};
+      }
+    } catch (e) {
+      provenance.push({tried: 'wikimedia-image-entity', ok: false, reason: `${a.label}: ${e.message}`});
+    }
+
+    // c) Wikipedia REST page lead image — only for title-shaped candidates.
+    for (const title of a.pageTitles.filter(titleShaped)) {
+      let pageImg = null;
+      try { pageImg = await fetchWikipediaImage(title); }
+      catch (e) { provenance.push({tried: 'wikipedia-pageimage-entity', ok: false, reason: `${title}: ${e.message}`}); continue; }
+      if (taken(pageImg)) continue;
+      // No sourcing-time HEAD (see image step): the Wikipedia REST API
+      // returned this as the page's lead image — trust it, anchor, and let
+      // caching + the render-gate handle reachability.
+      ctx.usedStockUrls.add(pageImg);
+      telemetry.outcome = 'pageimage';
+      // entityName only when this attempt was entity-derived (keeps the
+      // footage.entityAnchor field meaning "a real named entity").
+      const anchorName = a.entityName ? title : null;
+      provenance.push({tried: 'wikipedia-pageimage-entity', ok: true, reason: `${a.label} title="${title}"`});
+      console.log(`[entity-first] ${tag} title="${title}" → wikipedia-pageimage-entity`);
+      return {url: pageImg, source: 'wikipedia-pageimage-entity', creator: null, entity: anchorName, provenance, telemetry};
+    }
+
+    console.log(`[entity-first] ${tag} query="${a.query}" → null`);
+  }
+
+  provenance.push({tried: 'entity-first', ok: false, reason: `all ${plan.length} attempt(s) missed`});
+  telemetry.outcome = 'fellthrough';
+  return miss();
+}
+
+// Test-only exports for the offline asset-selection dry-run harness
+// (scripts/dryrun-asset-selection.js). These let the harness run the REAL
+// selection logic against a saved scene plan with no render. Harmless to the
+// deployed function — extra properties on module.exports don't affect the
+// onRequest/onDocument triggers. All of probeEntityFirstSource's network
+// deps are keyless (Wikimedia Commons + Wikipedia REST), so the harness
+// needs no secrets.
+module.exports.probeEntityFirstSource = probeEntityFirstSource;
+module.exports.searchAllFootageSources = searchAllFootageSources;
+module.exports.wikimediaImageSearchTop = wikimediaImageSearchTop;
+module.exports.wikimediaVideoSearchTop = wikimediaVideoSearchTop;
+module.exports.fetchWikipediaImage = fetchWikipediaImage;
+// Full per-scene asset selection (entity-first probe + handlers + stock
+// fallback) — used by the local short-video preview harness so its footage
+// reflects production logic exactly. Pass a stub jobRef ({update,get}).
+module.exports.sourceScenesAndBuildFootage = sourceScenesAndBuildFootage;
+// Asset caching to Firebase Storage — the preview harness uses this so the
+// LOCAL render fetches cached copies instead of hitting Wikimedia/Pexels
+// live (the local IP gets 429'd by Wikimedia's CDN, hanging delayRender).
+module.exports.cacheRemoteToFirebase = cacheRemoteToFirebase;
+// Item #8 TTS number spell-out — exported so the before/after can be shown.
+module.exports.normalizeNumbersForTts = normalizeNumbersForTts;
+// Item #12 stat_overlay cap + scoring — exported for dump-based testing.
+module.exports.applyStatOverlayCap = applyStatOverlayCap;
+module.exports._statWorthinessScore = _statWorthinessScore;
+// Item #16 brand sanitizer — exported so the before/after can be shown.
+module.exports.sanitizeAiPrompt = sanitizeAiPrompt;
 
 // Day-14 Phase 6a + Day-16 Phase 16C: per-scene asset routing via
 // HANDLERS dispatch with provenance tracking. Each scene's footage entry
@@ -7218,6 +8623,12 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
   if (forbiddenNames.length) {
     console.log(`[ai-image] forbiddenNames: ${forbiddenNames.slice(0, 5).join(', ')}${forbiddenNames.length > 5 ? ` … (+${forbiddenNames.length - 5} more)` : ''}`);
   }
+
+  // Per-video coverage telemetry — rolled up to timings.* after the loop.
+  // Relevance-first: the probe queries only scene-specific subjects (entities
+  // + the scene's own keywords), never the video topic — so no topic read.
+  const efTel = {attempted: 0, video: 0, image: 0, pageimage: 0, retried: 0, fellThrough: 0};
+
   const footage = [];
   for (let si = 0; si < scenes.length; si++) {
     const scene = scenes[si];
@@ -7237,7 +8648,7 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
 
     // Phase 16C: HANDLERS dispatch with full provenance tracking
     // Phase 16D: forbiddenNames propagated for AI image generation
-    const ctx = {channelId, blocklist, aiImageBudget, usedStockUrls, sceneBeats, forbiddenNames};
+    const ctx = {channelId, blocklist, aiImageBudget, usedStockUrls, sceneBeats, forbiddenNames, sceneKeywords: keywords};
     const handler = ASSET_HANDLERS[scene.assetType] || ASSET_HANDLERS.stock_footage;
     let url = null;
     let source = null;
@@ -7248,22 +8659,79 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
     // Phase 16I: code-rendered templates skip URL sourcing
     let templateType = null;
     let templateParams = null;
+    let mapQuery = null; // resolved Mapbox query string when handleMap fires
+    let entityAnchor = null; // PART A: entity name when entity-first sourcing won
 
-    try {
-      const primary = await handler(scene, ctx);
-      url = primary.url;
-      source = primary.source;
-      pexelsAlternates = primary.pexelsAlternates || [];
-      provenance.push(...(primary.provenance || []));
-      if (primary.creator) creator = primary.creator;
-      // Capture template metadata if handler returned it
-      if (primary.templateType) {
-        templateType = primary.templateType;
-        templateParams = primary.templateParams || {};
+    // PART B: aggregate the scene's beat entities (deduped by name) so they
+    // persist on the footage entry. Entities were previously ephemeral —
+    // only rawBeats held them — so audits couldn't tell which scenes named
+    // an entity. Persisting them here makes that countable downstream.
+    const sceneEntities = [];
+    {
+      const seenEnt = new Set();
+      for (const b of sceneBeats) {
+        if (!Array.isArray(b?.entities)) continue;
+        for (const e of b.entities) {
+          if (!e?.name) continue;
+          const k = String(e.name).toLowerCase().trim();
+          if (!k || seenEnt.has(k)) continue;
+          seenEnt.add(k);
+          sceneEntities.push({name: e.name, type: e.type || null});
+        }
       }
-    } catch (e) {
-      provenance.push({tried: scene.assetType + '-handler', ok: false, reason: e.message});
-      console.warn(`scene ${si + 1}: primary handler threw — ${e.message}`);
+    }
+
+    // PART A: entity-first probe runs before the per-assetType handler for
+    // every footage-sourced scene. Code-rendered templates (stat_overlay,
+    // quote_card, comparison_split, timeline_bar) are skipped — their
+    // synthetic visual is the intended render, not sourced footage, and
+    // anchoring a quote_card to a Wikimedia still would clobber the card.
+    const isTemplateAsset = !!ASSET_TYPE_TO_TEMPLATE_TYPE[scene.assetType];
+    if (!isTemplateAsset) {
+      try {
+        const ep = await probeEntityFirstSource(sceneBeats, ctx);
+        provenance.push(...ep.provenance);
+        if (ep.url) {
+          url = ep.url;
+          source = ep.source;
+          if (ep.creator) creator = ep.creator;
+          entityAnchor = ep.entity || null;
+        }
+        // Roll up coverage telemetry (item 6).
+        const t = ep.telemetry;
+        if (t && t.attempted) {
+          efTel.attempted++;
+          if (t.retried) efTel.retried++;
+          if (t.outcome === 'video') efTel.video++;
+          else if (t.outcome === 'image') efTel.image++;
+          else if (t.outcome === 'pageimage') efTel.pageimage++;
+          else efTel.fellThrough++;
+        }
+      } catch (e) {
+        provenance.push({tried: 'entity-first', ok: false, reason: e.message});
+        console.warn(`scene ${si + 1}: entity-first probe threw — ${e.message}`);
+      }
+    }
+
+    // Primary handler dispatch — only when entity-first didn't anchor.
+    if (!url) {
+      try {
+        const primary = await handler(scene, ctx);
+        url = primary.url;
+        source = primary.source;
+        pexelsAlternates = primary.pexelsAlternates || [];
+        provenance.push(...(primary.provenance || []));
+        if (primary.creator) creator = primary.creator;
+        if (primary.mapQuery) mapQuery = primary.mapQuery;
+        // Capture template metadata if handler returned it
+        if (primary.templateType) {
+          templateType = primary.templateType;
+          templateParams = primary.templateParams || {};
+        }
+      } catch (e) {
+        provenance.push({tried: scene.assetType + '-handler', ok: false, reason: e.message});
+        console.warn(`scene ${si + 1}: primary handler threw — ${e.message}`);
+      }
     }
 
     // Generic stock cascade (last resort). Skipped if a template
@@ -7345,16 +8813,39 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
     // into the lead-in, so capping leaves [0, footageStart) rendering
     // black for the entire intro (user reported ~12s black opener).
     if (si > 0 && templateType && (sceneEnd - sceneStart) > TEMPLATE_MAX_DURATION) {
-      // Phase 18 fix 1B: clamp footageStart to the previous beat's reachable
-      // end. stretchFootageToFillGaps stretches prev up to footageStart, but
-      // video-source prev entries cap at +3s past their natural end (and at
-      // sourceDuration+0.5s when probed). When that cap < sceneEnd-4, a
-      // black gap appears between (prev.end+cap) and footageStart. Pulling
-      // footageStart back to prev.end guarantees no gap; the template just
-      // displays slightly longer than 4s on those rare scenes.
+      // Phase 22 fix B: previously this used prev.end directly (the
+      // PRE-stretch natural end at this point in the pipeline) and
+      // assumed stretchFootageToFillGaps would close the resulting gap.
+      // But the stretch loop caps video-source prev at sourceDuration+
+      // 0.5s (when known) or +3s past natural end — and when prev's
+      // reachable end is still < sceneEnd-4, a hard black gap remained
+      // (e.g. Micron job idx 83→84 produced a 4.68s black gap at ~6:20).
+      // Mirror the same stretch caps here so the template start lands at
+      // exactly the point prev CAN reach. Template plays slightly longer
+      // than 4s on rare scenes; no black gap ever ships.
       const prev = footage.length > 0 ? footage[footage.length - 1] : null;
-      const prevBeatEnd = (prev && typeof prev.end === 'number') ? prev.end : sceneStart;
-      footageStart = Math.max(sceneEnd - TEMPLATE_MAX_DURATION, prevBeatEnd);
+      let prevMaxReach;
+      if (!prev || typeof prev.end !== 'number') {
+        prevMaxReach = sceneStart;
+      } else if (VIDEO_SOURCE_NAMES.has(prev.source)) {
+        const baseStart = prev.start || 0;
+        const videoCeiling = (typeof prev.sourceDuration === 'number' && prev.sourceDuration > 0)
+          ? baseStart + prev.sourceDuration + 0.5
+          : prev.end + 3;
+        prevMaxReach = Math.max(prev.end, videoCeiling);
+      } else {
+        // image/template prev — stretch loop treats these as effectively
+        // uncapped (Ken Burns covers any duration).
+        prevMaxReach = Infinity;
+      }
+      const idealStart = sceneEnd - TEMPLATE_MAX_DURATION;
+      if (prevMaxReach >= idealStart) {
+        footageStart = idealStart;
+      } else {
+        // Pull template start back to wherever prev can actually reach,
+        // floored at sceneStart so we never overrun the plan boundary.
+        footageStart = Math.max(sceneStart, prevMaxReach);
+      }
       templateCapped = footageStart > sceneStart;
     }
 
@@ -7382,12 +8873,36 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
       // Phase 16I: code-rendered template metadata (when applicable).
       // MainComp dispatches by templateType — see SCENE_TEMPLATES map.
       ...(templateType ? {templateType, templateParams: templateParams || {}} : {}),
+      // Resolved Mapbox query string for map scenes — surfaces the
+      // actual geocoded entity in firestore so future audits can see
+      // why a given map was chosen.
+      ...(mapQuery ? {mapQuery} : {}),
+      // PART B: persisted scene entities + (PART A) the entity that won
+      // entity-first sourcing — lets audits count which scenes named an
+      // entity and which actually got anchored to that entity's media.
+      ...(sceneEntities.length ? {entities: sceneEntities} : {}),
+      ...(entityAnchor ? {entityAnchor} : {}),
       // Scene metadata for diagnostics / future analysis
       assetType: scene.assetType,
       visualConcept: scene.visualConcept,
     });
     console.log(`scene ${si + 1}: ${source || 'NO MATCH'} (${scene.assetType}, ${(sceneEnd - sceneStart).toFixed(1)}s)${templateCapped ? ` [tpl-capped→${(sceneEnd - footageStart).toFixed(1)}s]` : ''}${heroMoment ? ' [HERO]' : ''}${aggregatedOverlays.length ? ` [+${aggregatedOverlays.length} ovl]` : ''}${aggregatedSfx.length ? ` [+${aggregatedSfx.length} sfx]` : ''}`);
   }
+
+  // PART A (expanded) item 6: per-video Wikipedia/Wikimedia coverage. Lets
+  // us measure what % of non-template scenes ended on real Wiki* footage.
+  const efAnchored = efTel.video + efTel.image + efTel.pageimage;
+  console.log(`[entity-first] summary: attempted=${efTel.attempted} → video=${efTel.video} image=${efTel.image} pageimage=${efTel.pageimage} (anchored=${efAnchored}), retried=${efTel.retried}, fellThrough=${efTel.fellThrough}; ${scenes.length} scenes total`);
+  await jobRef.update({
+    'timings.probeEntityFirstAttempted': efTel.attempted,
+    'timings.probeEntityFirstAnchoredVideo': efTel.video,
+    'timings.probeEntityFirstAnchoredImage': efTel.image,
+    'timings.probeEntityFirstAnchoredPageImage': efTel.pageimage,
+    'timings.probeEntityFirstRetried': efTel.retried,
+    'timings.probeEntityFirstFellThrough': efTel.fellThrough,
+    updatedAt: FieldValue.serverTimestamp(),
+  }).catch(() => {});
+
   return footage;
 }
 
@@ -7616,7 +9131,12 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     if (draftScenes.length === 0) {
       draftScenes = await buildScenePlan(rawBeats, captions, timingTags, anthropicKey, voiceoverDurForScenePlan, singlepassPerScene);
     }
-    const probeStats = await validateScenePlanAgainstAvailability(draftScenes, singlepassPerScene, aiImageBudget);
+    const probeStats = await validateScenePlanAgainstAvailability(draftScenes, singlepassPerScene, aiImageBudget, rawBeats);
+    // Item #12: cap stat_overlay at STAT_OVERLAY_CAP_PCT of total scenes,
+    // demoting the weakest excess to real footage via fallbackChain. Runs
+    // AFTER availability so it acts on post-availability counts and the
+    // sceneFinalTypes report below reflects the capped result.
+    const statCapStats = applyStatOverlayCap(draftScenes);
     scenes = draftScenes;
     const touched = applyScenesToBeats(rawBeats, scenes);
     const sceneMs = Date.now() - sceneT0;
@@ -7626,6 +9146,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       'timings.sceneBeatsTouched': touched,
       'timings.sceneFinalTypes': scenes.reduce((acc, s) => { acc[s.assetType] = (acc[s.assetType] || 0) + 1; return acc; }, {}),
       'timings.sceneProbeStats': probeStats || {},
+      'timings.statOverlayCap': statCapStats,
       'timings.scenePlanProvider': scenePlanProvider,
       'timings.scenePrePrebeStats': scenePrePrebeStats || null,
     }).catch(() => {});
@@ -7633,9 +9154,59 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     console.warn(`[scene-plan] EXCEPTION: ${e.message} — falling back to per-beat keywords`);
     scenes = [];
   }
-  // Scene-driven sourcing fires whenever the scene plan produced scenes.
-  // Empty scenes (rare: short voiceover or Claude failure) fall through
-  // to the per-beat loop below.
+  // Phase 22 pacing fix: when both Gemini and Claude scene-plan failed
+  // to enrich scenes, the per-beat fallback path used to emit footage
+  // straight from rawBeats with no SCENE_HARD_MAX cap — letting any
+  // LLM beat >6s ship as a single long clip. Job j9VH lost pacing this
+  // way (27 clips >10s, max 28.69s). Re-run prepareScenesForPlan now
+  // (no LLM call, no API keys, just the time-bounds aggregation +
+  // word-snap that already powers the scene-driven path) so the scene
+  // bounds + HARD_MAX still apply when LLM enrichment is unavailable.
+  // The synthesized scenes carry assetType='stock_footage' (default
+  // routing) and no searchKeywords (sourceScenesAndBuildFootage falls
+  // back to sceneBeats[0]?.keywords automatically). The absolute
+  // per-beat loop below is now reachable only if prepareScenesForPlan
+  // itself throws or returns 0 scenes.
+  if (scenes.length === 0) {
+    try {
+      const voForFallback = (captions && captions.length)
+        ? Math.max(...captions.map((c) => c.end || 0))
+        : 0;
+      const {scenes: rebuiltScenes} = prepareScenesForPlan(rawBeats, captions, voForFallback);
+      if (rebuiltScenes && rebuiltScenes.length) {
+        scenes = rebuiltScenes.map((s, idx) => ({
+          index: idx,
+          beats: s.beats.slice(),
+          start: s.start,
+          end: s.end,
+          durationSec: +(s.end - s.start).toFixed(2),
+          assetType: 'stock_footage',
+          searchKeywords: null,
+          visualConcept: '',
+          aiPrompt: null,
+          mapContext: null,
+          fallbackChain: ['stock_footage'],
+          pacingHint: 'standard',
+          templateParams: null,
+          resolvedSource: null,
+          resolvedUrl: null,
+        }));
+        applyScenesToBeats(rawBeats, scenes);
+        console.log(`[scene-plan] LLM enrichment unavailable — using ${scenes.length} time-bounds-only scenes (SCENE_HARD_MAX cap honored, assetType=stock_footage for all)`);
+        await jobRef.update({
+          'timings.sceneCount': scenes.length,
+          'timings.scenePlanProvider': 'pacing-fallback',
+          'timings.sceneFinalTypes': {stock_footage: scenes.length},
+        }).catch(() => {});
+      }
+    } catch (e) {
+      console.warn(`[scene-plan] pacing-fallback also failed (${e.message}) — falling all the way through to per-beat loop with no scene aggregation`);
+    }
+  }
+  // Scene-driven sourcing fires whenever the scene plan produced scenes
+  // (LLM-enriched OR pacing-fallback). The per-beat loop below is now
+  // reachable only when prepareScenesForPlan itself returned 0 scenes
+  // (extremely rare: empty rawBeats or word-snap fail-loud assertion).
   const sceneDrivenActive = scenes.length > 0;
 
   // No SFX heuristic fallback. We trust Claude's strict-trigger
@@ -7732,9 +9303,10 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       if (candidates.length < rawCandidates.length) {
         console.log(`beat ${i + 1}: skipped ${rawCandidates.length - candidates.length} blocklisted candidate(s)`);
       }
-      // wikimedia-image candidates need image-shaped validation; everything
-      // else goes through the video-shaped validator.
-      const validator = pickedSource === 'wikimedia-image' ? validateImageUrl : validatePexelsVideo;
+      // Image-shaped sources (wikimedia-image, pexels-photo, pixabay-photo,
+      // unsplash) need validateImageUrl; everything else goes through the
+      // mp4-shaped validatePexelsVideo. See IMAGE_SOURCES near line 4197.
+      const validator = pickValidatorForSource(pickedSource);
       let dedupSkipsThisBeat = 0;
       for (let ci = 0; ci < candidates.length; ci++) {
         const cand = candidates[ci];
@@ -7770,7 +9342,7 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
       if (!url && dedupSkipsThisBeat > 0 && dedupSkipsThisBeat === candidates.length) {
         for (let ci = 0; ci < candidates.length; ci++) {
           const cand = candidates[ci];
-          const v = await validatePexelsVideo(cand);
+          const v = await validator(cand);
           if (v.ok) {
             url = cand;
             source = pickedSource;
@@ -7976,7 +9548,19 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
     'timings.cacheErrors': cacheErrors,
   }).catch(() => {});
   console.log(`cached ${cacheHits + cacheMisses}/${footage.length} beats: ${cacheHits} hits + ${cacheMisses} downloads + ${cacheErrors} errors (took ${(cachingMs / 1000).toFixed(1)}s)`);
-  return cached;
+  // Phase 16D++: expose forbiddenNames + aiImageBudget so preflight can
+  // run the AI-image rescue (url=null beats after Pexels alts exhausted)
+  // with the same deepfake guard + budget tracker the main sourcing pass
+  // used. Names are rebuilt here from rawBeats.entities so both the
+  // scene-driven and per-beat paths produce the same list.
+  const forbiddenNames = [];
+  for (const b of rawBeats || []) {
+    if (!Array.isArray(b.entities)) continue;
+    for (const e of b.entities) {
+      if (e?.type === 'person' && e.name) forbiddenNames.push(e.name);
+    }
+  }
+  return {footage: cached, forbiddenNames, aiImageBudget};
 }
 
 // ─── Remotion Lambda ────────────────────────────────────────────────
@@ -8150,6 +9734,36 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
     }
   }
 
+  // ─ Catch-all extension allowlist (pre-probe) ─
+  // Some sources (LoC, Wikimedia, Internet Archive) can leak document or
+  // raster formats Remotion <Img>/<OffthreadVideo> cannot render — .djvu,
+  // .pdf, .tif/.tiff, .svg, .bmp. One leak fails the entire Lambda render.
+  // Run this BEFORE the network probe so the URL never even gets fetched,
+  // then funnel failures through the same swap-or-null degrade path the
+  // probe failures use. Source-level guards exist too (defense in depth)
+  // but this is the last gate before Lambda — it must catch everything.
+  const renderableFootageRe = /\.(jpe?g|png|webp|gif|mp4|mov|webm)(\?|#|$)/i;
+  const extensionFailures = [];
+  for (let i = 0; i < (footage || []).length; i++) {
+    const f = footage[i];
+    if (!f?.url) continue;
+    // Inspect the path component only — query strings can contain noise
+    // like ?format=jpg that would false-positive a regex on the full URL.
+    let pathname;
+    try { pathname = new URL(f.url).pathname; } catch { pathname = f.url; }
+    const lastDot = pathname.lastIndexOf('.');
+    // Extensionless URLs (yt-dlp googlevideo `/videoplayback` etc) get a
+    // pass — they're MIME-typed by the CDN, and the network probe is the
+    // right tool to validate them.
+    if (lastDot < 0) continue;
+    const ext = pathname.slice(lastDot + 1).toLowerCase();
+    if (!/^[a-z0-9]{2,5}$/.test(ext)) continue;
+    if (renderableFootageRe.test(pathname)) continue;
+    console.warn(`[preflight] non-renderable footage[${f.beatIndex ?? i}] (${ext}) — degrading`);
+    extensionFailures.push({idx: i, reason: `non-renderable extension .${ext}`, url: f.url});
+  }
+  const extensionFailedIdx = new Set(extensionFailures.map((e) => e.idx));
+
   // ─ URL probes (parallel, with retry+backoff on transient failures) ─
   // Failure handling is split by criticality:
   //   - voiceover / music → critical: failure aborts the render
@@ -8165,6 +9779,7 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
   if (musicUrl) probeJobs.push(probeUrlWithRetry(musicUrl).then((r) => ({label: 'music', kind: 'critical', url: musicUrl, ...r})));
   for (let i = 0; i < (footage || []).length; i++) {
     const f = footage[i];
+    if (extensionFailedIdx.has(i)) continue;
     if (f?.url) probeJobs.push(probeUrlWithRetry(f.url).then((r) => ({
       label: `footage[${f.beatIndex ?? i}]`,
       kind: 'footage',
@@ -8205,17 +9820,30 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
       errors.push(`URL probe failed — ${r.label}: ${r.reason} (${r.url.slice(0, 100)})`);
     }
   }
+  // Funnel extension failures through the same recovery path as probe
+  // failures (counted in footageSwapped/footageDropped totals downstream).
+  for (const ef of extensionFailures) footageFailures.push(ef);
   // Footage recovery: try each beat's pexelsAlternates (probe in turn,
   // swap on first ok). If none survive, null the URL so gap-fill can
   // stretch the previous beat over the silence.
   let footageSwapped = 0;
   let footageDropped = 0;
+  let footageKept = 0;
   if (footageFailures.length && Array.isArray(footage)) {
     for (const fail of footageFailures) {
       const beat = footage[fail.idx];
       const alts = (beat && Array.isArray(beat.pexelsAlternates)) ? beat.pexelsAlternates : [];
       let swappedTo = null;
       for (const altUrl of alts) {
+        // Skip alternates that would themselves trip the extension gate —
+        // no point probing a URL we'd reject downstream.
+        let altPath;
+        try { altPath = new URL(altUrl).pathname; } catch { altPath = String(altUrl); }
+        const dot = altPath.lastIndexOf('.');
+        if (dot >= 0) {
+          const e = altPath.slice(dot + 1).toLowerCase();
+          if (/^[a-z0-9]{2,5}$/.test(e) && !renderableFootageRe.test(altPath)) continue;
+        }
         const probe = await probeUrlWithRetry(altUrl);
         if (probe.ok) { swappedTo = altUrl; break; }
       }
@@ -8223,6 +9851,18 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
         footage[fail.idx] = {...beat, previousUrl: beat.url, url: swappedTo, originalUrl: swappedTo, replacedReason: `preflight pexels-alt swap (was: ${fail.reason})`};
         footageSwapped++;
         warnings.push(`swapped footage[${fail.idx}] to pexels alternate (was: ${fail.reason})`);
+      } else if (IMAGE_SOURCES.has(beat?.source) && isTransientReason(fail.reason)) {
+        // FIX 2: image-source scene, no working alternate, TRANSIENT failure
+        // (HTTP 429/503). The image is the ONLY asset for this scene and a
+        // transient upstream throttle is not a reason to black it out. KEEP
+        // the URL — Lambda fetches it from the Firebase cache (Fix 1 retries
+        // 429s into Storage) or re-requests the source. Mirrors the per-clip
+        // preflightValidateFootage policy ("kept anyway — no alternates exist
+        // for image-source scenes"); the two gates previously disagreed and
+        // this one's drop tripped the unfixable abort on a Wikimedia 429
+        // storm. NOT counted toward footageDropped / the unfixable rate.
+        footageKept++;
+        warnings.push(`kept footage[${fail.idx}] (${beat.source}) on transient probe failure (${fail.reason}); no alt, not a drop`);
       } else {
         footage[fail.idx] = {...beat, previousUrl: beat.url, url: null, source: null, replacedReason: `preflight drop — no working alt (was: ${fail.reason})`};
         footageDropped++;
@@ -8252,10 +9892,10 @@ async function validatePipelineOutputBeforeLambda({inputProps, jobId = '<job>'})
   }
 
   const ok = errors.length === 0;
-  console.log(`[preflight] ${jobId}: ok=${ok} probes=${probeResults.length} errors=${errors.length} warnings=${warnings.length} retries=${retriedCount} overlaysDropped=${overlayDropIndices.length} footageSwapped=${footageSwapped} footageDropped=${footageDropped}`);
+  console.log(`[preflight] ${jobId}: ok=${ok} probes=${probeResults.length} errors=${errors.length} warnings=${warnings.length} retries=${retriedCount} overlaysDropped=${overlayDropIndices.length} footageSwapped=${footageSwapped} footageDropped=${footageDropped} footageKept=${footageKept}`);
   if (warnings.length) console.warn(`[preflight] ${jobId} warnings:\n  - ${warnings.join('\n  - ')}`);
   if (errors.length) console.warn(`[preflight] ${jobId} errors:\n  - ${errors.join('\n  - ')}`);
-  return {ok, errors, warnings, probesRun: probeResults.length, overlaysDropped: overlayDropIndices.length, footageSwapped, footageDropped};
+  return {ok, errors, warnings, probesRun: probeResults.length, overlaysDropped: overlayDropIndices.length, footageSwapped, footageDropped, footageKept};
 }
 
 async function renderOnLambda(inputProps, jobRef, {progressLabel = 'Rendering on Lambda'} = {}) {
@@ -8571,11 +10211,12 @@ async function renderWithSwapLoop(renderInput, jobRef, {jobId = '', channelId = 
       const alternates = (failedBeat.pexelsAlternates || []).filter(
         (u) => u !== previousOriginal && !blocklist.has(u),
       );
+      const altValidator = pickValidatorForSource(failedBeat.source);
       for (const altUrl of alternates) {
         try {
-          const v = await validatePexelsVideo(altUrl);
+          const v = await altValidator(altUrl);
           if (!v.ok) {
-            console.log(`[${jobId}] beat ${beatIdx + 1} alt ${altUrl.slice(0, 60)} failed HEAD/ftyp: ${v.reason}`);
+            console.log(`[${jobId}] beat ${beatIdx + 1} alt ${altUrl.slice(0, 60)} failed validation: ${v.reason}`);
             continue;
           }
         } catch { continue; }
@@ -8801,6 +10442,12 @@ async function uploadRenderToFirebaseStorage(s3Url, channelId, projectId, jobRef
 
 // ─── Main job handler ───────────────────────────────────────────────
 async function processJob(job) {
+  // FIX 2: drop any probe-results cache entries left over from a previous
+  // job on this warm Cloud Functions instance. Without this, a later job
+  // could read a previous job's URL list back from the cache when the
+  // sanitized scene topics happen to collide.
+  clearProbeCache();
+
   const jobRef = db.collection('editingJobs').doc(job.id);
   const projRef = db.collection('channels').doc(job.channelId)
     .collection('projects').doc(job.projectId);
@@ -8928,11 +10575,14 @@ async function processJob(job) {
   }).catch(() => {});
 
   const sourcingT0 = Date.now();
-  let footage = await sourceBeatAwareFootage(captions, anthropicKey, jobRef, 35, 25, {
+  const sourcingResult = await sourceBeatAwareFootage(captions, anthropicKey, jobRef, 35, 25, {
     channelId: job.channelId,
     aiVideoOverride: job.aiVideoOverride,
     timingTags,
   });
+  let footage = sourcingResult.footage;
+  const sourcingForbiddenNames = sourcingResult.forbiddenNames || [];
+  const sourcingAiImageBudget = sourcingResult.aiImageBudget;
   const sourcingMs = Date.now() - sourcingT0;
   console.log(`[${job.id}] ⏱ sourcing: ${(sourcingMs / 1000).toFixed(1)}s`);
   await jobRef.update({'timings.sourcingMs': sourcingMs}).catch(() => {});
@@ -9057,7 +10707,12 @@ async function processJob(job) {
   // would otherwise cost. Mid-render swap loop below stays as a
   // backstop for anything that slips through (network flake during
   // render, edge-case codec).
-  await preflightValidateFootage(footage, jobRef, {channelId: job.channelId});
+  await preflightValidateFootage(footage, jobRef, {
+    channelId: job.channelId,
+    forbiddenNames: sourcingForbiddenNames,
+    aiImageBudget: sourcingAiImageBudget,
+    falApiKey: process.env.FAL_AI_API_KEY,
+  });
 
   // Stretch each visible beat to cover the gap until the next beat.
   // Without this, inter-sentence silence frames render as black —
@@ -9509,8 +11164,11 @@ Criteria (in priority order):
 5. Fresh enough to feel "trending" — last 24-72h ideal, last week max
 6. Has substance — could fill 5 minutes with research, not a one-line meme
 7. Suitable for narration over stock footage (faceless format) — avoid topics that need a specific person on camera
+8. **Prefer SPECIFIC anchors over patterns** — when two topics are otherwise comparable, prefer the one whose title names a concrete recent event: a number, a named action, a price move, a specific dated decision, a specific actor doing a specific thing. Pattern-type titles ("Why X and Y are happening", "The trouble with X", "What's wrong with X") are weaker — they don't anchor to a moment in time and they invite the downstream script to drift into generic background. A title like "Brent crude jumped 8% Tuesday after OPEC cut output" beats "Why oil prices keep climbing" every time.
 
-If EVERY topic fails criterion 1 (all are stale), pick the freshest one and rewrite the title/topic to reframe it as a current-affairs angle (e.g. "What the [past event] from a year ago means for [today's market]"). Never pass through a year that's clearly historical.${recentBlock}
+If EVERY topic fails criterion 1 (all are stale), pick the freshest one and rewrite the title/topic to reframe it as a current-affairs angle (e.g. "What the [past event] from a year ago means for [today's market]"). Never pass through a year that's clearly historical.
+
+If the picked topic IS pattern-type (its title names no specific recent event — no number, no dated action, no named actor doing a specific thing this week), the rewritten title MUST inject a concrete recent anchor pulled from the topic's summary/whyTrending: a specific number, a named action from the last week, a dated price move, a named actor. Never ship a pattern title without a concrete current-event hook attached — that's what causes the downstream script to drift into year-old background.${recentBlock}
 
 Then generate 5 viral title variants for that topic, ranked by predicted CTR using these patterns (mix them):
 - Curiosity gap: "The [thing] nobody is talking about"
@@ -11011,6 +12669,16 @@ const AUTOPILOT_SCRIPT_DIP_RULES = [
 function autoPilotValidateScript(text, dynamicDipPhrases = []) {
   if (!text || typeof text !== 'string') return {passed: false, violations: [{type: 'empty', snippet: '', context: '(no text)'}]};
   const violations = [];
+  // Length floor: enforce a minimum word count so an under-length
+  // generation is rejected and regenerated (the gen loop retries on any
+  // violation). At this channel's ~131 effective words/min (TTS + dead-air
+  // trim), 1650 words ≈ 12.6 min — keeps every video above the 12-min bar.
+  // Without this, a short script silently shipped as a 7-min video.
+  const MIN_SCRIPT_WORDS = 1650;
+  const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
+  if (wordCount < MIN_SCRIPT_WORDS) {
+    violations.push({type: 'too-short', snippet: `${wordCount} words`, context: `below the ${MIN_SCRIPT_WORDS}-word minimum (~12 min)`});
+  }
   const firstLine = text.split(/[.!?\n]/, 1)[0] || '';
   for (const rule of AUTOPILOT_SCRIPT_DIP_RULES) {
     const target = rule.openingOnly ? firstLine : text;
@@ -11043,6 +12711,7 @@ function autoPilotValidateScript(text, dynamicDipPhrases = []) {
 
 function autoPilotBuildScriptPrompt(topic, forensic, insights, retryViolations) {
   const fp = forensic?.patterns || null;
+  const todayStr = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
   const lines = [];
   lines.push('═══════════════════════════════════════════════════════════════');
   lines.push('MANDATORY RULES — these are not suggestions. The script is rejected if any are violated.');
@@ -11069,6 +12738,47 @@ function autoPilotBuildScriptPrompt(topic, forensic, insights, retryViolations) 
   lines.push('  • Transition between sections with a hard cut — drop the connective filler.');
   lines.push('  • If a term needs defining, weave it into a story or example — never an explicit "so what is X?" stopover.');
   lines.push('  • Vary sentence length aggressively. Punchy 3-5 word sentences interleaved with longer ones.');
+  lines.push('');
+  lines.push('✓ TEMPORAL ANCHORING — every concrete reference must be RECENT and DATED:');
+  lines.push('');
+  lines.push(`  TODAY'S DATE: ${todayStr}`);
+  lines.push('');
+  lines.push('  • Every concrete example, statistic, and event you cite must come from a NAMED EVENT within roughly the last 30 days — and you must signal WHEN it happened ("last Tuesday", "this week", "three days ago", or a specific date inside the last month). Undated facts read as stock background and lose the viewer.');
+  lines.push('  • Do NOT open with, or build sections around, historical background older than ~12 months. The only allowed use of an older year is single-sentence CONTRAST against a specific recent event — and the recent event comes first. Shape: "X hit a record this week — the last time it was this high was 2022." NEVER the reverse ("Back in 2022, X hit a record. Now it\'s happening again…").');
+  lines.push('  • The HOOK must anchor to the CURRENT event driving this video — not the general pattern, not the long-running backdrop, not the historical analogue. If the topic is a price move this week, the hook is THAT move and its number — not the 2022 oil shock, not the 2008 crash, not a decade of policy history.');
+  lines.push('');
+  lines.push('✓ RETENTION ARCHITECTURE — the hook gets them in; this keeps them past 30s:');
+  lines.push('');
+  lines.push('  MANDATORY ARC (use this structure even when no channel-specific structure is given below):');
+  lines.push('    1. HOOK (0-15s): the named-entity opener — already covered above.');
+  lines.push('    2. STAKES + LOOPS (15-60s): name what is at risk, then plant 1-2 OPEN LOOPS the viewer must keep watching to resolve.');
+  lines.push('    3. ESCALATING BODY (60s through ~80%): facts arranged as a RISING sequence of tensions, each major beat ending on a question or pivot — never on a flat fact.');
+  lines.push('    4. CLIMAX / PAYOFF (~80-95%): the largest revelation; resolve the open loops you planted in §2.');
+  lines.push('    5. SHORT CONCLUSION (final ~5%): one sharp takeaway sentence that lands the meaning. Do not trail off because you hit the word count.');
+  lines.push('');
+  lines.push('  OPEN LOOPS (mandatory — plant in the first 60s, resolve later):');
+  lines.push('    • Name 1-2 unresolved threads early. Concrete examples:');
+  lines.push('       — "But the real reason this happened isn\'t what you\'d think — and we\'ll get to that in a minute."');
+  lines.push('       — "The strange part — the part nobody is talking about — comes later."');
+  lines.push('       — "Hold that number in your head. It matters more by the end of this video than it does right now."');
+  lines.push('    • Every loop you open MUST be explicitly resolved before the conclusion. Unresolved loops are broken promises and tank trust.');
+  lines.push('');
+  lines.push('  RE-HOOKS (every ~60-90s — never let the viewer go longer without a fresh reason to stay):');
+  lines.push('    • At each major beat boundary, plant a micro-hook. VARY THE FORM each time — sometimes a question, sometimes a tease of what is coming, sometimes a contradiction of what was just said, sometimes a concrete cliffhanger ("watch what the SEC did three weeks later"), sometimes a stat preview ("and that number is about to look small"). Never reuse the same re-hook structure twice in the same script.');
+  lines.push('    • Illustrations of the principle (DO NOT copy these phrasings verbatim — they are shape examples): "And the number gets stranger when you see what happened next." / "There is a second piece to this that almost nobody is connecting." / "Watch what happens when you put those two facts side by side."');
+  lines.push('');
+  lines.push('  TENSION TURNS (use throughout — these are the verbal equivalent of cuts):');
+  lines.push('    • Forward momentum comes from turn words instead of stacking facts: "but", "however", "here\'s the part nobody mentions", "and that\'s when it gets weird", "except for one detail", "and yet".');
+  lines.push('    • Use turns FREQUENTLY but with VARIETY in how paragraphs land. Some beats should end on a pivot, some on a clean hard fact, some on a question. If every paragraph closes the same way it becomes a tic the viewer notices and the script feels formulaic — the goal is rhythm with variation, not repetition of one device.');
+  lines.push('');
+  lines.push('  SECTION CLIFFHANGERS:');
+  lines.push('    • End each body section on a question or unresolved tension, NOT on a flat conclusion.');
+  lines.push('    • Bad: "The Fed had a problem. Inflation was at 9.1%."');
+  lines.push('    • Better: "The Fed had a problem. And the problem was bigger than anyone in that room was willing to say out loud."');
+  lines.push('');
+  lines.push('  PAYOFF ENDING:');
+  lines.push('    • The closing MUST (a) explicitly resolve every open loop planted earlier, (b) land one sharp final takeaway sentence, and (c) NOT trail off mid-thought because the word count was reached.');
+  lines.push('    • If you reach 1800 words mid-thought, finish the thought — overshooting by 100 words is fine; cutting a payoff is not.');
   lines.push('');
   if (Array.isArray(fp?.spikeWordPatterns) && fp.spikeWordPatterns.length) {
     lines.push('PROVEN spike phrases — replicate these or close cousins at structural turning points:');
@@ -11125,26 +12835,38 @@ function autoPilotBuildScriptPrompt(topic, forensic, insights, retryViolations) 
     lines.push('');
   }
   if (Array.isArray(retryViolations) && retryViolations.length) {
+    const tooShort = retryViolations.find((v) => v.type === 'too-short');
+    const phraseViolations = retryViolations.filter((v) => v.type !== 'too-short');
     lines.push('═══════════════════════════════════════════════════════════════');
-    lines.push('PREVIOUS ATTEMPT FAILED VALIDATION. CONCRETE VIOLATIONS:');
-    retryViolations.slice(0, 10).forEach((v) => {
-      lines.push(`  ✗ [${v.type}] "${v.snippet}"  — context: "${v.context}"`);
-    });
-    lines.push('Do NOT use any of these patterns again. Rewrite those sections with a different approach.');
+    lines.push('PREVIOUS ATTEMPT FAILED VALIDATION.');
+    if (tooShort) {
+      lines.push(`LENGTH: the previous script was TOO SHORT (${tooShort.snippet}). Write a FULLER script — develop each section with more concrete detail, specific named entities, numbers, dates, and examples. Add real substance, NOT filler or banned phrases. Do not stop early; reach the full target length.`);
+    }
+    if (phraseViolations.length) {
+      lines.push('CONCRETE PHRASE VIOLATIONS:');
+      phraseViolations.slice(0, 10).forEach((v) => {
+        lines.push(`  ✗ [${v.type}] "${v.snippet}"  — context: "${v.context}"`);
+      });
+      lines.push('Do NOT use any of these patterns again. Rewrite those sections with a different approach.');
+    }
     lines.push('═══════════════════════════════════════════════════════════════');
     lines.push('');
   }
   lines.push('TASK:');
-  lines.push(`Write a 1500-2000 word YouTube video script. Topic: "${topic}".`);
+  lines.push(`Write a 1900-2400 word YouTube video script (this MUST run 13+ minutes spoken — do not stop short). Topic: "${topic}".`);
   lines.push('');
   lines.push('Format: natural spoken paragraphs. No stage directions. No headings. No section labels.');
   lines.push('Voice: conversational, direct, urgent when appropriate.');
   lines.push('Pacing: short punchy sentences mixed with longer ones.');
   lines.push('');
   lines.push('REMEMBER:');
-  lines.push('  1. Hook by sentence 2.');
+  lines.push('  1. Hook by sentence 2. Open with a named entity / number / event — not "you".');
   lines.push('  2. NO soft transitions, NO definition blocks, NO generic-you openers, NO meta-promises.');
-  lines.push('  3. Open with a named entity / number / event — not "you".');
+  lines.push('  3. Plant 1-2 open loops in the first 60s. Resolve them before the conclusion.');
+  lines.push('  4. Re-hook every 60-90s. End body sections on tension, not on flat facts.');
+  lines.push('  5. Use turn words (but / however / here\'s the part nobody mentions) to keep momentum.');
+  lines.push('  6. End on a sharp takeaway that closes the loops. Do not trail off at the word count.');
+  lines.push('  7. Anchor everything to the last ~30 days. Older background only as one-line contrast against a specific recent event. Hook = current event, not the pattern.');
   return lines.join('\n');
 }
 
@@ -11159,7 +12881,7 @@ async function autoPilotGenerateScript(topic, channelId, apiKey, maxAttempts = 3
   let finalAttempts = maxAttempts;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const prompt = autoPilotBuildScriptPrompt(topic, forensic, insights, attempt > 1 ? lastViolations : null);
-    const text = await callAnthropic(apiKey, prompt, 3500);
+    const text = await callAnthropic(apiKey, prompt, 4096);
     if (!text) break;
     const validation = autoPilotValidateScript(text, dynamicDipPhrases);
     lastText = text;
@@ -11341,13 +13063,17 @@ If you find no errors, return claimsTotal>=0, claimsCorrected:0, correctedScript
       finalAccuracy: (parsed.claimsCorrected || 0) > 0 ? 'corrected' : 'verified',
       durationMs: Date.now() - t0,
     };
-    // Only use the corrected script if it's substantive and reasonable
-    // (didn't get truncated, isn't suspiciously short).
-    if (corrected && corrected.length >= Math.max(200, scriptText.length * 0.6)) {
+    // A fact-check must CORRECT claims, not rewrite the script shorter.
+    // The floor was 0.6 — which let a condensing rewrite drop 40% of the
+    // script (a ~1550-word script came back 931 words → a 7-min video
+    // instead of 12+). At 0.9 any rewrite that loses >10% of length is
+    // rejected and we keep the full original; only length-preserving claim
+    // corrections are applied. Genuine corrections barely change length.
+    if (corrected && corrected.length >= Math.max(200, scriptText.length * 0.9)) {
       console.log(`[fact-check] ${report.claimsCorrected}/${report.claimsTotal} claims corrected in ${(report.durationMs / 1000).toFixed(1)}s`);
       return {text: corrected, report};
     }
-    console.warn(`[fact-check] corrected script too short (${corrected.length} chars) — using original`);
+    console.warn(`[fact-check] corrected script lost >10% of length (${corrected.length} vs ${scriptText.length} chars) — keeping original to preserve runtime`);
     return {text: scriptText, report: {...report, finalAccuracy: 'verified-no-changes-applied'}};
   } catch (e) {
     console.warn(`[fact-check] threw: ${e.message} — proceeding with original script`);
@@ -11651,7 +13377,7 @@ const THUMB_BRAND = {
   font: 'Anton',           // matches BRAND.fonts.display (Anton condensed)
 };
 
-function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFormula, globalPatterns}) {
+function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFormula, globalPatterns, subjectRef}) {
   // Day-13 F1 + Phase 18 Fix 6: locked style template for cross-video
   // consistency. Every thumbnail uses the same font (Anton), composition
   // (subject right / text left), and palette as the in-video brand
@@ -11681,7 +13407,16 @@ function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFo
   // use representational visuals (institutional setting, silhouette,
   // suit/podium iconography) so the visual conveys authority without
   // attempting an unrecognizable portrait.
-  const entList = Array.isArray(entities) ? entities.slice(0, 1) : [];
+  // Phase 21: when a real reference image is supplied (Pikzels
+  // /v2/thumbnail/image conditions on the actual photo/logo) we WANT the
+  // real subject — skip the symbolic no-face fallback used for text-only.
+  const useRef = subjectRef && (subjectRef.kind === 'person' || subjectRef.kind === 'logo');
+  if (useRef && subjectRef.kind === 'person') {
+    parts.push(`Right half: the real person from the provided reference image${subjectRef.name ? ` (${subjectRef.name})` : ''}, integrated photorealistically with dramatic side-lighting and a ${THUMB_BRAND.accent} rim-light. Preserve their real likeness exactly — do NOT replace with a different or invented face.`);
+  } else if (useRef) {
+    parts.push(`Right half: the ${subjectRef.name || 'company'} logo from the provided reference image, featured large, clean and well-lit on the brand background. Keep the logo exact — do NOT redesign or distort it.`);
+  }
+  const entList = useRef ? [] : (Array.isArray(entities) ? entities.slice(0, 1) : []);
   for (const e of entList) {
     if (e?.type === 'person') {
       // Map known finance institutions → iconic visual. Falls back to
@@ -11721,7 +13456,7 @@ function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFo
   }
   // Belt-and-braces: even if entList was empty above, ensure NO PORTRAIT
   // policy is explicit so Pikzels doesn't default to inventing a face.
-  if (entList.length === 0) {
+  if (!useRef && entList.length === 0) {
     parts.push('Right half: dramatic abstract finance imagery — trading screens with red/orange data, financial district skyline at dusk, or breaking-news graphic. NO human portraits.');
   }
 
@@ -11731,7 +13466,11 @@ function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFo
     parts.push(`Left text block: large ${THUMB_BRAND.font} UPPERCASE headline "${overlay.slice(0, 30)}" in ${THUMB_BRAND.text}; smaller ${THUMB_BRAND.font} ${THUMB_BRAND.accent} stat / subtitle below. Never over the subject's face.`);
   }
 
-  parts.push('NOT cartoon, NOT generic stock, NOT 3D-render look. NO random/invented human portraits — model cannot render real-person likenesses, so use symbolic/institutional visuals instead.');
+  if (useRef && subjectRef.kind === 'person') {
+    parts.push('NOT cartoon, NOT generic stock, NOT 3D-render look. Keep the real subject\'s likeness from the reference image — do NOT invent a different face.');
+  } else {
+    parts.push('NOT cartoon, NOT generic stock, NOT 3D-render look. NO random/invented human portraits — model cannot render real-person likenesses, so use symbolic/institutional visuals instead.');
+  }
 
   // Optional bias: channel's proven expressions if extracted.
   if (ownFormula && Array.isArray(ownFormula.commonExpressions) && ownFormula.commonExpressions.length) {
@@ -11750,6 +13489,95 @@ function buildSmartThumbnailPrompt({title, topic, scriptOpening, entities, ownFo
   const out = parts.join(' ');
   // Hard ceiling — Pikzels truncates / rejects above ~600 chars in practice.
   return out.length > 600 ? out.slice(0, 597) + '...' : out;
+}
+
+// Phase 21: choose the thumbnail's focus-slot subject from the script
+// entities, tiered by what makes the strongest thumbnail:
+//   1. a real, relevant person photo (Wikipedia lead image → Commons
+//      search) — reuses the same primitives as the entity-first scene
+//      probe (fetchWikipediaImage / wikimediaImageSearchTop).
+//   2. a relevant company logo (Logo.dev via fetchCompanyLogo).
+//   3. null → caller falls back to the text-only AI thumbnail.
+// Relevance: entities whose name appears in the title rank first. The
+// returned url (when tier !== 'ai') is passed to Pikzels
+// /v2/thumbnail/image as the reference subject.
+async function selectThumbnailSubject({title, entities}) {
+  const list = Array.isArray(entities) ? entities.filter((e) => e && e.name) : [];
+  if (!list.length) return {tier: 'ai', url: null, name: null};
+  const titleLow = String(title || '').toLowerCase();
+  const inTitle = (name) => {
+    const n = String(name || '').toLowerCase().trim();
+    if (!n) return false;
+    if (titleLow.includes(n)) return true;
+    // Also match any distinctive token (e.g. surname) of a multi-word name.
+    return n.split(/\s+/).some((tok) => tok.length > 3 && titleLow.includes(tok));
+  };
+  // Stable sort: in-title entities first, original order preserved otherwise.
+  const rank = (arr) => arr
+    .map((e, i) => ({e, i, hit: inTitle(e.name) ? 0 : 1}))
+    .sort((a, b) => a.hit - b.hit || a.i - b.i)
+    .map((x) => x.e);
+  const persons = rank(list.filter((e) => e.type === 'person'));
+  const companies = rank(list.filter((e) => e.type === 'company'));
+
+  // ── Tier 1: real person photo ──────────────────────────────────────
+  for (const e of persons.slice(0, 2)) {
+    try {
+      const lead = await fetchWikipediaImage(e.name);
+      if (lead) {
+        console.log(`[thumb-subject] tier1 person "${e.name}" → wikipedia lead image`);
+        return {tier: 'person', url: lead, name: e.name};
+      }
+    } catch (err) { console.warn(`[thumb-subject] wiki "${e.name}": ${err.message}`); }
+    try {
+      const imgs = await wikimediaImageSearchTop(e.name, 3);
+      const hit = (imgs || []).find((r) => r && r.url);
+      if (hit) {
+        console.log(`[thumb-subject] tier1 person "${e.name}" → commons image`);
+        return {tier: 'person', url: hit.url, name: e.name};
+      }
+    } catch (err) { console.warn(`[thumb-subject] commons "${e.name}": ${err.message}`); }
+  }
+
+  // ── Tier 2: company logo ────────────────────────────────────────────
+  // Try the full name, then a "core" variant with corporate descriptors
+  // stripped ("Dell Technologies" → "Dell") so it can hit COMPANY_DOMAIN_MAP
+  // / the domain guesser when the full name doesn't resolve.
+  const logoDevKey = process.env.LOGO_DEV_API_KEY;
+  const CORP_DESC_RE = /\b(technologies|technology|incorporated|corporation|company|holdings|group|inc|corp|co|plc|ltd|limited|llc)\b\.?/gi;
+  for (const e of companies.slice(0, 2)) {
+    const variants = [e.name];
+    const core = String(e.name).replace(CORP_DESC_RE, '').replace(/\s+/g, ' ').trim();
+    if (core && core.toLowerCase() !== String(e.name).toLowerCase()) variants.push(core);
+    for (const v of variants) {
+      try {
+        const logo = await fetchCompanyLogo(v, logoDevKey);
+        if (logo) {
+          console.log(`[thumb-subject] tier2 logo "${e.name}"${v !== e.name ? ` (as "${v}")` : ''} → logo.dev`);
+          return {tier: 'logo', url: logo, name: e.name};
+        }
+      } catch (err) { console.warn(`[thumb-subject] logo "${v}": ${err.message}`); }
+    }
+  }
+
+  // ── Tier 3: no real subject — caller uses the text-only AI thumbnail ─
+  console.log('[thumb-subject] tier3 — no real person/logo found; using text AI thumbnail');
+  return {tier: 'ai', url: null, name: null};
+}
+
+// Phase 21: download a subject image and return it as a base64 data URL.
+// We send the bytes to Pikzels /v2/thumbnail/image as image_base64 rather
+// than handing it a URL — that way generation never depends on Pikzels
+// being able to fetch the source (logo.dev token CDNs and some Wikimedia
+// hosts block server-side fetches → INVALID_IMAGE). Throws on fetch
+// failure so the caller falls through to the text-only AI thumbnail.
+async function fetchImageAsDataUrl(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`subject fetch ${r.status}`);
+  const ct = (r.headers.get('content-type') || 'image/png').split(';')[0].trim();
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (!buf.length) throw new Error('subject fetch returned 0 bytes');
+  return `data:${ct};base64,${buf.toString('base64')}`;
 }
 
 // Pull the channel's own top 20 thumbnails (from existing analytics
@@ -12475,7 +14303,7 @@ exports.autoPilotWorker = onRequest(
             const r = await fetch(`${RENDER_PROXY_URL}/elevenlabs/tts`, {
               method: 'POST',
               headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({channelId, projectId, text: proj.script, voiceId, modelId, _apiKey: secrets.elevenLabsKey}),
+              body: JSON.stringify({channelId, projectId, text: normalizeNumbersForTts(proj.script), voiceId, modelId, _apiKey: secrets.elevenLabsKey}),
             });
             const body = await r.json();
             if (!r.ok || !body.ok) throw new Error('TTS: ' + (body.error || `HTTP ${r.status}`));
@@ -12581,22 +14409,70 @@ exports.autoPilotWorker = onRequest(
             console.warn(`[autopilot] ${projectId}: bootstrap skipped — no owner Anthropic key`);
           }
         }
-        const promptText = buildSmartThumbnailPrompt({
-          title: proj.title || proj.ytTitle || proj.topic || '',
-          topic: proj.topic || '',
-          scriptOpening: (proj.script || '').slice(0, 300),
-          entities: proj.scriptEntities || [],
-          ownFormula,
-          globalPatterns,
-        });
+        const thumbTitle = proj.title || proj.ytTitle || proj.topic || '';
+        // Phase 21: prefer a real person photo → company logo as the
+        // thumbnail subject, passed to Pikzels /v2/thumbnail/image as a
+        // reference so the AI keeps its style but renders the REAL subject.
+        // Falls through to the text-only AI thumbnail (tier 3) on no-match
+        // OR any reference-render failure — the existing Pikzels-text →
+        // Flux → placeholder chain below stays the safety net.
+        const subj = await selectThumbnailSubject({title: thumbTitle, entities: proj.scriptEntities || []})
+          .catch((e) => { console.warn(`[autopilot] ${projectId}: thumbnail subject select failed: ${e.message}`); return {tier: 'ai'}; });
         // Pikzels can take 30-90s for a thumbnail. Heartbeat keeps the
         // stale-detection threshold off.
         const thumbHeartbeat = setInterval(() => {
           heartbeat('Generating thumbnail (Pikzels)… still working');
         }, 25_000);
-        let imageUrl;
+        let imageUrl = null;
+        let promptText = null;
+        let thumbnailSource = null;
         try {
-          imageUrl = await withAutoFix(async () => {
+          // Tiers 1/2: real person/logo reference → Pikzels /v2/thumbnail/image.
+          if (subj.tier === 'person' || subj.tier === 'logo') {
+            promptText = buildSmartThumbnailPrompt({
+              title: thumbTitle,
+              topic: proj.topic || '',
+              scriptOpening: (proj.script || '').slice(0, 300),
+              entities: proj.scriptEntities || [],
+              ownFormula,
+              globalPatterns,
+              subjectRef: {kind: subj.tier, name: subj.name},
+            });
+            try {
+              const subjectB64 = await fetchImageAsDataUrl(subj.url);
+              imageUrl = await withAutoFix(async () => {
+                const r = await fetch(`${RENDER_PROXY_URL}/pikzels-image`, {
+                  method: 'POST',
+                  headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify({prompt: promptText, image_base64: subjectB64, format: '16:9', model: 'pkz_4', _apiKey: secrets.pikzelsKey}),
+                });
+                const body = await r.json();
+                if (body.error) throw new Error('Thumbnail-image: ' + (body.error.message || body.error));
+                const url = body.output || body.image_url || body.url;
+                if (!url) throw new Error('Pikzels image endpoint returned no URL');
+                return url;
+              }, 'thumbnail-image', {
+                maxRetries: 2,
+                onAttempt: () => heartbeat(`Generating thumbnail (real ${subj.tier})… retrying`),
+              });
+              thumbnailSource = `pikzels-image-${subj.tier}`;
+              console.log(`[autopilot] ${projectId}: Stage 5 — thumbnail from real ${subj.tier} "${subj.name}"`);
+            } catch (refErr) {
+              console.warn(`[autopilot] ${projectId}: Stage 5 reference-image (${subj.tier}) failed: ${refErr.message} — falling back to text thumbnail`);
+              imageUrl = null;
+            }
+          }
+          // Tier 3 / fallback: text-only AI thumbnail (unchanged safety net).
+          if (!imageUrl) {
+            promptText = buildSmartThumbnailPrompt({
+              title: thumbTitle,
+              topic: proj.topic || '',
+              scriptOpening: (proj.script || '').slice(0, 300),
+              entities: proj.scriptEntities || [],
+              ownFormula,
+              globalPatterns,
+            });
+            imageUrl = await withAutoFix(async () => {
             const r = await fetch(`${RENDER_PROXY_URL}/pikzels`, {
               method: 'POST',
               headers: {'Content-Type': 'application/json'},
@@ -12656,22 +14532,25 @@ exports.autoPilotWorker = onRequest(
               return placeholderUrl;
             },
           });
+            // Classify which tier of the fallback chain actually produced
+            // the URL so the quality dashboard can flag placeholder shipments.
+            // Pikzels → Replicate → placehold.co are the three tiers.
+            thumbnailSource = 'pikzels';
+            if (/placehold\.co/i.test(imageUrl)) thumbnailSource = 'placeholder';
+            else if (/replicate\.com|replicate\.delivery/i.test(imageUrl)) thumbnailSource = 'flux';
+          }
         } finally {
           clearInterval(thumbHeartbeat);
         }
-        // Classify which tier of the fallback chain actually produced
-        // the URL so the quality dashboard can flag placeholder shipments.
-        // Pikzels → Replicate → placehold.co are the three tiers.
-        let thumbnailSource = 'pikzels';
-        if (/placehold\.co/i.test(imageUrl)) thumbnailSource = 'placeholder';
-        else if (/replicate\.com|replicate\.delivery/i.test(imageUrl)) thumbnailSource = 'flux';
         await projRef.update({
           thumbnailUrl: imageUrl,
           thumbnailPrompt: promptText,
           thumbnailSource,
+          thumbnailSubjectTier: subj.tier,
+          thumbnailSubjectName: subj.name || null,
           status: {...(proj.status || {}), thumbnail: 'approved', publish: 'in_progress'},
         });
-        console.log(`[autopilot] ${projectId}: Stage 5 done — thumbnail at ${imageUrl.slice(0, 80)} (source=${thumbnailSource})`);
+        console.log(`[autopilot] ${projectId}: Stage 5 done — thumbnail at ${imageUrl.slice(0, 80)} (source=${thumbnailSource}, tier=${subj.tier})`);
       }
       await autoApproveStage('thumbnail', 'publish');
 

@@ -2209,6 +2209,39 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Pikzels reference-image endpoint (Phase 21) ─────────────
+  // Same as /pikzels but hits /v2/thumbnail/image, which generates a
+  // thumbnail in Pikzels' style around a supplied reference image
+  // (image_url / image_base64) — used for the real-person & logo
+  // thumbnail tiers. The /pikzels text endpoint stays the AI fallback.
+  if (pathname === '/pikzels-image') {
+    console.log('Calling Pikzels image API...');
+    const payload = JSON.stringify(parsed);
+    const options = {
+      hostname: 'api.pikzels.com',
+      path: '/v2/thumbnail/image',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+        'X-Api-Key': apiKey,
+      }
+    };
+    const apiReq = https.request(options, apiRes => {
+      let data = '';
+      apiRes.on('data', chunk => { data += chunk; });
+      apiRes.on('end', () => {
+        console.log('Pikzels image status:', apiRes.statusCode);
+        res.writeHead(apiRes.statusCode, { 'Content-Type': 'application/json' });
+        res.end(data);
+      });
+    });
+    apiReq.on('error', err => { res.writeHead(500); res.end(JSON.stringify({ error: err.message })); });
+    apiReq.write(payload);
+    apiReq.end();
+    return;
+  }
+
   // ── Default: Anthropic ──────────────────────────────────────
   console.log('Calling Anthropic API...');
   const payload = JSON.stringify(parsed);
