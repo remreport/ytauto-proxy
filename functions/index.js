@@ -498,8 +498,8 @@ const BEATS_TOOL = {
               items: {
                 type: 'object',
                 properties: {
-                  name: {type: 'string', description: 'Canonical name (e.g. "Jerome Powell", "Goldman Sachs", "Federal Reserve").'},
-                  type: {type: 'string', enum: ['person', 'company', 'place', 'event'], description: 'What kind of entity this is. Drives layout (people get portrait crop, companies get logo treatment).'},
+                  name: {type: 'string', description: 'FULL canonical name — NEVER a fragment. Use "Booz Allen Hamilton" (never "Booz"/"Allen"/"Hamilton"), "Center for Strategic and International Studies" (never "Strategic"). Never list both a full name and a fragment of it across beats. E.g. "Jerome Powell", "Goldman Sachs", "Federal Reserve".'},
+                  type: {type: 'string', enum: ['person', 'company', 'organization', 'place', 'event'], description: 'What kind of entity this is. Drives layout + footage sourcing (people get portrait crop; companies/organizations get logo / HQ / seal via Wikidata-first lookup). Use "organization" for government bodies / agencies / committees / institutions / think tanks (Department of Defense, Government Accountability Office, Senate Armed Services Committee, the Fed, SEC) — do NOT label these "event".'},
                 },
                 required: ['name', 'type'],
               },
@@ -1386,11 +1386,16 @@ async function fetchWikipediaImage(name) {
       }
       const data = await resp.json();
       if (data.type === 'disambiguation') continue;
-      const imageUrl = data.originalimage?.source || data.thumbnail?.source || null;
-      if (imageUrl) {
-        if (qualifier) console.log(`[wiki] "${baseName}" → resolved via qualifier "${qualifier}"`);
-        _wikiImageCache.set(key, imageUrl);
-        return imageUrl;
+      const rawImageUrl = data.originalimage?.source || data.thumbnail?.source || null;
+      if (rawImageUrl) {
+        // Bucket-1 fix #1: SVG lead images (common for company logos —
+        // Dell/IBM/Leidos) aren't renderable in Remotion; raster to PNG.
+        const imageUrl = await rasterizeIfSvg(rawImageUrl);
+        if (imageUrl) {
+          if (qualifier) console.log(`[wiki] "${baseName}" → resolved via qualifier "${qualifier}"`);
+          _wikiImageCache.set(key, imageUrl);
+          return imageUrl;
+        }
       }
     }
     // Phase 1 fully exhausted — Phase 2 era/context fallback is
@@ -1403,6 +1408,105 @@ async function fetchWikipediaImage(name) {
     _wikiImageCache.set(key, null);
     return null;
   }
+}
+
+// Bucket-1 fix #1/#2/#4 helpers (entity-first real-footage hit rate).
+//
+// Extract the Commons "File:" name from an upload.wikimedia.org or
+// Special:FilePath URL (handles /thumb/.../Foo.svg/120px-Foo.svg.png too —
+// the original filename is the segment ending in a media extension).
+function commonsFilenameFromUrl(url) {
+  try {
+    const segs = new URL(url).pathname.split('/').filter(Boolean)
+      .map((s) => { try { return decodeURIComponent(s); } catch { return s; } });
+    const seg = segs.find((s) => /\.(svg|png|jpe?g|webp|gif|tiff?)$/i.test(s));
+    return seg || segs[segs.length - 1] || null;
+  } catch { return null; }
+}
+
+// Resolve a Commons File to a RENDERED raster thumbnail URL via imageinfo
+// iiurlwidth. For an SVG this returns a .../NNNpx-Foo.svg.png URL (PNG
+// render); for a raster it returns a width-scaled .jpg/.png. Either way the
+// returned URL ends in a renderable raster extension, so it passes the
+// /\.(jpe?g|png|webp|gif)/ gates at sourcing AND preflight.
+async function commonsFileThumbUrl(filename, width = 1280) {
+  if (!filename || wikimediaInCooldown()) return null;
+  const api = new URL('https://commons.wikimedia.org/w/api.php');
+  api.searchParams.set('action', 'query');
+  api.searchParams.set('format', 'json');
+  api.searchParams.set('titles', `File:${filename}`);
+  api.searchParams.set('prop', 'imageinfo');
+  api.searchParams.set('iiprop', 'url|mime');
+  api.searchParams.set('iiurlwidth', String(width));
+  api.searchParams.set('origin', '*');
+  await paceWikimedia();
+  let resp;
+  try { resp = await fetchWithRetry(api, {}, {timeoutMs: 8000, maxAttempts: 2, label: 'commons-thumb'}); }
+  catch (e) { console.warn(`[commons-thumb] "${filename}": ${e.message}`); return null; }
+  if (!resp.ok) { if (resp.status === 429) markWikimediaRateLimited(); return null; }
+  const data = await resp.json();
+  const info = (Object.values(data.query?.pages || {})[0]?.imageinfo || [])[0];
+  const out = info?.thumburl || info?.url || null;
+  if (!out) return null;
+  return /\.(jpe?g|png|webp|gif)(\?|#|$)/i.test(out) ? out : null;
+}
+
+// Bucket-1 fix #1: if an entity image URL is an SVG (Dell/IBM/Leidos-style
+// vector logos), raster it to PNG; otherwise pass through unchanged.
+async function rasterizeIfSvg(url, width = 1280) {
+  if (!url) return null;
+  if (!/\.svg(\?|#|$)/i.test(url)) return url;
+  const fname = commonsFilenameFromUrl(url);
+  if (!fname) return null;
+  return await commonsFileThumbUrl(fname, width);
+}
+
+// Bucket-1 fix #4: type-aware Commons query qualifier for orgs/places that
+// the bare name misses (a building/HQ hint surfaces real imagery).
+function _entityQueryQualifier(type) {
+  if (!type) return null;
+  const t = String(type).toLowerCase();
+  if (t === 'place') return 'building';
+  if (t === 'company' || t === 'organization') return 'headquarters';
+  return null;
+}
+
+// Bucket-1 fix #2: Wikidata as an entity-image source. name → Q-id
+// (wbsearchentities) → P18 (image) else P154 (logo) → Commons raster thumb.
+// Catches canonical entity images Commons full-text search misses (and via
+// commonsFileThumbUrl, rasters SVG logos). Returns {url, prop, qid} | null.
+async function _wikidataApi(params, label) {
+  if (wikimediaInCooldown()) return null;
+  const api = new URL('https://www.wikidata.org/w/api.php');
+  for (const [k, v] of Object.entries(params)) api.searchParams.set(k, v);
+  api.searchParams.set('format', 'json');
+  api.searchParams.set('origin', '*');
+  await paceWikimedia();
+  let resp;
+  try { resp = await fetchWithRetry(api, {}, {timeoutMs: 8000, maxAttempts: 2, label}); }
+  catch (e) { console.warn(`[${label}] ${e.message}`); return null; }
+  if (!resp.ok) { if (resp.status === 429) markWikimediaRateLimited(); return null; }
+  return await resp.json();
+}
+const _wikidataImageCache = new Map();
+async function fetchWikidataEntityImage(name, width = 1280) {
+  if (!name || typeof name !== 'string') return null;
+  const key = name.trim().toLowerCase();
+  if (_wikidataImageCache.has(key)) return _wikidataImageCache.get(key);
+  const search = await _wikidataApi({action: 'wbsearchentities', search: name.trim(), language: 'en', uselang: 'en', type: 'item', limit: '1'}, 'wikidata-search');
+  const qid = search?.search?.[0]?.id;
+  if (!qid) { _wikidataImageCache.set(key, null); return null; }
+  let prop = '18';
+  let fname = (await _wikidataApi({action: 'wbgetclaims', entity: qid, property: 'P18'}, 'wikidata-claims'))?.claims?.P18?.[0]?.mainsnak?.datavalue?.value || null;
+  if (!fname) {
+    prop = '154';
+    fname = (await _wikidataApi({action: 'wbgetclaims', entity: qid, property: 'P154'}, 'wikidata-claims'))?.claims?.P154?.[0]?.mainsnak?.datavalue?.value || null;
+  }
+  if (!fname) { _wikidataImageCache.set(key, null); return null; }
+  const url = await commonsFileThumbUrl(fname, width);
+  const result = url ? {url, prop, qid} : null;
+  _wikidataImageCache.set(key, result);
+  return result;
 }
 
 // Walk every beat, dedupe entity names across all beats, fetch their
@@ -6157,7 +6261,10 @@ const AI_VIDEO_MODELS = {
     }),
   },
 };
-const DEFAULT_AI_VIDEO_MODEL = 'kwaivgi/kling-v2.5-turbo-pro';
+// Default to Hailuo 02 — cheaper ($0.27/6s vs Kling $0.35/5s) and the
+// conservative choice for the first paid-source rollout. Channels can
+// override per-channel via aiVideo.model.
+const DEFAULT_AI_VIDEO_MODEL = 'minimax/hailuo-02';
 
 function estimateAiVideoClipCostUsd(modelSlug) {
   const m = AI_VIDEO_MODELS[modelSlug];
@@ -7256,7 +7363,7 @@ async function handleAiGenerated(scene, ctx) {
   // beats so the AI-prompt sanitizer can swap any unlisted brand for a
   // generic neutral noun ("a major company") instead of letting the literal
   // brand name reach fal.ai (where it produces fake logos or hits content-mod).
-  const sceneEntities = [];
+  const _rawSceneEntities = [];
   const _seenEnt = new Set();
   for (const b of (ctx.sceneBeats || [])) {
     if (!Array.isArray(b?.entities)) continue;
@@ -7265,9 +7372,11 @@ async function handleAiGenerated(scene, ctx) {
       const k = String(e.name).toLowerCase().trim();
       if (!k || _seenEnt.has(k)) continue;
       _seenEnt.add(k);
-      sceneEntities.push({name: e.name, type: e.type || null});
+      _rawSceneEntities.push({name: e.name, type: e.type || null});
     }
   }
+  // Build-B S2: collapse fragmented names before they reach forbiddenNames / AI prompts.
+  const sceneEntities = mergeEntityFragments(_rawSceneEntities);
   const aiUrl = await generateAiImage({
     prompt: scene.aiPrompt,
     falApiKey: process.env.FAL_AI_API_KEY,
@@ -8442,6 +8551,11 @@ async function probeEntityFirstSource(sceneBeats, ctx) {
   // anchor people first. ANY entity type counts as a nameable subject.
   const persons = [];
   const others = [];
+  const typeOf = new Map();
+  // Build-B S2: the probe reads RAW beat.entities (not the persisted/merged
+  // aggregation), so de-fragment HERE too — otherwise it would still query
+  // "Booz"/"Allen" instead of "Booz Allen Hamilton" and miss.
+  const _collected = [];
   const seen = new Set();
   for (const b of sceneBeats) {
     if (!Array.isArray(b?.entities)) continue;
@@ -8450,24 +8564,28 @@ async function probeEntityFirstSource(sceneBeats, ctx) {
       const key = String(e.name).toLowerCase().trim();
       if (!key || seen.has(key)) continue;
       seen.add(key);
-      if (e.type === 'person') persons.push(e.name); else others.push(e.name);
+      _collected.push({name: e.name, type: e.type || null});
     }
+  }
+  for (const e of mergeEntityFragments(_collected)) {
+    typeOf.set(String(e.name).toLowerCase().trim(), e.type || null);
+    if (e.type === 'person') persons.push(e.name); else others.push(e.name);
   }
   const keywords = (Array.isArray(ctx.sceneKeywords) ? ctx.sceneKeywords : []).filter(Boolean);
 
   // ── Build the ordered, de-duped attempt list (scene-specific only) ───
-  // Each attempt: {label, query, pageTitles[], entityName|null}.
+  // Each attempt: {label, query, pageTitles[], entityName|null, entityType|null}.
   const attempts = [];
-  const addAttempt = (label, query, pageTitles, entityName) => {
+  const addAttempt = (label, query, pageTitles, entityName, entityType) => {
     const q = String(query || '').trim();
     if (!q) return;
-    attempts.push({label, query: q, pageTitles: (pageTitles || []).filter(Boolean), entityName: entityName || null});
+    attempts.push({label, query: q, pageTitles: (pageTitles || []).filter(Boolean), entityName: entityName || null, entityType: entityType || null});
   };
 
   // 1. People first — one attempt per named person (up to 2).
-  for (const name of persons.slice(0, 2)) addAttempt('person', name, [name], name);
+  for (const name of persons.slice(0, 2)) addAttempt('person', name, [name], name, 'person');
   // 2. Other named entities — combined search query + per-name page titles.
-  if (others.length) addAttempt('entity', others.slice(0, 3).join(' '), others.slice(0, 2), others[0]);
+  if (others.length) addAttempt('entity', others.slice(0, 3).join(' '), others.slice(0, 2), others[0], typeOf.get(String(others[0]).toLowerCase().trim()));
   // 3. Entity-LESS scenes only: ONE tight scene-keyword query against Commons
   //    image/video search (scene-specific, NOT the video topic; relevance-
   //    filtered). NO page-image titles here: a generic keyword resolves a
@@ -8493,7 +8611,7 @@ async function probeEntityFirstSource(sceneBeats, ctx) {
 
   // ── Run each attempt's Video → Image → PageImage ladder. Stop on the
   //    first renderable hit. Video preferred at EVERY attempt. ──────────
-  const titleShaped = (t) => _wikimediaTokens(t).length <= 4; // page-image guard
+  const titleShaped = (t) => _wikimediaTokens(t).length <= 7; // page-image guard (Bucket-1 fix #3: 4→7; unblocks CSIS/OSD-length names)
   for (let ai = 0; ai < plan.length; ai++) {
     const a = plan[ai];
     const tag = a.label;
@@ -8522,26 +8640,61 @@ async function probeEntityFirstSource(sceneBeats, ctx) {
       provenance.push({tried: 'wikimedia-video-entity', ok: false, reason: `${a.label}: ${e.message}`});
     }
 
-    // b) Commons STILL.
-    try {
-      const imgs = await wikimediaImageSearchTop(a.query, 3);
-      for (const r of (imgs || [])) {
-        if (taken(r?.url)) continue;
-        // No sourcing-time HEAD probe: the Commons API already vetted
-        // mime/license/size + renderable extension. A HEAD here only adds
-        // image-CDN load that throttles (429s / connection resets) and
-        // false-rejects perfectly good images — the FTX/SEC misses. Real
-        // reachability is re-checked when the asset is cached to Firebase
-        // (with 429 retry) and at the render-gate (keeps transient failures,
-        // drops only hard 404s). So trust the candidate and anchor it.
-        ctx.usedStockUrls.add(r.url);
-        telemetry.outcome = 'image';
-        provenance.push({tried: 'wikimedia-image-entity', ok: true, reason: `${a.label} query="${a.query}"`});
-        console.log(`[entity-first] ${tag} query="${a.query}" → wikimedia-image-entity`);
-        return {url: r.url, source: 'wikimedia-image-entity', creator: r.creator || null, entity: a.entityName, provenance, telemetry};
+    // b) Commons still image + Wikidata canonical image — Bucket-1 fixes
+    //    #1/#2/#4. Order depends on entity type:
+    //      • company/organization → Wikidata FIRST. Its canonical P18/P154
+    //        (logo / HQ / known product) beats a random Commons full-text hit
+    //        (e.g. "IBM" full-text → a Microdrive photo).
+    //      • people/places/keywords → Commons FIRST. Wikidata's single P18 is
+    //        often too narrow for these; Commons full-text is broader.
+    const tryCommonsImage = async () => {
+      try {
+        // fix #4: on miss, retry once with a type-aware qualifier (orgs/places
+        // resolve better with an HQ/building hint). scene-keyword skips it.
+        let imgs = await wikimediaImageSearchTop(a.query, 3);
+        if ((!imgs || !imgs.length) && a.label !== 'scene-keyword') {
+          const qual = _entityQueryQualifier(a.entityType);
+          if (qual) {
+            imgs = await wikimediaImageSearchTop(`${a.query} ${qual}`, 3);
+            if (imgs && imgs.length) console.log(`[entity-first] ${tag} query="${a.query}" retried with qualifier "${qual}"`);
+          }
+        }
+        for (const r of (imgs || [])) {
+          if (taken(r?.url)) continue;
+          // No sourcing-time HEAD probe: the Commons API already vetted
+          // mime/license/size + renderable extension (reachability is
+          // re-checked at cache-time and the render-gate). Trust + anchor.
+          ctx.usedStockUrls.add(r.url);
+          telemetry.outcome = 'image';
+          provenance.push({tried: 'wikimedia-image-entity', ok: true, reason: `${a.label} query="${a.query}"`});
+          console.log(`[entity-first] ${tag} query="${a.query}" → wikimedia-image-entity`);
+          return {url: r.url, source: 'wikimedia-image-entity', creator: r.creator || null, entity: a.entityName, provenance, telemetry};
+        }
+      } catch (e) {
+        provenance.push({tried: 'wikimedia-image-entity', ok: false, reason: `${a.label}: ${e.message}`});
       }
-    } catch (e) {
-      provenance.push({tried: 'wikimedia-image-entity', ok: false, reason: `${a.label}: ${e.message}`});
+      return null;
+    };
+    const tryWikidata = async () => {
+      if (!a.entityName) return null;
+      try {
+        const wd = await fetchWikidataEntityImage(a.entityName);
+        if (wd && wd.url && !taken(wd.url)) {
+          ctx.usedStockUrls.add(wd.url);
+          telemetry.outcome = 'image';
+          provenance.push({tried: 'wikidata-image-entity', ok: true, reason: `${a.label} "${a.entityName}" P${wd.prop}`});
+          console.log(`[entity-first] ${tag} "${a.entityName}" → wikidata-image-entity (P${wd.prop})`);
+          return {url: wd.url, source: 'wikidata-image-entity', creator: null, entity: a.entityName, provenance, telemetry};
+        }
+      } catch (e) {
+        provenance.push({tried: 'wikidata-image-entity', ok: false, reason: `${a.label}: ${e.message}`});
+      }
+      return null;
+    };
+    const companyish = /^(company|organization)$/i.test(String(a.entityType || ''));
+    for (const step of (companyish ? [tryWikidata, tryCommonsImage] : [tryCommonsImage, tryWikidata])) {
+      const hit = await step();
+      if (hit) return hit;
     }
 
     // c) Wikipedia REST page lead image — only for title-shaped candidates.
@@ -8666,7 +8819,7 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
     // persist on the footage entry. Entities were previously ephemeral —
     // only rawBeats held them — so audits couldn't tell which scenes named
     // an entity. Persisting them here makes that countable downstream.
-    const sceneEntities = [];
+    const _rawSceneEntities = [];
     {
       const seenEnt = new Set();
       for (const b of sceneBeats) {
@@ -8676,10 +8829,13 @@ async function sourceScenesAndBuildFootage({scenes, rawBeats, channelId, blockli
           const k = String(e.name).toLowerCase().trim();
           if (!k || seenEnt.has(k)) continue;
           seenEnt.add(k);
-          sceneEntities.push({name: e.name, type: e.type || null});
+          _rawSceneEntities.push({name: e.name, type: e.type || null});
         }
       }
     }
+    // Build-B S2: collapse fragmented names so the persisted beat.entities
+    // (and audits) carry full canonical names, not "Booz"/"Allen"/"Hamilton".
+    const sceneEntities = mergeEntityFragments(_rawSceneEntities);
 
     // PART A: entity-first probe runs before the per-assetType handler for
     // every footage-sourced scene. Code-rendered templates (stat_overlay,
@@ -9410,14 +9566,24 @@ async function sourceBeatAwareFootage(captions, anthropicKey, jobRef, baseProgre
   const aiVideoT0 = Date.now();
   // aiCfg already loaded at top of function (with aiVideoOverride applied).
   let aiVideoStats = {clipsGenerated: 0, costUsd: 0, skippedDueBudget: 0};
-  // Phase 6a: scene-driven path skips Kling AI video — abstract/hero
-  // scenes use fal.ai Nano Banana 2 images instead (cheaper, no 5s
-  // clip-looping problem on longer scenes).
-  if (sceneDrivenActive) {
-    console.log(`[ai-video] scene-driven path active — Kling pass skipped (fal.ai NB2 handles ai_generated scenes)`);
-  } else if (aiCfg.enabled && aiCfg.mode !== 'disabled') {
+  // Phase 2X: AI video for hero + abstract scenes. Previously the
+  // scene-driven path skipped Kling/Hailuo entirely (everything stayed a
+  // fal.ai NB2 still). Now, when the channel has AI video enabled, the
+  // scene-driven path routes ONLY hero + shouldAnimate scenes through AI
+  // video — that's where the slideshow feel hurts most — while every other
+  // ai_generated scene keeps its fal.ai NB2 image. Cost stays bounded by the
+  // existing 10-clip / per-render / monthly caps in runAiVideoGenerationPass.
+  if (aiCfg.enabled && aiCfg.mode !== 'disabled') {
     let candidates = [];
-    if (aiCfg.mode === 'fallback-only') {
+    if (sceneDrivenActive) {
+      // Scene-driven scope is FIXED to hero (shouldAnimate added below);
+      // channel `mode` is intentionally ignored here to bound cost. We do
+      // NOT pull in fallback (url-less) or all ai_generated scenes.
+      candidates = footage
+        .map((b, idx) => (b && b.heroMoment ? idx : -1))
+        .filter((idx) => idx >= 0);
+      console.log(`[ai-video] scene-driven path — AI video scoped to hero + shouldAnimate scenes (${candidates.length} hero beat(s) so far)`);
+    } else if (aiCfg.mode === 'fallback-only') {
       // Beats where every Pexels candidate failed validation.
       candidates = footage
         .map((b, idx) => (b && !b.url ? idx : -1))
@@ -11098,6 +11264,69 @@ async function getRecentChannelTopics(channelId, limitN = 15) {
   }
 }
 
+// Pull recently-PUBLISHED video titles from videoPerformance. Project docs
+// are deleted after publish (cleanup), so the projects subcollection alone is
+// not a reliable dedupe history — a story we already published can vanish from
+// it and get re-picked (the Dell/Trump repeat: project deleted, but
+// videoPerformance still held "Trump's Pentagon Deal Just Made Dell Stock
+// Explode"). videoPerformance is the durable record, so fold it into the
+// avoid-list. No orderBy (avoids a composite-index requirement) — filter +
+// sort the last `days` in memory.
+async function getRecentPublishedTitles(channelId, limitN = 40, days = 45) {
+  if (!channelId) return [];
+  try {
+    const cutoffMs = Date.now() - days * 86400_000;
+    const snap = await db.collection('videoPerformance').where('channelId', '==', channelId).limit(limitN).get();
+    const out = [];
+    for (const doc of snap.docs) {
+      const d = doc.data() || {};
+      const pubMs = d.publishedAt?.toMillis ? d.publishedAt.toMillis()
+        : (d.publishedAt ? new Date(d.publishedAt).getTime() : 0);
+      if (pubMs && pubMs < cutoffMs) continue;
+      const title = d.title || '';
+      if (title) out.push({topic: '', title: String(title).slice(0, 150)});
+    }
+    return out;
+  } catch (e) {
+    console.warn(`[recent-published] ${channelId}: ${e.message}`);
+    return [];
+  }
+}
+
+// Hard-dedupe support. The soft "avoid-list" prompt instruction (recentBlock
+// below) is overridden by Claude when one story dominates trending — it
+// re-picks a paraphrase ("Dell Stock Up 80% Since Trump Buy Recommendation"
+// vs the recent "Dell Is Up 80%… Trump's Buy Call"). These functions back a
+// code-level overlap check in processDiscoveryJob that rejects such picks.
+//
+// Significant tokens = lowercase, ≥4 chars, minus common + finance-generic
+// words, so overlap is driven by DISTINCTIVE entities (dell/trump/pentagon),
+// not boilerplate ("stock"/"market"/"report" must not make two unrelated
+// stories look like duplicates).
+const _TOPIC_STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'this', 'that', 'what', 'whats', 'why', 'how', 'when', 'your', 'here', 'heres', 'really', 'since', 'about', 'into', 'over', 'just', 'they', 'them', 'will', 'would', 'could', 'should', 'than', 'then', 'more', 'most', 'amid', 'after', 'before',
+  // finance / news generic — recur across unrelated stories
+  'stock', 'stocks', 'share', 'shares', 'market', 'markets', 'price', 'prices', 'report', 'reports', 'news', 'video', 'update', 'today', 'week', 'month', 'year', 'says', 'said', 'jumps', 'surge', 'surges', 'rises', 'falls', 'drop', 'drops', 'soars', 'plunge', 'deal', 'call', 'move', 'moves', 'data', 'high', 'highs', 'record', 'recommendation',
+]);
+function _topicSignificantTokens(s) {
+  const out = new Set();
+  for (const w of String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)) {
+    if (w.length >= 4 && !_TOPIC_STOPWORDS.has(w)) out.add(w);
+  }
+  return out;
+}
+// Two topics "overlap" (= the same story we've already made) when they share
+// ≥2 distinctive tokens. One shared token is too loose (two different Nvidia
+// stories share "nvidia"); 2+ reliably means same entities + angle.
+function _topicsOverlap(a, b, minShared = 2) {
+  const tb = _topicSignificantTokens(b);
+  let shared = 0;
+  for (const t of _topicSignificantTokens(a)) {
+    if (tb.has(t) && ++shared >= minShared) return true;
+  }
+  return false;
+}
+
 async function rankAndPickTopic(trending, niche, anthropicKey, {recentTopics = []} = {}) {
   // Reject topics older than 7 days. Sources with reliable createdAt
   // (Reddit, HN, NewsAPI) get filtered hard; Google Trends sets
@@ -11250,11 +11479,36 @@ exports.processDiscoveryJob = onDocumentCreated(
       // the picker as an avoid-list. Without this, dominant news
       // stories produced duplicate-topic bulk runs ($20+ wasted per
       // run on near-identical videos).
-      const recentTopics = await getRecentChannelTopics(data.channelId, 15);
+      // Avoid-list = recent project docs (may be sparse — deleted after
+      // publish) UNION recently-published video titles (durable record).
+      const [recentProjects, recentPublished] = await Promise.all([
+        getRecentChannelTopics(data.channelId, 15),
+        getRecentPublishedTitles(data.channelId, 40, 45),
+      ]);
+      const recentTopics = recentProjects.concat(recentPublished);
       if (recentTopics.length) {
-        console.log(`[${jobId}] excluding ${recentTopics.length} recent topics from picker`);
+        console.log(`[${jobId}] excluding ${recentTopics.length} recent topics from picker (${recentProjects.length} projects + ${recentPublished.length} published)`);
       }
-      const proposal = await rankAndPickTopic(trending, data.niche, anthropicKey, {recentTopics});
+      // HARD dedupe: the avoid-list prompt is soft and a dominant recurring
+      // story overrides it with a paraphrase. After each pick, check
+      // entity/keyword overlap against the recent topics in CODE; if it
+      // overlaps a story we've already made, reject it, add it to the
+      // avoid-list, and re-rank for the next-best genuinely-different story.
+      // Up to 4 attempts, then accept the last pick (never block the queue).
+      let proposal = null;
+      const rejectedPicks = [];
+      for (let attempt = 1; attempt <= 4; attempt++) {
+        proposal = await rankAndPickTopic(trending, data.niche, anthropicKey, {recentTopics: recentTopics.concat(rejectedPicks)});
+        const pickStr = `${proposal.pickedTopic} ${proposal.pickedTitle}`;
+        const dup = recentTopics.find((r) => _topicsOverlap(pickStr, `${r.topic} ${r.title}`));
+        if (!dup) {
+          if (attempt > 1) console.log(`[${jobId}] accepted on attempt ${attempt} after rejecting ${rejectedPicks.length} duplicate(s)`);
+          break;
+        }
+        console.warn(`[${jobId}] dedupe attempt ${attempt}: pick "${proposal.pickedTopic}" overlaps recent "${dup.topic || dup.title}" — rejecting, re-ranking for a different story`);
+        rejectedPicks.push({topic: proposal.pickedTopic, title: proposal.pickedTitle});
+        if (attempt === 4) console.warn(`[${jobId}] dedupe: all 4 attempts overlapped recent topics — shipping last pick (no distinct story surfaced this run)`);
+      }
       console.log(`[${jobId}] picked: ${proposal.pickedTopic}`);
       console.log(`[${jobId}] title: ${proposal.pickedTitle}`);
 
@@ -12859,6 +13113,11 @@ function autoPilotBuildScriptPrompt(topic, forensic, insights, retryViolations) 
   lines.push('Voice: conversational, direct, urgent when appropriate.');
   lines.push('Pacing: short punchy sentences mixed with longer ones.');
   lines.push('');
+  lines.push('✓ TOPIC ENTITIES — name the people and organisations the topic implies:');
+  lines.push('  • Every specific PERSON or ORGANISATION named in the topic above must appear in the script, with their role in THIS story explained — who they are and what they actually did here. A topic-named person must NEVER fall away as unmentioned backdrop. Cover them genuinely as part of the narrative, not shoehorned into a list.');
+  lines.push('  • This is SUBORDINATE to the temporal-anchoring rules: the hook is still the current event / number, not the person. Name and explain the topic\'s people where they belong in the body — do not force them into the first sentence just to satisfy this.');
+  lines.push('  • INTEGRITY — NON-NEGOTIABLE: never assert an unverified claim about a real person as established fact, and never fabricate a person\'s words, actions, or motives. If the topic implies something about a person you cannot state as verified fact, attribute it honestly ("reportedly", "according to [source]", "is said to have…") or cover only what is genuinely known and frame the rest as the open question. Under-claiming is correct here; inventing is not. A downstream fact-check verifies these claims — give it accurate, attributable statements to verify, not fabrications.');
+  lines.push('');
   lines.push('REMEMBER:');
   lines.push('  1. Hook by sentence 2. Open with a named entity / number / event — not "you".');
   lines.push('  2. NO soft transitions, NO definition blocks, NO generic-you openers, NO meta-promises.');
@@ -12867,6 +13126,7 @@ function autoPilotBuildScriptPrompt(topic, forensic, insights, retryViolations) 
   lines.push('  5. Use turn words (but / however / here\'s the part nobody mentions) to keep momentum.');
   lines.push('  6. End on a sharp takeaway that closes the loops. Do not trail off at the word count.');
   lines.push('  7. Anchor everything to the last ~30 days. Older background only as one-line contrast against a specific recent event. Hook = current event, not the pattern.');
+  lines.push('  8. Name every person/organisation the topic implies and explain their role — but attribute any unverified person-claim ("reportedly", "according to…"), never assert it as fact.');
   return lines.join('\n');
 }
 
@@ -12893,30 +13153,63 @@ async function autoPilotGenerateScript(topic, channelId, apiKey, maxAttempts = 3
       break;
     }
   }
-  // Extract entities from the finalized script so Stage 5 (thumbnail)
-  // can feature the right people / companies / events. Best-effort —
-  // if extraction fails, thumbnail still renders from base style.
-  const entities = lastText
-    ? await extractEntitiesFromScript(lastText, topic, apiKey).catch((e) => {
-        console.warn(`[autopilot:script] entity extraction failed: ${e.message}`);
-        return [];
-      })
-    : [];
-  return {text: lastText, attempts: finalAttempts, violations: lastViolations, entities};
+  // Build-B S5: entity extraction moved to AFTER the fact-check gate (the
+  // call site), so scriptEntities are derived from the CORRECTED script —
+  // a fact-check rewrite can add/remove a named entity.
+  return {text: lastText, attempts: finalAttempts, violations: lastViolations};
 }
 
-// Extract the 2-4 most prominent named entities from a script for use
-// by the thumbnail prompt builder. Asks Claude for image-recognisable
-// entities only — Powell, Apple, Capitol building, "the 2008 crash" —
-// skipping generic nouns ("the market", "investors"). Returns up to 4
-// entries with type + 5-10 word context.
-async function extractEntitiesFromScript(scriptText, topic, apiKey) {
-  const slim = (scriptText || '').slice(0, 3500);
-  if (slim.length < 300) return [];
-  const prompt = `Extract the most important NAMED entities from this YouTube script. Return ONLY entities that an image generator could VISUALLY represent — recognisable people, companies (with logos), places (with iconic visuals), or specific named events.
+// Build-B S2: collapse fragmented multi-word entity names. Drops any entity
+// whose name tokens are a strict subset of a longer entity's tokens (e.g.
+// "Booz" / "Allen" / "Hamilton" → all dropped in favour of "Booz Allen
+// Hamilton"; "Strategic" / "International Studies" → dropped for "Center for
+// Strategic and International Studies"). Longest name wins; original order
+// of survivors is preserved.
+function mergeEntityFragments(ents) {
+  if (!Array.isArray(ents) || ents.length < 2) return ents;
+  const toks = (s) => new Set(String(s).toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean));
+  const ranked = ents.map((e, i) => ({e, i, t: toks(e.name)})).sort((a, b) => b.t.size - a.t.size || a.i - b.i);
+  const kept = [];
+  for (const cand of ranked) {
+    const subsumed = kept.some((k) => k.t.size > cand.t.size && [...cand.t].every((tok) => k.t.has(tok)));
+    if (!subsumed) kept.push(cand);
+  }
+  return kept.sort((a, b) => a.i - b.i).map((x) => x.e);
+}
 
-INCLUDE: "Jerome Powell", "Apple", "Goldman Sachs", "Capitol building", "the 2008 crash"
+// Build-B S4: stable-sort people to the front (strongest thumbnail/footage
+// subjects), preserving the model's importance order within each group.
+function stableSortPersonsFirst(ents) {
+  return ents.map((e, i) => ({e, i}))
+    .sort((a, b) => ((a.e.type === 'person' ? 0 : 1) - (b.e.type === 'person' ? 0 : 1)) || a.i - b.i)
+    .map((x) => x.e);
+}
+
+// Extract the most prominent image-recognisable NAMED entities from a script
+// for the thumbnail + entity-first footage layers. Build B: reads the FULL
+// script (S1), uses an extended type taxonomy incl. organization (S3),
+// people-first ranking (S4), and full-canonical-name instructions; results
+// are fragment-merged (S2) + person-sorted (S4) post-parse.
+async function extractEntitiesFromScript(scriptText, topic, apiKey) {
+  // S1: was capped at 3500 (~28% of a 12k script), hiding later entities.
+  // 16k covers a full 13-min script in one call.
+  const slim = (scriptText || '').slice(0, 16000);
+  if (slim.length < 300) return [];
+  const prompt = `Extract the most important NAMED entities from this YouTube script. Return ONLY entities that an image generator could VISUALLY represent — recognisable people, companies, organizations / government bodies, places, or specific named events.
+
+INCLUDE: "Jerome Powell" (person), "Apple" (company), "Department of Defense" (organization), "Capitol building" (place), "the 2008 crash" (event)
 EXCLUDE: generic "the market", "investors", "regulators", "inflation" (not visually specific)
+
+TYPES — use the MOST SPECIFIC:
+  • person — a named human (CEOs, officials, politicians)
+  • company — a for-profit firm with a logo
+  • organization — a government body / agency / committee / institution / think tank (e.g. Department of Defense, Government Accountability Office, Senate Armed Services Committee). Do NOT label these "event".
+  • place — a building, city, or landmark
+  • event — a named happening (a crash, a hearing, a named program)
+
+RULES:
+  • List PEOPLE FIRST, then organizations/companies/places/events by importance. People make the strongest thumbnails.
+  • Use each entity's FULL CANONICAL name ("Booz Allen Hamilton", never "Booz"/"Allen"/"Hamilton"; "Center for Strategic and International Studies", never "Strategic"). NEVER split a multi-word name into fragments, and NEVER list both a full name and a fragment of it.
 
 TOPIC: ${topic || '(unknown)'}
 
@@ -12927,12 +13220,12 @@ Return ONLY a JSON object — no prose, no markdown fences:
 {
   "entities": [
     {"name": "Jerome Powell", "type": "person", "context": "Fed chair making this announcement"},
-    {"name": "Goldman Sachs", "type": "company", "context": "the bank that warned of recession"}
+    {"name": "Department of Defense", "type": "organization", "context": "issued the contract endorsement"}
   ]
 }
 
-Up to 10 entities, ordered by importance to this video. context is 5-10 words explaining their role. Don't be conservative — list every recognisable name worth illustrating.`;
-  const raw = await callAnthropic(apiKey, prompt, 800);
+Up to 12 entities, PEOPLE FIRST then by importance. context is 5-10 words explaining their role. Don't be conservative — list every recognisable name worth illustrating, but use full canonical names only.`;
+  const raw = await callAnthropic(apiKey, prompt, 1000);
   if (!raw) return [];
   // Robust extraction: strip fences, find outermost { } block, parse.
   let cleaned = raw.trim().replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
@@ -12946,18 +13239,20 @@ Up to 10 entities, ordered by importance to this video. context is 5-10 words ex
     return [];
   }
   if (!Array.isArray(parsed?.entities)) return [];
-  // Bumped 4→10 — finance scripts often reference 6-10 distinct
-  // companies/people/places. The Stage-5 thumbnail prompt only uses
-  // the first 3, but downstream beats can reference any of these via
-  // entityPortrait overlays for richer per-beat visuals.
-  return parsed.entities
+  // S3: allow organization/product so govt bodies aren't coerced to 'event'
+  // (the coercion silently disabled Build A's type-aware Wikidata-first +
+  // qualifier path, which keys on company/organization).
+  const ALLOWED = ['person', 'company', 'organization', 'place', 'product', 'event'];
+  let ents = parsed.entities
     .filter((e) => e && typeof e.name === 'string' && e.name.trim())
-    .slice(0, 10)
     .map((e) => ({
-      name: String(e.name).slice(0, 80),
-      type: ['person', 'company', 'place', 'event'].includes(e.type) ? e.type : 'event',
+      name: String(e.name).slice(0, 80).trim(),
+      type: ALLOWED.includes(e.type) ? e.type : 'event',
       context: String(e.context || '').slice(0, 100),
     }));
+  ents = mergeEntityFragments(ents);     // S2
+  ents = stableSortPersonsFirst(ents);   // S4
+  return ents.slice(0, 12);
 }
 
 // Silent fact-check gate. Runs between Stage 2 (script gen) and
@@ -14266,12 +14561,22 @@ exports.autoPilotWorker = onRequest(
           clearInterval(factCheckHeartbeat);
         }
 
+        // Build-B S5: extract entities from the POST-fact-check script so the
+        // stored scriptEntities match the final text (a correction may have
+        // added/removed a named entity). Best-effort — empty on failure.
+        let scriptEntities = [];
+        try {
+          scriptEntities = await extractEntitiesFromScript(scriptText, proj.topic, secrets.anthropicKey);
+        } catch (e) {
+          console.warn(`[autopilot] ${projectId}: entity extraction failed: ${e.message}`);
+        }
+
         await projRef.update({
           script: scriptText,
-          // scriptEntities — feeds the smart thumbnail prompt at Stage 5.
-          // Up to 4 image-recognisable named entities (Powell, Apple, etc.).
-          // Empty array on extraction failure is the safe fallback.
-          scriptEntities: Array.isArray(result.entities) ? result.entities : [],
+          // scriptEntities — feeds the smart thumbnail prompt (Stage 5) +
+          // entity-first footage. Image-recognisable named entities, people
+          // first. Empty array on extraction failure is the safe fallback.
+          scriptEntities: Array.isArray(scriptEntities) ? scriptEntities : [],
           status: {...(proj.status || {}), script: 'approved', voiceover: 'in_progress'},
           scriptValidation: {attempts: result.attempts, violations: result.violations || []},
           factCheck: factCheckReport,
