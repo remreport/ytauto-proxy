@@ -1264,8 +1264,22 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readBody(req);
       const p = JSON.parse(body);
-      const { channelId, title, description, videoUrl, thumbnailUrl, tags, privacyStatus, publishAt, categoryId } = p;
+      const { channelId, projectId, title, description, videoUrl, thumbnailUrl, tags, privacyStatus, publishAt, categoryId } = p;
       if (!channelId || !videoUrl) return sendJSON(res, 400, { error: 'channelId and videoUrl required' });
+
+      // IDEMPOTENCY (#3): dedupe by (channelId, projectId) so a client retry after a
+      // timeout/hang can NEVER double-post. The marker is written the instant the
+      // insert succeeds (below), BEFORE the response — so even if the response hangs
+      // and the client retries, this returns the already-uploaded video.
+      const dedupRef = projectId ? db.collection('youtubeUploads').doc(`${channelId}__${projectId}`) : null;
+      if (dedupRef) {
+        const existing = await dedupRef.get();
+        if (existing.exists && existing.data().videoId) {
+          const e = existing.data();
+          console.log(`[youtube/upload] idempotent hit ${channelId}__${projectId} → existing video ${e.videoId} (no re-upload)`);
+          return sendJSON(res, 200, { ok: true, videoId: e.videoId, watchUrl: e.watchUrl, studioUrl: e.studioUrl, scheduledPublishAt: e.publishAt || null, thumbnailUploaded: !!e.thumbnailUploaded, dedup: true });
+        }
+      }
 
       // 1) Load tokens from Firestore
       const snap = await db.collection('channels').doc(channelId).get();
@@ -1321,6 +1335,13 @@ const server = http.createServer(async (req, res) => {
 
       const videoId = uploadResp.data.id;
       console.log(`YouTube upload complete. videoId: ${videoId}${publishAt ? ` · scheduled for ${publishAt}` : ''}`);
+
+      // Write the idempotency marker IMMEDIATELY — before the thumbnail and before
+      // the response — so a hung response + client retry returns THIS video, never a
+      // duplicate. This is the anchor that makes the client-side timeout safe.
+      if (dedupRef) {
+        await dedupRef.set({ videoId, watchUrl: `https://youtube.com/watch?v=${videoId}`, studioUrl: `https://studio.youtube.com/video/${videoId}/edit`, channelId, projectId, publishAt: publishAt || null, uploadedAt: new Date().toISOString() }).catch((e) => console.error('[youtube/upload] dedup marker write failed (non-fatal):', e.message));
+      }
 
       // 5) Upload thumbnail if provided. Failure is non-fatal — the
       // video is already on YouTube; user can still set the thumbnail
