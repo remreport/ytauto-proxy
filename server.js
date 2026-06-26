@@ -33,7 +33,84 @@ try {
 } catch (e) {
   console.error('⚠ Firebase Admin init failed:', e.message);
 }
-const db = firebaseReady ? admin.firestore() : null;
+// ── Firestore: direct, or relayed through a Function on Google infra ──
+// Render's shared egress IP gets HTTP-403'd by Google for firestore.googleapis.com
+// (abuse interstitial). When FIRESTORE_RELAY_URL + FIRESTORE_RELAY_SECRET are set,
+// route ALL Firestore ops through the firestoreRelay function (runs on Google's
+// own infra, never IP-blocked). Mirrors the subset of the Firestore API the proxy
+// uses: collection/doc chaining, get/set/update/add/delete, orderBy+limit queries,
+// and serverTimestamp()/delete() field-value sentinels.
+const RELAY_URL = (process.env.FIRESTORE_RELAY_URL || '').trim();
+const RELAY_SECRET = (process.env.FIRESTORE_RELAY_SECRET || '').trim();
+
+function makeRelayDb(url, secret) {
+  async function rpc(body) {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-relay-secret': secret },
+      body: JSON.stringify(body),
+    });
+    const text = await r.text();
+    let j;
+    try { j = JSON.parse(text); } catch { throw new Error(`Firestore relay non-JSON (${r.status}): ${text.slice(0, 120)}`); }
+    if (!r.ok) { const e = new Error(j.error || `Firestore relay HTTP ${r.status}`); e.code = j.code; throw e; }
+    return j;
+  }
+  // Rehydrate {__ts__: ms} markers into a Timestamp-like object so callers that
+  // duck-type `field?.toMillis()` keep working.
+  function rehydrate(v) {
+    if (v === null || typeof v !== 'object') return v;
+    if (typeof v.__ts__ === 'number') { const ms = v.__ts__; return { toMillis: () => ms, toDate: () => new Date(ms), _seconds: Math.floor(ms / 1000) }; }
+    if (Array.isArray(v)) return v.map(rehydrate);
+    const o = {};
+    for (const k of Object.keys(v)) o[k] = rehydrate(v[k]);
+    return o;
+  }
+  function docSnap(j) {
+    const d = j && j.exists ? rehydrate(j.data) : undefined;
+    return { exists: !!(j && j.exists), id: j && j.id, data: () => d, get: (f) => (d ? d[f] : undefined) };
+  }
+  function makeRef(path, query) {
+    return {
+      collection(name) { return makeRef([...path, name], {}); },
+      doc(id) { return makeRef([...path, id], {}); },
+      orderBy(field, dir) { return makeRef(path, { ...query, orderBy: [field, dir || 'asc'] }); },
+      limit(n) { return makeRef(path, { ...query, limit: n }); },
+      async get() {
+        const j = await rpc({ path, op: 'get', query: query || {} });
+        if (path.length % 2 === 0) return docSnap(j); // doc ref
+        const docs = (j.docs || []).map(docSnap);      // collection/query
+        return { docs, empty: j.empty, size: j.size, forEach: (fn) => docs.forEach(fn) };
+      },
+      async set(data, opts) { await rpc({ path, op: 'set', data, opts: opts || {} }); return {}; },
+      async update(data) { await rpc({ path, op: 'update', data }); return {}; },
+      async add(data) { return await rpc({ path, op: 'add', data }); },
+      async delete() { await rpc({ path, op: 'delete' }); return {}; },
+    };
+  }
+  return { collection(name) { return makeRef([name], {}); } };
+}
+
+let db = null;
+if (RELAY_URL && RELAY_SECRET) {
+  db = makeRelayDb(RELAY_URL, RELAY_SECRET);
+  // Make FieldValue sentinels relay-safe: plain markers the relay reconstructs.
+  const relayFV = {
+    serverTimestamp: () => ({ __relay_fv__: 'serverTimestamp' }),
+    delete: () => ({ __relay_fv__: 'delete' }),
+    increment: (n) => ({ __relay_fv__: 'increment', n }),
+    arrayUnion: (...v) => ({ __relay_fv__: 'arrayUnion', v }),
+    arrayRemove: (...v) => ({ __relay_fv__: 'arrayRemove', v }),
+  };
+  try { Object.defineProperty(admin.firestore, 'FieldValue', { value: relayFV, writable: true, configurable: true }); }
+  catch (e) { console.error('⚠ FieldValue relay override failed:', e.message); }
+  if (admin.firestore.FieldValue.serverTimestamp().__relay_fv__ !== 'serverTimestamp') {
+    console.error('⚠ FieldValue override did NOT take — serverTimestamp/delete writes will be wrong in relay mode');
+  }
+  console.log('✓ Firestore RELAY mode active (ops routed through firestoreRelay on Google infra)');
+} else if (firebaseReady) {
+  db = admin.firestore();
+}
 const bucket = firebaseReady ? admin.storage().bucket() : null;
 
 // Per-model ElevenLabs config — char limits + per-1k-char rates.
@@ -1390,6 +1467,34 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── YouTube: schedule (set publishAt on already-uploaded video) ──
+  // POST /youtube/set-thumbnail  body: { channelId, videoId, thumbnailUrl }
+  // Set/replace the thumbnail on an ALREADY-uploaded video (no re-upload) — e.g.
+  // to fix a video that shipped with a placeholder when Pikzels failed mid-run.
+  if (req.method === 'POST' && pathname === '/youtube/set-thumbnail') {
+    if (!db) return sendJSON(res, 500, { error: 'Firebase not configured' });
+    try {
+      const { channelId, videoId, thumbnailUrl } = JSON.parse(await readBody(req));
+      if (!channelId || !videoId || !thumbnailUrl) return sendJSON(res, 400, { error: 'channelId, videoId and thumbnailUrl required' });
+      const snap = await db.collection('channels').doc(channelId).get();
+      if (!snap.exists) return sendJSON(res, 404, { error: 'Channel not found' });
+      const data = snap.data();
+      if (!data.youtubeRefreshToken) return sendJSON(res, 400, { error: 'YouTube not connected for this channel' });
+      const oauth = makeOAuthClient();
+      oauth.setCredentials({ refresh_token: data.youtubeRefreshToken, access_token: data.youtubeAccessToken || undefined, expiry_date: data.youtubeTokenExpiry || undefined });
+      const yt = google.youtube({ version: 'v3', auth: oauth });
+      const thumbBuffer = await downloadToBuffer(thumbnailUrl);
+      const mimeType = /\.png(\?|$)/i.test(thumbnailUrl) ? 'image/png' : 'image/jpeg';
+      await yt.thumbnails.set({ videoId, media: { body: Readable.from(thumbBuffer), mimeType } });
+      const fresh = oauth.credentials;
+      if (fresh.access_token) await db.collection('channels').doc(channelId).update({ youtubeAccessToken: fresh.access_token, youtubeTokenExpiry: fresh.expiry_date || null });
+      console.log(`[youtube/set-thumbnail] set thumbnail on ${videoId} (${mimeType})`);
+      return sendJSON(res, 200, { ok: true, videoId });
+    } catch (e) {
+      console.error('set-thumbnail error:', e);
+      return sendJSON(res, 500, { error: e.message || 'set-thumbnail failed' });
+    }
+  }
+
   // POST /youtube/schedule  body: { channelId, videoId, publishAt }
   //
   // For videos uploaded as drafts that the user (or auto-scheduler)
