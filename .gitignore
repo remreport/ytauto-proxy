@@ -14,3 +14,6 @@ service-account.json
 Thumbs.db
 .vscode/
 .idea/
+
+# functions runtime env (contains FIRESTORE_RELAY_SECRET) — never commit
+functions/.env.ytauto-95f91

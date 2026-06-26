@@ -11,5 +11,22 @@
         ".env.local"
       ]
     }
-  ]
+  ],
+  "hosting": {
+    "public": "hosting-public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "/relay",
+        "run": {
+          "serviceId": "firestorerelay",
+          "region": "us-central1"
+        }
+      }
+    ]
+  }
 }

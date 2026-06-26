@@ -70,6 +70,20 @@ function makeRelayDb(url, secret) {
     const d = j && j.exists ? rehydrate(j.data) : undefined;
     return { exists: !!(j && j.exists), id: j && j.id, data: () => d, get: (f) => (d ? d[f] : undefined) };
   }
+  // serverTimestamp() / delete() return STABLE SINGLETON sentinels (admin.firestore
+  // returns a fresh ref each access, so overriding FieldValue globally doesn't take;
+  // reference-equality against the captured singletons is the reliable detector).
+  const SENT_ST = admin.firestore.FieldValue.serverTimestamp();
+  const SENT_DEL = admin.firestore.FieldValue.delete();
+  function serializeOut(v) {
+    if (v === SENT_ST) return { __relay_fv__: 'serverTimestamp' };
+    if (v === SENT_DEL) return { __relay_fv__: 'delete' };
+    if (v === null || typeof v !== 'object' || v instanceof Date) return v;
+    if (Array.isArray(v)) return v.map(serializeOut);
+    const o = {};
+    for (const k of Object.keys(v)) o[k] = serializeOut(v[k]);
+    return o;
+  }
   function makeRef(path, query) {
     return {
       collection(name) { return makeRef([...path, name], {}); },
@@ -82,9 +96,9 @@ function makeRelayDb(url, secret) {
         const docs = (j.docs || []).map(docSnap);      // collection/query
         return { docs, empty: j.empty, size: j.size, forEach: (fn) => docs.forEach(fn) };
       },
-      async set(data, opts) { await rpc({ path, op: 'set', data, opts: opts || {} }); return {}; },
-      async update(data) { await rpc({ path, op: 'update', data }); return {}; },
-      async add(data) { return await rpc({ path, op: 'add', data }); },
+      async set(data, opts) { await rpc({ path, op: 'set', data: serializeOut(data), opts: opts || {} }); return {}; },
+      async update(data) { await rpc({ path, op: 'update', data: serializeOut(data) }); return {}; },
+      async add(data) { return await rpc({ path, op: 'add', data: serializeOut(data) }); },
       async delete() { await rpc({ path, op: 'delete' }); return {}; },
     };
   }
@@ -94,19 +108,6 @@ function makeRelayDb(url, secret) {
 let db = null;
 if (RELAY_URL && RELAY_SECRET) {
   db = makeRelayDb(RELAY_URL, RELAY_SECRET);
-  // Make FieldValue sentinels relay-safe: plain markers the relay reconstructs.
-  const relayFV = {
-    serverTimestamp: () => ({ __relay_fv__: 'serverTimestamp' }),
-    delete: () => ({ __relay_fv__: 'delete' }),
-    increment: (n) => ({ __relay_fv__: 'increment', n }),
-    arrayUnion: (...v) => ({ __relay_fv__: 'arrayUnion', v }),
-    arrayRemove: (...v) => ({ __relay_fv__: 'arrayRemove', v }),
-  };
-  try { Object.defineProperty(admin.firestore, 'FieldValue', { value: relayFV, writable: true, configurable: true }); }
-  catch (e) { console.error('⚠ FieldValue relay override failed:', e.message); }
-  if (admin.firestore.FieldValue.serverTimestamp().__relay_fv__ !== 'serverTimestamp') {
-    console.error('⚠ FieldValue override did NOT take — serverTimestamp/delete writes will be wrong in relay mode');
-  }
   console.log('✓ Firestore RELAY mode active (ops routed through firestoreRelay on Google infra)');
 } else if (firebaseReady) {
   db = admin.firestore();
